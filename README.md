@@ -1,6 +1,6 @@
-# Enclave: The Smart-Node Harnessing Layer for Secure, Local AI Agents
+# Aegis: The Smart-Node Harnessing Layer for Secure, Local AI Agents
 
-**Enclave** is an enterprise-grade AI agent platform that runs entirely on local hardware. By providing a modern, chat-based desktop interface, Enclave allows non-technical business users to automate workflows across their tools (Slack, Gmail, internal databases) without ever exposing proprietary data to external cloud APIs.
+**Aegis** is an enterprise-grade AI agent platform that runs entirely on local hardware. By providing a modern, chat-based desktop interface, Aegis allows non-technical business users to automate workflows across their tools (Slack, Gmail, internal databases) without ever exposing proprietary data to external cloud APIs.
 
 ## ⚠️ The Enterprise AI Problem
 
@@ -11,10 +11,10 @@ Enterprises want the automation capabilities of agentic AI, but face two major b
 
 ## 💡 The Solution: Local Execution + Smart Nodes
 
-Enclave acts as a **secure harnessing layer** for open-source local AI models, solving both privacy and control issues simultaneously.
+Aegis acts as a **secure harnessing layer** for open-source local AI models, solving both privacy and control issues simultaneously.
 
 * **100% Local Inference:** The desktop application bundles the AI model and local memory directly on the user's machine. Enterprise data never leaves the employee's device or the corporate firewall.
-* **The "Smart Node" Architecture:** Instead of giving the AI open-ended access to tools, users configure natural-language boundaries directly in the chat UI (e.g., *"Only read the #marketing channel"*). Enclave uses these instructions to dynamically constrain the AI's context and permissions, acting as a strict governor to prevent unauthorized actions before they happen.
+* **The "Smart Node" Architecture:** Instead of giving the AI open-ended access to tools, users configure natural-language boundaries directly in the chat UI (e.g., *"Only read the #marketing channel"*). Aegis uses these instructions to dynamically constrain the AI's context and permissions, acting as a strict governor to prevent unauthorized actions before they happen.
 
 ## ✨ Core Capabilities
 
