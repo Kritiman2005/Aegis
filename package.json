@@ -1,0 +1,73 @@
+{
+  "name": "aegis-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Aegis — Local-first, privacy-focused AI agent desktop platform",
+  "main": "dist/electron/main.js",
+  "scripts": {
+    "dev:next": "next dev",
+    "dev:backend": "cd backend && uvicorn main:app --reload --port 8000",
+    "dev:electron": "tsc -p electron/tsconfig.json && electron .",
+    "dev": "concurrently -n \"NEXT,BACKEND,ELECTRON\" -c \"cyan,green,magenta\" \"next dev\" \"cd backend && uvicorn main:app --reload --port 8000\" \"wait-on http://localhost:3000 http://localhost:8000/api/health && tsc -p electron/tsconfig.json && electron .\"",
+    "build:next": "next build",
+    "build:electron": "tsc -p electron/tsconfig.json",
+    "build": "next build && tsc -p electron/tsconfig.json && electron-builder",
+    "package:mac": "npm run build && electron-builder --mac",
+    "package:win": "npm run build && electron-builder --win",
+    "package:linux": "npm run build && electron-builder --linux",
+    "lint": "next lint",
+    "type-check": "tsc --noEmit"
+  },
+  "build": {
+    "appId": "com.aegis.desktop",
+    "productName": "Aegis",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/electron/**/*",
+      "out/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "backend",
+        "to": "backend",
+        "filter": ["**/*", "!__pycache__", "!*.pyc"]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "assets/icon.icns",
+      "target": ["dmg", "zip"]
+    },
+    "win": {
+      "icon": "assets/icon.ico",
+      "target": ["nsis"]
+    },
+    "linux": {
+      "icon": "assets/icon.png",
+      "target": ["AppImage", "deb"]
+    }
+  },
+  "dependencies": {
+    "next": "^14.2.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "autoprefixer": "^10.4.19",
+    "concurrently": "^8.2.2",
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3",
+    "eslint": "^8.57.0",
+    "eslint-config-next": "^14.2.5",
+    "postcss": "^8.4.38",
+    "tailwindcss": "^3.4.4",
+    "typescript": "^5.4.5",
+    "wait-on": "^7.2.0"
+  }
+}
