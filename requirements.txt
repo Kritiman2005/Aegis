@@ -26,8 +26,9 @@ llama-cpp-python>=0.2.79
 huggingface-hub>=0.23.0
 mcp>=0.1.0
 
-# Google OAuth
+# Google OAuth & APIs
 google-auth-oauthlib>=1.2.0
+google-api-python-client>=2.130.0
 
 # Environment variables
 python-dotenv>=1.0.1

@@ -67,17 +67,23 @@ async def websocket_endpoint(
                 logger.info(f"[WS:{connection_id[:8]}] User: {content[:80]!r}")
 
                 try:
-                    # 1. Process the message through the state machine
-                    # This will return the immediate response (e.g., the proposed plan)
-                    response_text = await session.handle_message(content)
-                    
-                    # Stream the text response back
+                    # Send a "thinking" indicator so the user knows the LLM is working
                     await manager.send_json(connection_id, {
                         "type": "token",
-                        "content": response_text
+                        "content": "⏳ Thinking..."
                     })
                     
-                    # Signal end of stream for the text response
+                    # Process the message through the state machine
+                    # No streaming callback — we send the formatted plan summary only
+                    response_text = await session.handle_message(content)
+                    
+                    # Send the formatted plan summary
+                    await manager.send_json(connection_id, {
+                        "type": "token",
+                        "content": "\r" + response_text  # \r clears the "Thinking..." line
+                    })
+                    
+                    # Signal end of stream
                     await manager.send_json(connection_id, {
                         "type": "done",
                         "content": "",

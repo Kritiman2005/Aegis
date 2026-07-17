@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Optional, Any, List
 
 try:
@@ -35,14 +36,14 @@ class LLMManager:
         
     def _register_default_models(self):
         """Register the models we know about."""
-        # Example of loading a model from a local file.
-        # Place your downloaded .gguf file in the backend/models directory.
+        # Resolve model path relative to this file so it works regardless of the CWD
+        _models_dir = Path(__file__).resolve().parent.parent.parent / "models"
         local_gemma_config = ModelConfig(
             name="gemma-local",
-            model_path="backend/models/qwen2.5-3b-instruct-q4_k_m.gguf", # Path to your local model
+            model_path=str(_models_dir / "qwen2.5-3b-instruct-q4_k_m.gguf"),
             chat_format="chatml",
             kwargs={
-                "n_ctx": 4096,  # Default context window
+                "n_ctx": 4096,
                 "verbose": False
             }
         )

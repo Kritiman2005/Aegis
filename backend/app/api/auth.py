@@ -5,6 +5,7 @@ import anyio
 
 from app.auth.google_oauth import initiate_oauth_flow, get_google_flow
 from app.mcp.manager import mcp_manager
+from app.core.connection_manager import manager as ws_manager
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
@@ -46,13 +47,23 @@ async def google_callback(request: Request):
         # To avoid blocking the FastAPI async event loop, run it in a thread.
         def fetch():
             flow.fetch_token(authorization_response=str(request.url))
-            return flow.credentials.token
+            return flow.credentials
             
-        access_token = await anyio.to_thread.run_sync(fetch)
+        credentials = await anyio.to_thread.run_sync(fetch)
         
-        # We skip saving to the database for now as requested.
-        # Instead, we directly initialize the MCP server with the fresh access token!
-        await mcp_manager.start_google_drive_mcp(access_token)
+        # Initialize the Google API manager with the full credentials object
+        def init_apis():
+            mcp_manager.initialize(credentials)
+        
+        await anyio.to_thread.run_sync(init_apis)
+        
+        # Notify all connected WebSocket clients that auth is complete
+        tools = mcp_manager.list_tools()
+        tool_names = ", ".join(t["name"] for t in tools)
+        await ws_manager.broadcast_json({
+            "type": "auth_ready",
+            "content": f"✅ Google authentication successful! {len(tools)} tools are now available: {tool_names}\n\nYou can now type your request below."
+        })
         
         # Return a friendly HTML response so the user can close the browser tab
         return HTMLResponse(

@@ -23,86 +23,114 @@ class AgentSession:
         self.plan: Optional[List[Dict]] = None
         self.chat_history: List[Dict] = []
         
-    async def get_available_tools(self) -> str:
-        """Fetches the available tools from the active MCP session."""
-        if "google_drive" not in mcp_manager.active_sessions:
-            return "No active MCP sessions found. Please authenticate with Google first."
+    def get_available_tools(self) -> str:
+        """Fetches the available tools from the GoogleAPIManager."""
+        if not mcp_manager.credentials:
+            return "No active Google session found. Please authenticate with Google first."
             
-        session = mcp_manager.active_sessions["google_drive"]
-        tools_result = await session.list_tools()
-        
-        tools_desc = []
-        for tool in tools_result.tools:
-            tools_desc.append(f"- {tool.name}: {tool.description}")
-            
+        tools = mcp_manager.list_tools()
+        tools_desc = [f"- {t['name']}: {t['description']}" for t in tools]
         return "\n".join(tools_desc)
 
-    def _generate_plan_sync(self, user_message: str, tools_str: str) -> str:
-        """Synchronous wrapper for llama.cpp chat completion."""
+    def _generate_plan_sync(self, user_message: str, tools_str: str, token_callback=None) -> str:
+        """Synchronous LLM call that optionally streams tokens via a callback."""
         try:
             llm = llm_manager.get_model("gemma-local")
         except Exception as e:
             return json.dumps({"error": f"LLM not loaded: {e}"})
             
-        system_prompt = f"""You are an AI assistant orchestrating an MCP (Model Context Protocol) server.
-Available MCP tools:
+        system_prompt = f"""You are an intelligent AI assistant with access to the following tools:
+
 {tools_str}
 
-The user will ask you to perform a task. You must output a JSON object containing a "plan" array.
-Each item in the "plan" array must have:
-- "tool": the exact name of the tool to use.
-- "reason": why this tool is being used.
-- "arguments": a dictionary of arguments to pass to the tool (if any).
+Analyze the user's request and conversation history to determine the best sequence of tools to fulfill their intent.
 
-If a requested action cannot be mapped to an available tool, mention it in a "warnings" array in the JSON.
-Your entire response must be valid JSON."""
+Return a JSON object with a "plan" array. Each step in "plan" must have:
+- "tool": exact tool name from the available list.
+- "reason": brief explanation of why this tool was selected for the request.
+- "arguments": object containing argument key-value pairs for the tool.
+
+If no tools are required or available for the request, return an empty "plan" array with a "warnings" array explaining why.
+
+Respond with valid JSON only."""
 
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(self.chat_history)
         messages.append({"role": "user", "content": user_message})
         
         try:
+            # Stream tokens exactly like test_chat.py does
             response = llm.create_chat_completion(
                 messages=messages,
                 response_format={"type": "json_object"},
-                temperature=0.1
+                temperature=0.1,
+                stream=True
             )
-            return response["choices"][0]["message"]["content"]
+            
+            full_response = ""
+            for chunk in response:
+                if "choices" in chunk and len(chunk["choices"]) > 0:
+                    delta = chunk["choices"][0].get("delta", {})
+                    if "content" in delta:
+                        token = delta["content"]
+                        full_response += token
+                        if token_callback:
+                            token_callback(token)  # stream token live
+                            
+            return full_response
         except Exception as e:
             logger.error(f"LLM generation failed: {e}")
             return json.dumps({"error": "Failed to generate plan."})
 
-    async def handle_message(self, message: str) -> str:
+    async def handle_message(self, message: str, token_callback=None) -> str:
         """Main state machine handler for incoming user messages."""
         
         if self.state == AgentState.IDLE:
             # Step 1: User gives query, we generate a plan
-            tools_str = await self.get_available_tools()
-            if "No active MCP sessions" in tools_str:
+            tools_str = self.get_available_tools()
+            if "No active Google session" in tools_str:
                 return tools_str
                 
             self.chat_history.append({"role": "user", "content": message})
             
-            # Generate plan using LLM in a thread
-            plan_json_str = await anyio.to_thread.run_sync(self._generate_plan_sync, message, tools_str)
+            # Generate plan using LLM in a thread — tokens stream via callback if provided
+            plan_json_str = await anyio.to_thread.run_sync(
+                lambda: self._generate_plan_sync(message, tools_str, token_callback)
+            )
             
             try:
                 plan_data = json.loads(plan_json_str)
-                self.plan = plan_data.get("plan", [])
+                raw_plan = plan_data.get("plan", [])
                 warnings = plan_data.get("warnings", [])
                 
+                # Validate hallucinated/unsupported tools against active tools
+                valid_tool_names = {t["name"] for t in mcp_manager.list_tools()}
+                self.plan = []
+                for step in raw_plan:
+                    tool_name = step.get("tool")
+                    if tool_name in valid_tool_names:
+                        self.plan.append(step)
+                    else:
+                        warnings.append(f"Tool `{tool_name}` is not currently available.")
+                
+                if not self.plan:
+                    self.state = AgentState.IDLE
+                    if warnings:
+                        return "Note:\n" + "\n".join([f"- {w}" for w in warnings])
+                    return f"Available tools:\n{tools_str}\n\nWhat would you like me to do with them?"
+
                 self.chat_history.append({"role": "assistant", "content": plan_json_str})
                 self.state = AgentState.WAITING_CONFIRMATION
                 
-                # Format the response for the user
-                response = "I have prepared the following execution plan based on the available MCP tools:\n\n"
+                # Format the human-readable plan summary
+                response = "\n\n📋 Execution plan based on your request:\n\n"
                 for i, step in enumerate(self.plan):
                     response += f"{i+1}. **{step.get('tool')}**: {step.get('reason')}\n"
                     
                 if warnings:
-                    response += "\nWarnings:\n" + "\n".join([f"- {w}" for w in warnings])
+                    response += "\n⚠️ Warnings:\n" + "\n".join([f"- {w}" for w in warnings])
                     
-                response += "\nIs this what you wanted? (Reply 'yes' to proceed or specify changes)"
+                response += "\n\nIs this what you wanted? (Reply 'yes' to proceed or tell me what to change)"
                 return response
                 
             except json.JSONDecodeError:
@@ -120,8 +148,10 @@ Your entire response must be valid JSON."""
                 return "Great! Proceeding with the execution... (Please wait)"
             else:
                 # User wants to refine the plan
-                tools_str = await self.get_available_tools()
-                plan_json_str = await anyio.to_thread.run_sync(self._generate_plan_sync, "Please refine the plan based on my previous feedback.", tools_str)
+                tools_str = self.get_available_tools()
+                plan_json_str = await anyio.to_thread.run_sync(
+                    lambda: self._generate_plan_sync("Please refine the plan based on my previous feedback.", tools_str, token_callback)
+                )
                 
                 try:
                     plan_data = json.loads(plan_json_str)
@@ -147,9 +177,8 @@ Your entire response must be valid JSON."""
             yield "No plan to execute."
             return
             
-        session = mcp_manager.active_sessions.get("google_drive")
-        if not session:
-            yield "Error: MCP session lost."
+        if not mcp_manager.credentials:
+            yield "Error: Google session lost. Please re-authenticate."
             self.state = AgentState.IDLE
             return
             
@@ -160,22 +189,17 @@ Your entire response must be valid JSON."""
             yield f"\n⏳ Executing Task {i+1}: Calling `{tool_name}`...\n"
             
             try:
-                # Call the MCP tool
-                result = await session.call_tool(tool_name, arguments)
-                
-                # Format the result to string (MCP results can have text or images)
-                result_text = ""
-                for content in result.content:
-                    if content.type == "text":
-                        result_text += content.text + "\n"
-                        
-                yield f"✅ Result for `{tool_name}`:\n{result_text[:500]}... (truncated)\n"
+                # Fix: capture loop variables by value using default arguments
+                result = await anyio.to_thread.run_sync(
+                    lambda t=tool_name, a=arguments: mcp_manager.call_tool(t, a)
+                )
+                yield f"✅ Result for `{tool_name}`:\n{str(result)[:1000]}\n"
             except Exception as e:
                 logger.error(f"Tool execution failed: {e}")
                 yield f"❌ Error executing `{tool_name}`: {e}\n"
-                break # Stop execution on error
+                break
                 
         yield "\n🎉 Execution complete! What would you like to do next?"
         self.state = AgentState.IDLE
         self.plan = None
-        self.chat_history = [] # Reset history for the next task
+        self.chat_history = []  # Reset history for the next task
