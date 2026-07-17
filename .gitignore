@@ -31,9 +31,11 @@ dist-info/
 .mypy_cache/
 .ruff_cache/
 
-# ─── Models ─────────────────────────────────────────────
+# ─── Models & DB ─────────────────────────────────────────
 *.gguf
 *.bin
+*.db
+*.sqlite3
 
 # ─── Environment Variables ───────────────────────────────
 .env

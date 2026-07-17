@@ -35,8 +35,7 @@ class LLMManager:
         self._register_default_models()
         
     def _register_default_models(self):
-        """Register the models we know about."""
-        # Resolve model path relative to this file so it works regardless of the CWD
+        """Register the models we know about from disk and SQLite."""
         _models_dir = Path(__file__).resolve().parent.parent.parent / "models"
         local_gemma_config = ModelConfig(
             name="gemma-local",
@@ -48,6 +47,26 @@ class LLMManager:
             }
         )
         self.register_model(local_gemma_config)
+
+        # Sync additional models from SQLite if DB is initialized
+        try:
+            from app.db.database import SessionLocal
+            from app.db.models import ModelRegistry
+            with SessionLocal() as db:
+                models = db.query(ModelRegistry).filter(ModelRegistry.status == "downloaded").all()
+                for m in models:
+                    if m.name not in self.available_models:
+                        cfg = ModelConfig(
+                            name=m.name,
+                            repo_id=m.repo_id,
+                            filename=m.filename,
+                            model_path=m.file_path,
+                            chat_format=m.chat_format,
+                            kwargs={"n_ctx": m.context_length, "verbose": False}
+                        )
+                        self.register_model(cfg)
+        except Exception as e:
+            logger.debug(f"SQLite model sync skipped: {e}")
         
     def register_model(self, config: ModelConfig):
         """Add a new model configuration."""

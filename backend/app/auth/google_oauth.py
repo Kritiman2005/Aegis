@@ -5,10 +5,12 @@ from google_auth_oauthlib.flow import Flow
 # Allow HTTP callback for local development
 os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
-# Required scopes for Gmail (readonly for testing) and Google Drive
+# Required scopes for Gmail and Google Drive (includes drafting and creating files)
 SCOPES = [
     'https://www.googleapis.com/auth/gmail.readonly',
-    'https://www.googleapis.com/auth/drive.readonly'
+    'https://www.googleapis.com/auth/gmail.compose',
+    'https://www.googleapis.com/auth/drive.readonly',
+    'https://www.googleapis.com/auth/drive.file'
 ]
 
 REDIRECT_URI = "http://localhost:8000/auth/google/callback"

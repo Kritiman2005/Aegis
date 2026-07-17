@@ -56,6 +56,33 @@ app.include_router(health_router, prefix="/api")
 app.include_router(ws_router)
 app.include_router(auth_router)
 
+# ─── Startup: SQLite Initialization & OAuth Auto-Restore ──────────────────────
+
+@app.on_event("startup")
+def on_startup():
+    """Initialize SQLite database tables, seed default model, and auto-restore Google OAuth session."""
+    import logging
+    from app.db.database import init_db, SessionLocal
+    from app.db.crud import seed_default_model, get_active_google_credentials
+    from app.mcp.manager import mcp_manager
+    
+    _logger = logging.getLogger("startup")
+    _logger.info("Initializing SQLite Database...")
+    init_db()
+
+    with SessionLocal() as db:
+        # Seed default local model in SQLite models table
+        model_path = str(Path(__file__).resolve().parent / "models" / "qwen2.5-3b-instruct-q4_k_m.gguf")
+        seed_default_model(db, model_path)
+
+        # Auto-restore saved Google OAuth credentials from SQLite
+        credentials = get_active_google_credentials(db)
+        if credentials:
+            mcp_manager.initialize(credentials)
+            _logger.info("Auto-restored active Google OAuth session from SQLite!")
+        else:
+            _logger.info("No saved Google OAuth credentials found in SQLite.")
+
 # ─── Direct Execution ────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

@@ -1,4 +1,6 @@
 import logging
+import base64
+from email.mime.text import MIMEText
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 
@@ -42,6 +44,15 @@ class GoogleAPIManager:
             "parameters": {
                 "message_id": "the Gmail message ID to read"
             }
+        },
+        {
+            "name": "gmail_create_draft",
+            "description": "Create a new email draft in the user's Gmail account.",
+            "parameters": {
+                "to": "recipient email address (optional)",
+                "subject": "email subject line (optional)",
+                "body": "email body content (optional)"
+            }
         }
     ]
 
@@ -84,6 +95,12 @@ class GoogleAPIManager:
             )
         elif tool_name == "gmail_read_message":
             return self._gmail_read_message(message_id=arguments.get("message_id", ""))
+        elif tool_name == "gmail_create_draft":
+            return self._gmail_create_draft(
+                to=arguments.get("to", ""),
+                subject=arguments.get("subject", ""),
+                body=arguments.get("body", "")
+            )
         else:
             return f"Unknown tool: {tool_name}"
 
@@ -173,6 +190,22 @@ class GoogleAPIManager:
             f"Date: {headers.get('Date', 'unknown')}\n\n"
             f"Snippet: {snippet}"
         )
+
+    def _gmail_create_draft(self, to: str = "", subject: str = "", body: str = "") -> str:
+        message = MIMEText(body)
+        if to:
+            message['to'] = to
+        if subject:
+            message['subject'] = subject
+
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+
+        draft = self._gmail_service.users().drafts().create(
+            userId="me",
+            body={"message": {"raw": raw}}
+        ).execute()
+
+        return f"✅ Email draft created successfully! (Draft ID: {draft.get('id')})"
 
 
 # Global instance
