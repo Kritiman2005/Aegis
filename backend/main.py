@@ -8,12 +8,21 @@ Or as a script:
     python main.py
 """
 
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load the .env file from the project root
+root_dir = Path(__file__).resolve().parent.parent
+load_dotenv(dotenv_path=root_dir / ".env")
+
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.health import router as health_router
 from app.api.websocket import router as ws_router
+from app.api.auth import router as auth_router
 
 # ─── App Factory ─────────────────────────────────────────────────────────────
 
@@ -45,6 +54,7 @@ app.add_middleware(
 
 app.include_router(health_router, prefix="/api")
 app.include_router(ws_router)
+app.include_router(auth_router)
 
 # ─── Direct Execution ────────────────────────────────────────────────────────
 

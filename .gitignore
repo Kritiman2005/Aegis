@@ -31,6 +31,10 @@ dist-info/
 .mypy_cache/
 .ruff_cache/
 
+# ─── Models ─────────────────────────────────────────────
+*.gguf
+*.bin
+
 # ─── Environment Variables ───────────────────────────────
 .env
 .env.local

@@ -20,3 +20,14 @@ starlette==0.37.2
 
 # Async utilities
 anyio==4.4.0
+
+# LLM & Context support
+llama-cpp-python>=0.2.79
+huggingface-hub>=0.23.0
+mcp>=0.1.0
+
+# Google OAuth
+google-auth-oauthlib>=1.2.0
+
+# Environment variables
+python-dotenv>=1.0.1
