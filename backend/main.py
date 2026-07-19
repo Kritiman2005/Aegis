@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.health import router as health_router
 from app.api.websocket import router as ws_router
 from app.api.auth import router as auth_router
+from app.api.connectors import router as connectors_router
 
 # ─── App Factory ─────────────────────────────────────────────────────────────
 
@@ -55,6 +56,7 @@ app.add_middleware(
 app.include_router(health_router, prefix="/api")
 app.include_router(ws_router)
 app.include_router(auth_router)
+app.include_router(connectors_router)
 
 # ─── Startup: SQLite Initialization & OAuth Auto-Restore ──────────────────────
 
@@ -64,7 +66,7 @@ def on_startup():
     import logging
     from app.db.database import init_db, SessionLocal
     from app.db.crud import seed_default_model, get_active_google_credentials
-    from app.mcp.manager import mcp_manager
+    from app.mcp.registry import mcp_registry
     
     _logger = logging.getLogger("startup")
     _logger.info("Initializing SQLite Database...")
@@ -78,8 +80,14 @@ def on_startup():
         # Auto-restore saved Google OAuth credentials from SQLite
         credentials = get_active_google_credentials(db)
         if credentials:
-            mcp_manager.initialize(credentials)
-            _logger.info("Auto-restored active Google OAuth session from SQLite!")
+            try:
+                mcp_registry.connect_google_workspace(
+                    credentials_json_str=credentials.to_json(),
+                    db=db
+                )
+                _logger.info("Auto-restored active Google Workspace MCP server from SQLite!")
+            except Exception as e:
+                _logger.error(f"Failed to auto-restore Google Workspace MCP server: {e}")
         else:
             _logger.info("No saved Google OAuth credentials found in SQLite.")
 

@@ -89,6 +89,81 @@ def save_google_user_and_credentials(
     return user
 
 
+def sync_mcp_server_and_tools(
+    db: Session,
+    server_name: str,
+    server_type: str = "stdio_mcp",
+    display_name: Optional[str] = None,
+    tools: Optional[List[dict]] = None,
+    user_email: str = "user@aegis.local"
+) -> MCPServer:
+    """Generic function to upsert any MCP server and its discovered tools into SQLite."""
+    user = db.query(User).filter(User.email == user_email).first()
+    user_id = user.id if user else 1
+
+    server = db.query(MCPServer).filter(
+        MCPServer.user_id == user_id,
+        MCPServer.name == server_name
+    ).first()
+
+    if not server:
+        server = MCPServer(
+            user_id=user_id,
+            name=server_name,
+            display_name=display_name or server_name,
+            server_type=server_type,
+            status="connected"
+        )
+        db.add(server)
+        db.commit()
+        db.refresh(server)
+    else:
+        server.status = "connected"
+        if display_name:
+            server.display_name = display_name
+        db.commit()
+
+    if tools:
+        for tool_def in tools:
+            tool_name = tool_def.get("name")
+            tool_record = db.query(MCPTool).filter(
+                MCPTool.server_id == server.id,
+                MCPTool.name == tool_name
+            ).first()
+
+            # Handle both MCP inputSchema and legacy parameters formats
+            schema = tool_def.get("inputSchema") or tool_def.get("parameters") or {}
+            param_str = json.dumps(schema)
+
+            if not tool_record:
+                tool_record = MCPTool(
+                    server_id=server.id,
+                    name=tool_name,
+                    description=tool_def.get("description"),
+                    parameters_json=param_str,
+                    is_enabled=True
+                )
+                db.add(tool_record)
+            else:
+                tool_record.description = tool_def.get("description")
+                tool_record.parameters_json = param_str
+                tool_record.is_enabled = True
+        db.commit()
+
+    logger.info(f"Synced server '{server_name}' and {len(tools or [])} tools in SQLite.")
+    return server
+
+
+def set_mcp_server_status(db: Session, server_name: str, status: str = "disconnected"):
+    """Updates the status of an MCP server in SQLite."""
+    server = db.query(MCPServer).filter(MCPServer.name == server_name).first()
+    if server:
+        server.status = status
+        db.commit()
+        logger.info(f"Updated server '{server_name}' status to '{status}' in SQLite.")
+
+
+
 def get_active_google_credentials(db: Session) -> Optional[Credentials]:
     """
     Retrieves saved Google OAuth credentials from SQLite.

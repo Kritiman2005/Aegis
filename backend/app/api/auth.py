@@ -4,7 +4,7 @@ import logging
 import anyio
 
 from app.auth.google_oauth import initiate_oauth_flow, get_google_flow
-from app.mcp.manager import mcp_manager
+from app.mcp.registry import mcp_registry
 from app.core.connection_manager import manager as ws_manager
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -51,23 +51,24 @@ async def google_callback(request: Request):
             
         credentials = await anyio.to_thread.run_sync(fetch)
         
-        # Initialize the Google API manager with the full credentials object
+        # Initialize the Google Workspace stdio MCP server via registry
         def init_apis_and_db():
-            mcp_manager.initialize(credentials)
-            # Persist user profile, credentials, server & tools to SQLite
             from app.db.database import SessionLocal
             from app.db.crud import save_google_user_and_credentials
             with SessionLocal() as db:
                 save_google_user_and_credentials(
                     db=db,
-                    credentials=credentials,
-                    available_tools=mcp_manager.list_tools()
+                    credentials=credentials
                 )
-        
-        await anyio.to_thread.run_sync(init_apis_and_db)
-        
+                tools = mcp_registry.connect_google_workspace(
+                    credentials_json_str=credentials.to_json(),
+                    db=db
+                )
+                return tools
+
+        tools = await anyio.to_thread.run_sync(init_apis_and_db)
+
         # Notify all connected WebSocket clients that auth is complete
-        tools = mcp_manager.list_tools()
         tool_names = ", ".join(t["name"] for t in tools)
         await ws_manager.broadcast_json({
             "type": "auth_ready",

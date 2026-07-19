@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, AsyncGenerator
 import anyio
 
 from app.core.llm_manager import LLMManager
-from app.mcp.manager import mcp_manager
+from app.mcp.registry import mcp_registry
 from app.db.database import SessionLocal
 from app.db.crud import save_entity, build_entity_context_block
 from app.prompts import build_planner_prompt, ENTITY_EXTRACTOR_SYSTEM, build_entity_extractor_user_msg
@@ -38,11 +38,11 @@ class AgentSession:
     # ─────────────────────────────────────────────────────────────────────────
 
     def get_available_tools(self) -> str:
-        """Fetches the available tools from the GoogleAPIManager."""
-        if not mcp_manager.credentials:
-            return "No active Google session found. Please authenticate with Google first."
-        tools = mcp_manager.list_tools()
-        tools_desc = [f"- {t['name']}: {t['description']}" for t in tools]
+        """Fetches all available tools from all connected MCP servers in the registry."""
+        tools = mcp_registry.list_all_tools()
+        if not tools:
+            return "No active MCP servers connected. Please authenticate with Google or connect a server first."
+        tools_desc = [f"- {t['name']}: {t.get('description', '')}" for t in tools]
         return "\n".join(tools_desc)
 
     def _get_entity_context(self) -> str:
@@ -179,9 +179,8 @@ class AgentSession:
         try:
             plan_data = json.loads(plan_json_str)
             raw_plan = plan_data.get("plan", [])
-            warnings = plan_data.get("warnings", [])
-
-            valid_tool_names = {t["name"] for t in mcp_manager.list_tools()}
+            # Validate hallucinated/unsupported tools against active tools in registry
+            valid_tool_names = {t["name"] for t in mcp_registry.list_all_tools()}
             self.plan = []
             for step in raw_plan:
                 tool_name = step.get("tool")
@@ -364,8 +363,9 @@ class AgentSession:
             yield "No plan to execute."
             return
 
-        if not mcp_manager.credentials:
-            yield "Error: Google session lost. Please re-authenticate."
+        all_tools = mcp_registry.list_all_tools()
+        if not all_tools:
+            yield "Error: No connected MCP servers found."
             self.state = AgentState.IDLE
             return
 
@@ -380,7 +380,7 @@ class AgentSession:
 
             try:
                 result = await anyio.to_thread.run_sync(
-                    lambda t=tool_name, a=arguments: mcp_manager.call_tool(t, a)
+                    lambda t=tool_name, a=arguments: mcp_registry.call_tool(t, a)
                 )
                 result_str = str(result)
                 yield f"✅ Result for `{tool_name}`:\n{result_str[:1000]}\n"

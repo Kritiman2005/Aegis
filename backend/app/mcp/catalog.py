@@ -1,8 +1,8 @@
 """
-Aegis — Pre-configured MCP Connectors Catalog
+Aegis — Comprehensive Pre-configured MCP Connectors Catalog
 
-Catalog of all popular reference and community MCP connectors (matching Claude Desktop / MCP Registry).
-Provides metadata, default command, environment variable requirements, and input fields for the frontend.
+Complete catalog of 30+ official reference and top community MCP connectors
+(matching Claude Desktop, Glama, MCP.so, and modelcontextprotocol/servers).
 """
 
 from typing import Dict, List, Optional
@@ -46,7 +46,37 @@ CONNECTORS_CATALOG: Dict[str, dict] = {
         "official": True,
     },
 
-    # ── 3. PostgreSQL ─────────────────────────────────────────────────────────
+    # ── 3. GitLab ─────────────────────────────────────────────────────────────
+    "gitlab": {
+        "name": "gitlab",
+        "display_name": "GitLab",
+        "category": "Developer Tools",
+        "description": "Interact with GitLab projects, merge requests, issues, and repositories.",
+        "icon": "gitlab",
+        "auth_type": "api_key",
+        "command": ["npx", "-y", "@modelcontextprotocol/server-gitlab"],
+        "env_schema": [
+            {
+                "key": "GITLAB_PERSONAL_ACCESS_TOKEN",
+                "label": "GitLab Personal Access Token",
+                "placeholder": "glpat-xxxxxxxxxxxxxxxxxxxx",
+                "required": True,
+                "secret": True,
+                "help_url": "https://gitlab.com/-/profile/personal_access_tokens"
+            },
+            {
+                "key": "GITLAB_API_URL",
+                "label": "GitLab Instance URL (Optional)",
+                "placeholder": "https://gitlab.com/api/v4",
+                "required": False,
+                "secret": False,
+            }
+        ],
+        "input_schema": [],
+        "official": True,
+    },
+
+    # ── 4. PostgreSQL ─────────────────────────────────────────────────────────
     "postgres": {
         "name": "postgres",
         "display_name": "PostgreSQL",
@@ -69,7 +99,103 @@ CONNECTORS_CATALOG: Dict[str, dict] = {
         "official": True,
     },
 
-    # ── 4. Local Filesystem ────────────────────────────────────────────────────
+    # ── 5. MySQL ──────────────────────────────────────────────────────────────
+    "mysql": {
+        "name": "mysql",
+        "display_name": "MySQL / MariaDB",
+        "category": "Databases",
+        "description": "Connect to MySQL or MariaDB databases for schema inspection and queries.",
+        "icon": "database",
+        "auth_type": "connection_string",
+        "command": ["npx", "-y", "mcp-server-mysql"],
+        "env_schema": [
+            {
+                "key": "MYSQL_URI",
+                "label": "MySQL Connection URI",
+                "placeholder": "mysql://user:password@localhost:3306/dbname",
+                "required": True,
+                "secret": True,
+            }
+        ],
+        "input_schema": [],
+        "official": False,
+    },
+
+    # ── 6. SQLite ─────────────────────────────────────────────────────────────
+    "sqlite": {
+        "name": "sqlite",
+        "display_name": "SQLite Database",
+        "category": "Databases",
+        "description": "Read and query local SQLite database files.",
+        "icon": "database",
+        "auth_type": "path",
+        "command": ["npx", "-y", "@modelcontextprotocol/server-sqlite"],
+        "env_schema": [],
+        "input_schema": [
+            {
+                "key": "db_path",
+                "label": "SQLite File Path",
+                "placeholder": "/Users/username/data.db",
+                "required": True,
+                "secret": False,
+                "command_arg_template": "--db-path={value}"
+            }
+        ],
+        "official": True,
+    },
+
+    # ── 7. Redis ──────────────────────────────────────────────────────────────
+    "redis": {
+        "name": "redis",
+        "display_name": "Redis Store",
+        "category": "Databases",
+        "description": "Inspect keys, query data structures, and manage Redis memory stores.",
+        "icon": "database",
+        "auth_type": "connection_string",
+        "command": ["npx", "-y", "redis-mcp-server"],
+        "env_schema": [
+            {
+                "key": "REDIS_URL",
+                "label": "Redis Connection URL",
+                "placeholder": "redis://:password@localhost:6379/0",
+                "required": True,
+                "secret": True,
+            }
+        ],
+        "input_schema": [],
+        "official": False,
+    },
+
+    # ── 8. Elasticsearch ──────────────────────────────────────────────────────
+    "elasticsearch": {
+        "name": "elasticsearch",
+        "display_name": "Elasticsearch",
+        "category": "Databases",
+        "description": "Search indices, execute query DSL, and analyze document clusters.",
+        "icon": "search",
+        "auth_type": "api_key",
+        "command": ["npx", "-y", "@elastic/mcp-server-elasticsearch"],
+        "env_schema": [
+            {
+                "key": "ES_URL",
+                "label": "Elasticsearch Endpoint Cluster URL",
+                "placeholder": "https://my-cluster.es.amazonaws.com:9243",
+                "required": True,
+                "secret": False,
+            },
+            {
+                "key": "ES_API_KEY",
+                "label": "API Key",
+                "placeholder": "V1V4...key...",
+                "required": True,
+                "secret": True,
+            }
+        ],
+        "input_schema": [],
+        "official": True,
+    },
+
+    # ── 9. Local Filesystem ────────────────────────────────────────────────────
     "filesystem": {
         "name": "filesystem",
         "display_name": "Local Filesystem",
@@ -92,7 +218,7 @@ CONNECTORS_CATALOG: Dict[str, dict] = {
         "official": True,
     },
 
-    # ── 5. Slack ──────────────────────────────────────────────────────────────
+    # ── 10. Slack ─────────────────────────────────────────────────────────────
     "slack": {
         "name": "slack",
         "display_name": "Slack",
@@ -122,7 +248,30 @@ CONNECTORS_CATALOG: Dict[str, dict] = {
         "official": True,
     },
 
-    # ── 6. Brave Search ───────────────────────────────────────────────────────
+    # ── 11. Discord ───────────────────────────────────────────────────────────
+    "discord": {
+        "name": "discord",
+        "display_name": "Discord",
+        "category": "Communication",
+        "description": "Manage Discord channels, send bot announcements, and read messages.",
+        "icon": "message-square",
+        "auth_type": "api_key",
+        "command": ["npx", "-y", "mcp-discord-server"],
+        "env_schema": [
+            {
+                "key": "DISCORD_BOT_TOKEN",
+                "label": "Discord Bot Token",
+                "placeholder": "MTEyMzQ1...token...",
+                "required": True,
+                "secret": True,
+                "help_url": "https://discord.com/developers/applications"
+            }
+        ],
+        "input_schema": [],
+        "official": False,
+    },
+
+    # ── 12. Brave Search ──────────────────────────────────────────────────────
     "brave_search": {
         "name": "brave_search",
         "display_name": "Brave Web Search",
@@ -145,7 +294,7 @@ CONNECTORS_CATALOG: Dict[str, dict] = {
         "official": True,
     },
 
-    # ── 7. Fetch (Web Reader) ─────────────────────────────────────────────────
+    # ── 13. Fetch (Web Reader) ────────────────────────────────────────────────
     "fetch": {
         "name": "fetch",
         "display_name": "Web Content Fetcher",
@@ -159,7 +308,44 @@ CONNECTORS_CATALOG: Dict[str, dict] = {
         "official": True,
     },
 
-    # ── 8. Git ────────────────────────────────────────────────────────────────
+    # ── 14. Puppeteer (Web Automation) ────────────────────────────────────────
+    "puppeteer": {
+        "name": "puppeteer",
+        "display_name": "Puppeteer Browser Automation",
+        "category": "Web & Search",
+        "description": "Automate headless Chrome browsing, take page screenshots, and evaluate scripts.",
+        "icon": "chrome",
+        "auth_type": "none",
+        "command": ["npx", "-y", "@modelcontextprotocol/server-puppeteer"],
+        "env_schema": [],
+        "input_schema": [],
+        "official": True,
+    },
+
+    # ── 15. Google Maps ───────────────────────────────────────────────────────
+    "google_maps": {
+        "name": "google_maps",
+        "display_name": "Google Maps Location & Places",
+        "category": "Web & Search",
+        "description": "Search places, calculate transit routes, and lookup location metadata.",
+        "icon": "map-pin",
+        "auth_type": "api_key",
+        "command": ["npx", "-y", "@modelcontextprotocol/server-google-maps"],
+        "env_schema": [
+            {
+                "key": "GOOGLE_MAPS_API_KEY",
+                "label": "Google Maps API Key",
+                "placeholder": "AIzaSy...key...",
+                "required": True,
+                "secret": True,
+                "help_url": "https://console.cloud.google.com/google/maps-apis"
+            }
+        ],
+        "input_schema": [],
+        "official": True,
+    },
+
+    # ── 16. Git ───────────────────────────────────────────────────────────────
     "git": {
         "name": "git",
         "display_name": "Git Repository Tools",
@@ -182,7 +368,87 @@ CONNECTORS_CATALOG: Dict[str, dict] = {
         "official": True,
     },
 
-    # ── 9. Memory (Knowledge Graph) ────────────────────────────────────────────
+    # ── 17. Sentry ────────────────────────────────────────────────────────────
+    "sentry": {
+        "name": "sentry",
+        "display_name": "Sentry Error Monitoring",
+        "category": "Developer Tools",
+        "description": "Inspect runtime crash tracebacks, issues, and production error logs.",
+        "icon": "alert-triangle",
+        "auth_type": "api_key",
+        "command": ["npx", "-y", "@sentry/mcp-server"],
+        "env_schema": [
+            {
+                "key": "SENTRY_AUTH_TOKEN",
+                "label": "Sentry Auth Token",
+                "placeholder": "sntrys_...token...",
+                "required": True,
+                "secret": True,
+                "help_url": "https://sentry.io/settings/account/api/auth-tokens/"
+            },
+            {
+                "key": "SENTRY_ORG",
+                "label": "Sentry Organization Slug",
+                "placeholder": "my-company-slug",
+                "required": True,
+                "secret": False,
+            }
+        ],
+        "input_schema": [],
+        "official": True,
+    },
+
+    # ── 18. AWS S3 ────────────────────────────────────────────────────────────
+    "aws_s3": {
+        "name": "aws_s3",
+        "display_name": "AWS S3 Cloud Storage",
+        "category": "Cloud & Infra",
+        "description": "List S3 buckets, inspect cloud objects, and read cloud storage files.",
+        "icon": "cloud",
+        "auth_type": "api_key",
+        "command": ["npx", "-y", "@modelcontextprotocol/server-aws-s3"],
+        "env_schema": [
+            {
+                "key": "AWS_ACCESS_KEY_ID",
+                "label": "AWS Access Key ID",
+                "placeholder": "AKIAIOSFODNN7EXAMPLE",
+                "required": True,
+                "secret": False,
+            },
+            {
+                "key": "AWS_SECRET_ACCESS_KEY",
+                "label": "AWS Secret Access Key",
+                "placeholder": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                "required": True,
+                "secret": True,
+            },
+            {
+                "key": "AWS_REGION",
+                "label": "AWS Region",
+                "placeholder": "us-east-1",
+                "required": True,
+                "secret": False,
+            }
+        ],
+        "input_schema": [],
+        "official": True,
+    },
+
+    # ── 19. Docker ────────────────────────────────────────────────────────────
+    "docker": {
+        "name": "docker",
+        "display_name": "Docker Engine",
+        "category": "Cloud & Infra",
+        "description": "Inspect running containers, check image layers, and view container logs.",
+        "icon": "container",
+        "auth_type": "none",
+        "command": ["npx", "-y", "mcp-server-docker"],
+        "env_schema": [],
+        "input_schema": [],
+        "official": False,
+    },
+
+    # ── 20. Memory (Knowledge Graph) ────────────────────────────────────────────
     "memory": {
         "name": "memory",
         "display_name": "Knowledge Graph Memory",
@@ -196,7 +462,21 @@ CONNECTORS_CATALOG: Dict[str, dict] = {
         "official": True,
     },
 
-    # ── 10. Time & Timezones ──────────────────────────────────────────────────
+    # ── 21. Sequential Thinking ───────────────────────────────────────────────
+    "sequential_thinking": {
+        "name": "sequential_thinking",
+        "display_name": "Sequential Thinking Reasoning",
+        "category": "AI Tools",
+        "description": "Enables multi-step step-by-step analytical reasoning and plan reflection.",
+        "icon": "cpu",
+        "auth_type": "none",
+        "command": ["npx", "-y", "@modelcontextprotocol/server-sequential-thinking"],
+        "env_schema": [],
+        "input_schema": [],
+        "official": True,
+    },
+
+    # ── 22. Time & Timezones ──────────────────────────────────────────────────
     "time": {
         "name": "time",
         "display_name": "Time & Timezone Converter",
@@ -210,7 +490,7 @@ CONNECTORS_CATALOG: Dict[str, dict] = {
         "official": True,
     },
 
-    # ── 11. Notion (Community) ────────────────────────────────────────────────
+    # ── 23. Notion ────────────────────────────────────────────────────────────
     "notion": {
         "name": "notion",
         "display_name": "Notion",
@@ -233,7 +513,7 @@ CONNECTORS_CATALOG: Dict[str, dict] = {
         "official": False,
     },
 
-    # ── 12. Linear (Community) ────────────────────────────────────────────────
+    # ── 24. Linear ────────────────────────────────────────────────────────────
     "linear": {
         "name": "linear",
         "display_name": "Linear",
@@ -252,6 +532,80 @@ CONNECTORS_CATALOG: Dict[str, dict] = {
                 "help_url": "https://linear.app/settings/api"
             }
         ],
+        "input_schema": [],
+        "official": False,
+    },
+
+    # ── 25. Jira (Atlassian) ──────────────────────────────────────────────────
+    "jira": {
+        "name": "jira",
+        "display_name": "Jira Software",
+        "category": "Productivity",
+        "description": "Search Jira tickets, manage issue boards, and track sprint progress.",
+        "icon": "trello",
+        "auth_type": "api_key",
+        "command": ["npx", "-y", "mcp-jira-server"],
+        "env_schema": [
+            {
+                "key": "JIRA_API_TOKEN",
+                "label": "Atlassian API Token",
+                "placeholder": "ATATT3xFfGF0...token...",
+                "required": True,
+                "secret": True,
+                "help_url": "https://id.atlassian.com/manage-profile/security/api-tokens"
+            },
+            {
+                "key": "JIRA_HOST",
+                "label": "Jira Domain URL",
+                "placeholder": "https://yourcompany.atlassian.net",
+                "required": True,
+                "secret": False,
+            },
+            {
+                "key": "JIRA_EMAIL",
+                "label": "Atlassian Account Email",
+                "placeholder": "user@company.com",
+                "required": True,
+                "secret": False,
+            }
+        ],
+        "input_schema": [],
+        "official": False,
+    },
+
+    # ── 26. Figma ─────────────────────────────────────────────────────────────
+    "figma": {
+        "name": "figma",
+        "display_name": "Figma Design",
+        "category": "Design & UI",
+        "description": "Inspect design frames, extract component specs, and export design tokens.",
+        "icon": "figma",
+        "auth_type": "api_key",
+        "command": ["npx", "-y", "figma-developer-mcp"],
+        "env_schema": [
+            {
+                "key": "FIGMA_PERSONAL_ACCESS_TOKEN",
+                "label": "Figma Personal Access Token",
+                "placeholder": "figd_...token...",
+                "required": True,
+                "secret": True,
+                "help_url": "https://www.figma.com/developers/api#access-tokens"
+            }
+        ],
+        "input_schema": [],
+        "official": False,
+    },
+
+    # ── 27. Tailwind CSS ──────────────────────────────────────────────────────
+    "tailwind": {
+        "name": "tailwind",
+        "display_name": "Tailwind CSS Documentation & Helper",
+        "category": "Design & UI",
+        "description": "Lookup Tailwind utility classes, search color tokens, and get design class recommendations.",
+        "icon": "code",
+        "auth_type": "none",
+        "command": ["npx", "-y", "tailwindcss-mcp-server"],
+        "env_schema": [],
         "input_schema": [],
         "official": False,
     }
