@@ -138,3 +138,68 @@ def seed_default_model(db: Session, model_path: str):
         db.add(model)
         db.commit()
         logger.info("Registered default Qwen model in SQLite models table.")
+
+
+# ─── Conversation Entity Memory ──────────────────────────────────────────────
+
+from app.db.models import ConversationEntity
+
+def save_entity(
+    db: Session,
+    conversation_id: str,
+    label: str,
+    entity_type: str,
+    entity_id: str,
+    data: dict
+) -> ConversationEntity:
+    """
+    Persists a user-confirmed entity to the conversation_entities table.
+    `data` is the full raw content (email body, file text, channel messages, etc.)
+    """
+    entity = ConversationEntity(
+        conversation_id=conversation_id,
+        label=label,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        data_json=json.dumps(data, ensure_ascii=False)
+    )
+    db.add(entity)
+    db.commit()
+    db.refresh(entity)
+    logger.info(f"Saved entity [{entity_type}] '{label}' for session {conversation_id[:8]}")
+    return entity
+
+
+def get_session_entities(db: Session, conversation_id: str) -> List[ConversationEntity]:
+    """Returns all confirmed entities for a given conversation session."""
+    return (
+        db.query(ConversationEntity)
+        .filter(ConversationEntity.conversation_id == conversation_id)
+        .order_by(ConversationEntity.created_at)
+        .all()
+    )
+
+
+def build_entity_context_block(db: Session, conversation_id: str) -> str:
+    """
+    Builds a compact, structured text block of confirmed session entities
+    to be injected at the top of the LLM system prompt.
+    Returns an empty string if no entities are confirmed yet.
+    """
+    entities = get_session_entities(db, conversation_id)
+    if not entities:
+        return ""
+
+    lines = ["## Session Memory (confirmed by you):", ""]
+    for e in entities:
+        data = json.loads(e.data_json)
+        lines.append(f"[{e.entity_type}] \"{e.label}\" (ID: {e.entity_id})")
+        # Inline actual content so LLM reasons directly on real data
+        for key, value in data.items():
+            if isinstance(value, (str, int, float)):
+                lines.append(f"  {key}: {str(value)[:400]}")
+            elif isinstance(value, list):
+                lines.append(f"  {key}: {json.dumps(value[:5])}")
+        lines.append("")
+
+    return "\n".join(lines)

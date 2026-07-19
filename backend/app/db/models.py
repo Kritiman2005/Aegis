@@ -70,3 +70,21 @@ class MCPTool(Base):
 
     # Relationships
     server = relationship("MCPServer", back_populates="tools")
+
+
+class ConversationEntity(Base):
+    """
+    Universal session memory store.
+    Holds any entity (email, file, channel, contact, etc.) the user explicitly
+    confirms to remember within a chat session.
+    All entity-type-specific fields live inside `data_json` as raw JSON.
+    """
+    __tablename__ = "conversation_entities"
+
+    id              = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(String, index=True, nullable=False)  # WebSocket connection_id / session key
+    label           = Column(String, nullable=False)              # Human-readable alias ("Instagram email", "#dev")
+    entity_type     = Column(String, nullable=False)              # "gmail_message" | "drive_file" | "slack_channel" | "slack_message" | "contact" | ...
+    entity_id       = Column(String, nullable=False)              # Actual ID in the external system
+    data_json       = Column(Text, nullable=False)                # Full JSON content (email body, file text, channel messages, ...)
+    created_at      = Column(DateTime, default=datetime.utcnow)

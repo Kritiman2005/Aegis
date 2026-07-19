@@ -70,19 +70,18 @@ async def websocket_endpoint(
                     # Send a "thinking" indicator so the user knows the LLM is working
                     await manager.send_json(connection_id, {
                         "type": "token",
-                        "content": "⏳ Thinking..."
+                        "content": "\n⏳ Thinking...\n"
                     })
-                    
+
                     # Process the message through the state machine
-                    # No streaming callback — we send the formatted plan summary only
                     response_text = await session.handle_message(content)
-                    
-                    # Send the formatted plan summary
+
+                    # Clear thinking line then print response on a fresh line
                     await manager.send_json(connection_id, {
                         "type": "token",
-                        "content": "\r" + response_text  # \r clears the "Thinking..." line
+                        "content": "\r" + " " * 20 + "\r" + response_text
                     })
-                    
+
                     # Signal end of stream
                     await manager.send_json(connection_id, {
                         "type": "done",
@@ -97,8 +96,9 @@ async def websocket_endpoint(
                                 "type": "token",
                                 "content": progress
                             })
-                        
+
                         # End stream when execution finishes
+                        # (state is now IDLE or WAITING_MEMORY_CONFIRMATION)
                         await manager.send_json(connection_id, {
                             "type": "done",
                             "content": "",
