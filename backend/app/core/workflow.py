@@ -198,12 +198,35 @@ class AgentSession:
             self.chat_history.append({"role": "assistant", "content": plan_json_str})
             self.state = AgentState.WAITING_CONFIRMATION
 
-            response = "\n\n📋 Execution plan based on your request:\n\n"
+            response = "📋 **Proposed Execution Plan:**\n\n"
             for i, step in enumerate(self.plan):
-                response += f"{i+1}. **{step.get('tool')}**: {step.get('reason')}\n"
+                response += f"**Step {i+1}: `{step.get('tool')}`**\n"
+                if step.get("reason"):
+                    response += f"└ *Purpose:* {step.get('reason')}\n"
+                
+                args = step.get("arguments", {})
+                if isinstance(args, dict) and args:
+                    response += "└ *Parameters:*\n"
+                    for k, v in args.items():
+                        if isinstance(v, (dict, list)):
+                            val_str = json.dumps(v, ensure_ascii=False)
+                        else:
+                            val_str = str(v)
+                        if len(val_str) > 140:
+                            val_str = val_str[:137] + "..."
+                        response += f"   • `{k}`: {val_str}\n"
+
+                preview = step.get("payload_preview")
+                if preview:
+                    preview_str = json.dumps(preview, indent=2, ensure_ascii=False) if isinstance(preview, (dict, list)) else str(preview)
+                    formatted_preview = preview_str.strip().replace('\n', '\n> ')
+                    response += f"└ *Payload Preview:*\n> {formatted_preview}\n"
+                response += "\n"
+
             if warnings:
-                response += "\n⚠️ Warnings:\n" + "\n".join([f"- {w}" for w in warnings])
-            response += "\n\nIs this what you wanted? (Reply 'yes' to proceed or tell me what to change)"
+                response += "⚠️ **Warnings:**\n" + "\n".join([f"- {w}" for w in warnings]) + "\n\n"
+
+            response += "Would you like me to proceed with this? (Reply **'yes'** to execute or tell me what to edit)"
             return response
 
         except json.JSONDecodeError:
