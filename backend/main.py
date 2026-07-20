@@ -24,6 +24,7 @@ from app.api.health import router as health_router
 from app.api.websocket import router as ws_router
 from app.api.auth import router as auth_router
 from app.api.connectors import router as connectors_router
+from app.api.oauth_routes import router as oauth_router   # generic OAuth for Slack, Notion, etc.
 
 # ─── App Factory ─────────────────────────────────────────────────────────────
 
@@ -55,8 +56,9 @@ app.add_middleware(
 
 app.include_router(health_router, prefix="/api")
 app.include_router(ws_router)
-app.include_router(auth_router)
-app.include_router(connectors_router)
+app.include_router(auth_router)          # /auth/google/login  + /auth/google/callback
+app.include_router(oauth_router)         # /auth/{service}/login + /auth/{service}/callback
+app.include_router(connectors_router)    # /api/connectors/*
 
 # ─── Startup: SQLite Initialization & OAuth Auto-Restore ──────────────────────
 

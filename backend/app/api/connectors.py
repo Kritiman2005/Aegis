@@ -18,6 +18,7 @@ from app.db.database import get_db
 from app.mcp.registry import mcp_registry
 from app.mcp.catalog import (
     get_catalog_list,
+    get_catalog_for_audience,
     resolve_connector_command,
     CONNECTORS_CATALOG
 )
@@ -29,23 +30,29 @@ router = APIRouter(prefix="/api/connectors", tags=["connectors"])
 # ── Request Schemas ───────────────────────────────────────────────────────────
 
 class ConnectCatalogRequest(BaseModel):
-    server_name: str                        # e.g., "github", "postgres", "filesystem"
-    env: Optional[Dict[str, str]] = None     # e.g., {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_..."}
-    input_params: Optional[Dict[str, str]] = None  # e.g., {"db_url": "postgresql://..."} or {"allowed_path": "/Users/..."}
+    server_name: str
+    env: Optional[Dict[str, str]] = None
+    input_params: Optional[Dict[str, str]] = None
 
 
 class ConnectCustomServerRequest(BaseModel):
-    server_name: str                         # e.g., "custom_server"
-    command: List[str]                       # e.g., ["npx", "-y", "@some/mcp-server"]
+    server_name: str
+    command: List[str]
     env: Optional[Dict[str, str]] = None
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.get("/catalog")
-def list_catalog():
-    """Returns the gallery of all pre-configured connectors for the frontend."""
+def list_catalog(audience: Optional[str] = None):
+    """
+    Returns the connector gallery.
+    Optional ?audience=hr|marketing|sales|operations|developer|all to filter.
+    """
+    if audience:
+        return {"catalog": get_catalog_for_audience(audience)}
     return {"catalog": get_catalog_list()}
+
 
 
 @router.get("")
