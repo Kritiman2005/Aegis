@@ -264,90 +264,109 @@ class AgentSession:
 
     async def _handle_memory_confirmation(self, message: str) -> str:
         """
-        WAITING_MEMORY_CONFIRMATION → parse user selection → save confirmed entities → IDLE.
+        WAITING_MEMORY_CONFIRMATION → parse user selection or custom user memory directive → save → IDLE.
 
         Accepts:
-          "yes" / "all"       → save all
+          "yes" / "all"       → save all AI suggestions
           "no" / "skip"       → skip all
-          "1 3" / "1, 2"      → save by index
-          "remember the gmail" / "save the email" → fuzzy type/label match
+          "1 3" / "1, 2"      → save specific suggestions by index
+          "remember ..."      → save custom user note with TOP PRIORITY
+          "label name"        → match and save suggested item
         """
         import re
-        msg = message.strip().lower()
+        msg_raw = message.strip()
+        msg_lower = msg_raw.lower()
         entities = self._pending_entities
 
         # ── Hard no ──────────────────────────────────────────────────────────
-        if not entities or msg in ("no", "n", "skip", "nope", "nah", "dont save", "don't save"):
+        if msg_lower in ("no", "n", "skip", "nope", "nah", "dont save", "don't save", "nothing"):
             self._pending_entities = []
             self.state = AgentState.IDLE
             return "Got it. Nothing saved. What would you like to do next?"
 
-        # ── Hard yes ─────────────────────────────────────────────────────────
-        if msg in ("yes", "y", "all", "save all", "yeah", "yep", "ok", "okay", "sure", "save"):
+        # ── Explicit user custom memory directive ("remember that...", "note that...", "save ...") ──
+        custom_prefixes = ["remember", "note", "keep in mind", "save that", "save note"]
+        is_custom_directive = any(msg_lower.startswith(p) for p in custom_prefixes)
+
+        if is_custom_directive:
+            # Extract the actual custom note body
+            custom_note = msg_raw
+            for p in custom_prefixes:
+                if msg_lower.startswith(p):
+                    custom_note = msg_raw[len(p):].strip(" :,-").capitalize()
+                    break
+
+            try:
+                db = SessionLocal()
+                save_entity(
+                    db=db,
+                    conversation_id=self.connection_id,
+                    label=custom_note[:60],
+                    entity_type="user_custom_note",
+                    entity_id=f"custom_{hash(custom_note)}",
+                    data={"custom_note": custom_note, "user_directed": True}
+                )
+                db.close()
+                self._pending_entities = []
+                self.state = AgentState.IDLE
+                return (
+                    f"💾 **Saved your custom note to memory (Top Priority):**\n"
+                    f"  ✅ \"{custom_note}\"\n\n"
+                    "I'll remember this for all future steps. What's next?"
+                )
+            except Exception as ex:
+                logger.error(f"Failed to save custom note: {ex}")
+                self._pending_entities = []
+                self.state = AgentState.IDLE
+                return f"⚠️ Could not save custom note: {ex}"
+
+        # ── Hard yes (Save all suggested entities) ───────────────────────────
+        selected = []
+        if msg_lower in ("yes", "y", "all", "save all", "yeah", "yep", "ok", "okay", "sure", "save"):
             selected = entities
 
         # ── Numeric selection: "1 3", "1, 2" ─────────────────────────────────
-        elif re.search(r'\d', msg):
-            nums = re.findall(r'\d+', msg)
+        elif re.search(r'\d', msg_lower):
+            nums = re.findall(r'\d+', msg_lower)
             indices = [int(n) - 1 for n in nums]
             selected = [entities[i] for i in indices if 0 <= i < len(entities)]
 
-        # ── Natural language / fuzzy match ───────────────────────────────────
+        # ── Fuzzy match against suggested entity labels ──────────────────────
         else:
-            # Map common keywords to entity types
-            type_keywords = {
-                "gmail_message": ["gmail", "email", "mail", "message", "inbox"],
-                "gmail_draft":   ["draft"],
-                "drive_file":    ["drive", "file", "doc", "document", "sheet", "slide"],
-                "slack_channel": ["slack", "channel"],
-                "slack_message": ["slack", "message"],
-                "contact":       ["contact", "person", "user"],
-                "calendar_event":["calendar", "event", "meeting"],
-                "notion_page":   ["notion", "page"],
-            }
-
-            selected = []
-
-            # 1. Try matching against entity labels ("remember the Instagram email" matches label containing "instagram")
             for e in entities:
                 label_lower = e.get("label", "").lower()
-                if any(word in msg for word in label_lower.split()):
+                if any(word in msg_lower for word in label_lower.split()):
                     selected.append(e)
 
-            # 2. If no label match, try matching entity type via keywords
-            if not selected:
-                for e in entities:
-                    etype = e.get("type", "")
-                    kws = type_keywords.get(etype, [etype])
-                    if any(kw in msg for kw in kws):
-                        selected.append(e)
-
-            # 3. Ordinal words: "first", "second", "third"
-            ordinals = {"first": 0, "second": 1, "third": 2, "fourth": 3, "fifth": 4,
-                        "1st": 0, "2nd": 1, "3rd": 2, "4th": 3, "5th": 4}
-            if not selected:
-                for word, idx in ordinals.items():
-                    if word in msg and idx < len(entities):
-                        selected.append(entities[idx])
-
-            # 4. Still nothing — ask with a hint showing what's available
-            if not selected:
-                entity_hints = ", ".join([f'"{e["label"]}" ({e["type"]})' for e in entities])
-                return (
-                    f"I couldn't match that to any of the proposed items: {entity_hints}.\n\n"
-                    "Please reply:\n"
-                    "  • **yes** — save all\n"
-                    "  • **no** — skip all\n"
-                    "  • **numbers** (e.g. `1 3`) — save specific items\n"
-                    "  • **label name** (e.g. 'gmail', 'Instagram email') — save by name"
-                )
+            # If still nothing matched, treat user's message as a custom memory note!
+            if not selected and len(msg_raw.split()) > 2:
+                try:
+                    db = SessionLocal()
+                    save_entity(
+                        db=db,
+                        conversation_id=self.connection_id,
+                        label=msg_raw[:60],
+                        entity_type="user_custom_note",
+                        entity_id=f"custom_{hash(msg_raw)}",
+                        data={"custom_note": msg_raw, "user_directed": True}
+                    )
+                    db.close()
+                    self._pending_entities = []
+                    self.state = AgentState.IDLE
+                    return (
+                        f"💾 **Saved custom note to memory (Top Priority):**\n"
+                        f"  ✅ \"{msg_raw}\"\n\n"
+                        "What would you like to do next?"
+                    )
+                except Exception as ex:
+                    logger.error(f"Failed to save custom memory: {ex}")
 
         if not selected:
             self._pending_entities = []
             self.state = AgentState.IDLE
-            return "Nothing matched your selection. Moving on — what's next?"
+            return "Got it. What would you like to do next?"
 
-        # Persist selected entities to SQLite
+        # Persist selected suggested entities to SQLite
         try:
             db = SessionLocal()
             saved_labels = []

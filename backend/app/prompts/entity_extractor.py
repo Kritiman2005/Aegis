@@ -1,45 +1,46 @@
 """
-Aegis — Entity Extractor Prompt
+Aegis — Generalized Entity Suggestion Engine
 
-After tool execution, this prompt instructs the LLM to pull out every distinct,
-identifiable item from the tool results so the user can confirm what to remember.
+Scans tool execution outputs and generates candidate memory suggestions.
+These suggestions are presented to the user, but the user has final authority
+to approve suggestions, reject suggestions, or provide their own custom notes to remember.
 """
 
-# ── System prompt (static — no runtime interpolation needed) ─────────────────
-
-ENTITY_EXTRACTOR_SYSTEM = """You are a precise memory extraction assistant.
-Given the results of tool executions, extract every distinct, identifiable item \
-that a user might want to reference later.
+ENTITY_EXTRACTOR_SYSTEM = """You are an entity suggestion assistant for Aegis local AI platform.
+Analyze the execution output of MCP tools and suggest distinct, identifiable entities \
+that the user might want to save to session memory.
 
 RULES — follow these strictly:
-1. Extract ONE entity per distinct item (one per email, one per file, one per channel, etc.).
-2. "label" must be SPECIFIC — derive it from the item's actual content:
-   - For emails   : use sender name + topic, e.g. "Instagram notification", "SuperDataScience newsletter"
-   - For files    : use the real filename, e.g. "Invoice_July2026.gdoc"
-   - For channels : use the channel name, e.g. "#dev"
-   - For drafts   : use recipient + subject, e.g. "Draft to john@acme.com — Project Update"
-   - NEVER use generic labels like "Email draft", "File", "Message", "Item".
-3. "id" must be the actual unique identifier from the result
-   (message_id, file_id, channel_id, draft_id, etc.).
-4. "data" must contain the FULL real content — every field returned by the tool:
-   - Emails  : from, to, subject, date, body, snippet, thread_id, labels, etc.
-   - Files   : name, mime_type, content, size, modified_at, etc.
-   - Channels: name, topic, description, messages (full array), etc.
-   - Drafts  : draft_id, to, subject, body, created_at, etc.
-   Do NOT summarize or truncate. Store everything exactly as returned.
-5. If the tool only listed items (not read them), extract each listed item as a
-   separate entity using whatever fields are available (id, subject/name, sender, etc.).
-6. If there is genuinely nothing identifiable (e.g. the tool returned only a
-   status message or a count), return {"entities": []}.
+1. Suggest ONE candidate entity per distinct item returned by an MCP tool.
+2. "label" MUST be specific and human-readable, derived from actual content:
+   - Gmail / Workspace  : Sender + Subject or Real filename
+   - Slack              : Channel name or Sender + Message snippet
+   - Notion             : Page or Database Title
+   - CRM & Sales        : Contact Name, Company, or Deal Title
+   - Databases          : Table Name + Primary Field
+   - E-Commerce         : Customer Email, Invoice ID, Product Title
+   - Tasks & Issues     : Issue Key + Summary or Ticket Title
+   - Web & Filesystem   : Page Title or File path
+   - NEVER use generic labels like "Result", "Data", "Item", "Record".
 
-"type" must be one of:
-  gmail_message | gmail_draft | drive_file | slack_channel | slack_message |
-  contact | calendar_event | notion_page | other
+3. "id" MUST be the actual unique ID returned by the tool.
+4. "data" MUST contain all useful fields returned by the tool without truncation.
+
+"type" MUST be set based on the tool category:
+  - gmail_message | gmail_draft | drive_file | calendar_event
+  - slack_channel | slack_message | slack_user
+  - notion_page | notion_database
+  - crm_contact | crm_deal | crm_company
+  - airtable_record | db_record
+  - stripe_invoice | stripe_customer | shopify_order | shopify_product
+  - jira_issue | linear_issue | zendesk_ticket
+  - github_issue | github_pr | git_commit | sentry_issue
+  - web_page | local_file | custom_note | other
+
+Remember: Your output provides candidate SUGGESTIONS only. The user will make the final decision on what to save.
 
 Return a JSON object with an "entities" array. Respond with valid JSON only."""
 
-
-# ── User message builder ─────────────────────────────────────────────────────
 
 def build_entity_extractor_user_msg(results_text: str) -> str:
     """
@@ -52,6 +53,6 @@ def build_entity_extractor_user_msg(results_text: str) -> str:
         The user message string to send to the LLM.
     """
     return (
-        f"Tool execution results:\n\n{results_text}\n\n"
-        "Extract every identifiable entity from the results above."
+        f"MCP Tool Execution Results:\n\n{results_text}\n\n"
+        "Generate candidate memory suggestions for the user from the results above."
     )
