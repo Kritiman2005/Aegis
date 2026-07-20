@@ -1,82 +1,85 @@
 'use client';
 
-import { useCallback } from 'react';
+import { useState, useCallback } from 'react';
+import Sidebar, { TabType } from '@/components/Sidebar';
+import Header from '@/components/Header';
+import ChatView from '@/components/ChatView';
+import ConnectorsView from '@/components/ConnectorsView';
+import SettingsView from '@/components/SettingsView';
 import { useSocket } from '@/hooks/useSocket';
-import Sidebar from '@/components/Sidebar';
-import ChatWindow from '@/components/ChatWindow';
-import ChatInput from '@/components/ChatInput';
 
 export default function Home() {
+  const [activeTab, setActiveTab] = useState<TabType>('connectors'); // Default to Connectors view matching Stitch Image 1
+  const [activeConnectorName, setActiveConnectorName] = useState('GitHub');
   const { messages, status, isStreaming, sendMessage, clearMessages } = useSocket();
 
   const handleNewChat = useCallback(() => {
     clearMessages();
+    setActiveTab('chat');
   }, [clearMessages]);
 
   return (
-    <main className="flex h-full w-full overflow-hidden bg-[#080B14]">
-      {/* Background gradient orbs */}
-      <div className="pointer-events-none fixed inset-0 overflow-hidden">
-        <div className="absolute -top-40 -left-40 w-80 h-80 rounded-full bg-aegis-primary/5 blur-3xl" />
-        <div className="absolute top-1/3 -right-20 w-60 h-60 rounded-full bg-aegis-accent/5 blur-3xl" />
-        <div className="absolute -bottom-20 left-1/3 w-72 h-72 rounded-full bg-aegis-primary/4 blur-3xl" />
-      </div>
+    <div className="flex h-screen w-screen overflow-hidden bg-[#F8F9FA] text-gray-900 font-sans antialiased">
+      {/* ── Left Sidebar Navigation (Fixed width matching stitch) ───────── */}
+      <Sidebar
+        activeTab={activeTab}
+        setActiveTab={setActiveTab}
+        onNewChat={handleNewChat}
+      />
 
-      {/* Sidebar */}
-      <Sidebar onNewChat={handleNewChat} />
-
-      {/* Main Chat Area */}
-      <section className="flex flex-col flex-1 min-w-0 h-full relative">
-        {/* Top bar */}
-        <header className="flex items-center justify-between px-6 py-3 border-b border-aegis-border glass flex-shrink-0">
-          <div className="flex items-center gap-3">
-            <h2 className="text-sm font-semibold text-aegis-text-primary">
-              Chat
-            </h2>
-            {messages.length > 0 && (
-              <span className="text-xs text-aegis-text-muted bg-aegis-raised px-2 py-0.5 rounded-full border border-aegis-border">
-                {messages.filter((m) => m.role === 'user').length} messages
-              </span>
-            )}
-          </div>
-
-          <div className="flex items-center gap-3">
-            {/* Connection status badge */}
-            <div className="flex items-center gap-1.5">
-              <span
-                className={`w-1.5 h-1.5 rounded-full ${
-                  status === 'connected'
-                    ? 'bg-aegis-success'
-                    : status === 'error'
-                    ? 'bg-aegis-error animate-pulse'
-                    : 'bg-aegis-warning animate-pulse'
-                }`}
-              />
-              <span className="text-xs text-aegis-text-muted capitalize">{status}</span>
-            </div>
-
-            {/* Clear button */}
-            {messages.length > 0 && (
-              <button
-                onClick={handleNewChat}
-                className="text-xs text-aegis-text-muted hover:text-aegis-error transition-colors px-2 py-1 rounded-lg hover:bg-aegis-error/10"
-              >
-                Clear
-              </button>
-            )}
-          </div>
-        </header>
-
-        {/* Messages */}
-        <ChatWindow messages={messages} isStreaming={isStreaming} />
-
-        {/* Input */}
-        <ChatInput
-          onSend={sendMessage}
-          isStreaming={isStreaming}
-          status={status}
+      {/* ── Main Content Area ───────────────────────────────────────────── */}
+      <div className="flex-1 flex flex-col min-w-0 h-full overflow-hidden">
+        {/* Top Header Bar */}
+        <Header
+          activeConnectorName={activeConnectorName}
+          searchPlaceholder={
+            activeTab === 'connectors'
+              ? 'Search connectors...'
+              : activeTab === 'settings'
+              ? 'Search settings...'
+              : 'Search Workspace...'
+          }
         />
-      </section>
-    </main>
+
+        {/* Tab Views */}
+        {activeTab === 'chat' && (
+          <ChatView
+            messages={messages}
+            status={status}
+            isStreaming={isStreaming}
+            onSendMessage={sendMessage}
+            onClearMessages={clearMessages}
+            activeConnectorName={activeConnectorName}
+          />
+        )}
+
+        {(activeTab === 'connectors' || activeTab === 'sync_detail') && (
+          <ConnectorsView
+            onSelectConnector={(connectorName) => {
+              setActiveConnectorName(connectorName);
+            }}
+          />
+        )}
+
+        {activeTab === 'settings' && <SettingsView />}
+
+        {activeTab === 'history' && (
+          <div className="flex-1 p-8 overflow-y-auto">
+            <h2 className="text-2xl font-bold text-gray-900 mb-4">Chat History</h2>
+            <div className="bg-white rounded-2xl border border-gray-200 p-6 shadow-sm">
+              <p className="text-xs text-gray-500">
+                Your past conversation threads are stored locally in Aegis SQLite database.
+              </p>
+              <button
+                onClick={() => setActiveTab('chat')}
+                className="mt-4 px-4 py-2 bg-black text-white text-xs font-semibold rounded-xl hover:bg-neutral-800 transition-all"
+              >
+                Start New Chat
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
   );
 }

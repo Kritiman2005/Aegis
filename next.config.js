@@ -1,18 +1,15 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  // Static HTML export — required for Electron production loading via loadFile()
-  output: 'export',
+  // Use static HTML export only when building for production Electron package
+  output: process.env.NEXT_EXPORT ? 'export' : undefined,
 
-  // Disable built-in image optimization (not compatible with static export)
+  // Disable built-in image optimization for local desktop compatibility
   images: {
     unoptimized: true,
   },
 
-  // Trailing slash for consistent static file resolution in Electron
+  // Trailing slash for consistent resolution
   trailingSlash: true,
-
-  // Source directory is src/
-  // (Next.js auto-detects this when src/app/ exists)
 };
 
 module.exports = nextConfig;

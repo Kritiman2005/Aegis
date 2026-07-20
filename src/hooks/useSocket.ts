@@ -2,7 +2,7 @@
  * Aegis — useSocket
  *
  * A robust WebSocket hook that manages:
- *  - Persistent connection to ws://localhost:8000/ws
+ *  - Persistent connection to ws://127.0.0.1:8000/ws
  *  - Automatic reconnection with exponential backoff
  *  - Streaming token accumulation into assistant messages
  *  - Connection status reporting
@@ -40,7 +40,7 @@ interface ServerPayload {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const WS_URL = 'ws://localhost:8000/ws';
+const WS_URL = 'ws://127.0.0.1:8000/ws';
 const MAX_RECONNECT_DELAY_MS = 30_000;
 const BASE_RECONNECT_DELAY_MS = 1_000;
 const PING_INTERVAL_MS = 25_000;
@@ -63,9 +63,9 @@ export function useSocket() {
   const socketRef = useRef<WebSocket | null>(null);
   const connectionIdRef = useRef<string>(generateId()); // Stable client ID across reconnects
   const reconnectAttemptsRef = useRef(0);
-  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout>>();
-  const pingTimerRef = useRef<ReturnType<typeof setInterval>>();
-  const pongTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const pingTimerRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
+  const pongTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const streamingIdRef = useRef<string | null>(null);
   const isUnmountedRef = useRef(false);
 
