@@ -70,7 +70,7 @@ async def websocket_endpoint(
                     # Send a "thinking" indicator so the user knows the LLM is working
                     await manager.send_json(connection_id, {
                         "type": "token",
-                        "content": "\n⏳ Thinking...\n"
+                        "content": "\nThinking...\n"
                     })
 
                     # Process the message through the state machine

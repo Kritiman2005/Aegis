@@ -67,8 +67,13 @@ export default function ConnectorsView({ onSelectConnector }: ConnectorsViewProp
       if (actRes.ok) {
         const actData = await actRes.json();
         const serverMap: Record<string, ConnectedServer> = {};
-        (actData.servers || []).forEach((s: ConnectedServer) => {
-          serverMap[s.name] = s;
+        Object.entries(actData.status || {}).forEach(([name, info]: [string, any]) => {
+          serverMap[name] = {
+            name,
+            status: info.running ? 'connected' : 'disconnected',
+            tools_count: info.tools_count || 0,
+            active: info.running
+          };
         });
         setActiveServers(serverMap);
       }

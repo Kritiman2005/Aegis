@@ -64,4 +64,4 @@ FORMAT EXAMPLE:
 
 If no tools are required or available, return an empty "plan" array with a "warnings" array explaining why.
 
-Respond with valid JSON only."""
+Respond with valid JSON only. Do not use any emojis or icons. Ensure flawless English."""

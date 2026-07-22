@@ -11,6 +11,7 @@ from app.db.crud import save_entity, build_entity_context_block
 from .base import BaseAgent
 from .planner import PlannerAgent
 from .extractor import EntityExtractorAgent
+from app.prompts.chat import build_chat_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ class ChatAgent(BaseAgent):
         # Entities proposed after execution — awaiting user confirmation
         # Format: [{"label": ..., "type": ..., "id": ..., "data": {...}}, ...]
         self._pending_entities: List[Dict] = []
+        self.requires_entity_extraction: bool = False
         
         # Instantiate sub-agents
         self.planner = PlannerAgent(llm_mgr)
@@ -71,6 +73,28 @@ class ChatAgent(BaseAgent):
             logger.warning(f"Could not load entity context: {e}")
             return ""
 
+    def _call_llm_json(self, messages):
+        llm = self.get_llm()
+        if not llm:
+            return "{}"
+        try:
+            response = llm.create_chat_completion(
+                messages=messages,
+                response_format={"type": "json_object"},
+                temperature=0.1,
+                stream=True
+            )
+            full_response = ""
+            for chunk in response:
+                if "choices" in chunk and len(chunk["choices"]) > 0:
+                    delta = chunk["choices"][0].get("delta", {})
+                    if "content" in delta:
+                        full_response += delta["content"]
+            return full_response
+        except Exception as e:
+            logger.error(f"LLM JSON call failed: {e}")
+            return "{}"
+
     # ─────────────────────────────────────────────────────────────────────────
     # State machine
     # ─────────────────────────────────────────────────────────────────────────
@@ -98,28 +122,34 @@ class ChatAgent(BaseAgent):
         if "No active Google session" in tools_str:
             return tools_str
 
-        # ── Meta-query interceptor (no LLM needed) ──────────────────────────
-        meta_keywords = [
-            "list tools", "list the tools", "show tools", "what tools",
-            "available tools", "what can you do", "help", "what are the tools",
-            "which tools", "tools available", "mcp tools", "list mcp"
-        ]
-        msg_lower = message.strip().lower()
-        if any(kw in msg_lower for kw in meta_keywords):
-            tools = mcp_registry.list_tools()
-            lines = [f"\n🛠️  Available tools ({len(tools)}):\n"]
-            for t in tools:
-                lines.append(f"  • **{t['name']}** — {t['description']}")
-            lines.append("\nJust describe what you'd like to do and I'll use them automatically.")
-            return "\n".join(lines)
-        # ────────────────────────────────────────────────────────────────────
-
         self.chat_history.append({"role": "user", "content": message})
         
         entity_context = self._get_entity_context()
 
+        # We will pass chat history EXCLUDING the current message to planner, as planner appends it.
+        history_for_planner = self.chat_history[:-1]
+
+        # ── Chat Router (Decide if tools needed) ─────────────────────────────
+        chat_prompt = build_chat_prompt(tools_str, entity_context)
+        messages = [{"role": "system", "content": chat_prompt}]
+        messages.extend(self.chat_history)
+
+        chat_response_json = await anyio.to_thread.run_sync(
+            lambda: self._call_llm_json(messages)
+        )
+
+        try:
+            chat_data = json.loads(chat_response_json)
+            if not chat_data.get("requires_planner"):
+                direct_response = chat_data.get("response", "I'm not sure how to respond.")
+                self.chat_history.append({"role": "assistant", "content": direct_response})
+                return direct_response
+        except Exception as e:
+            logger.error(f"Chat router failed: {e}")
+
+        # ── Plan Generation ──────────────────────────────────────────────────
         plan_json_str = await anyio.to_thread.run_sync(
-            lambda: self.planner.generate_plan(message, tools_str, entity_context, self.chat_history, token_callback)
+            lambda: self.planner.generate_plan(message, tools_str, entity_context, history_for_planner, token_callback)
         )
 
         try:
@@ -139,13 +169,16 @@ class ChatAgent(BaseAgent):
             if not self.plan:
                 self.state = AgentState.IDLE
                 if warnings:
-                    return "Note:\n" + "\n".join([f"- {w}" for w in warnings])
+                    return "**Note:**\n" + "\n".join([f"- {w}" for w in warnings])
                 return f"Available tools:\n{tools_str}\n\nWhat would you like me to do with them?"
 
+            # Set requires_entity_extraction to True if any tool is called, since we reverted the planner prompt.
+            # We can default to True when planner is invoked.
+            self.requires_entity_extraction = True
             self.chat_history.append({"role": "assistant", "content": plan_json_str})
             self.state = AgentState.WAITING_CONFIRMATION
 
-            response = "📋 **Proposed Execution Plan:**\n\n"
+            response = "**Proposed Execution Plan:**\n\n"
             for i, step in enumerate(self.plan):
                 response += f"**Step {i+1}: `{step.get('tool')}`**\n"
                 if step.get("reason"):
@@ -171,7 +204,7 @@ class ChatAgent(BaseAgent):
                 response += "\n"
 
             if warnings:
-                response += "⚠️ **Warnings:**\n" + "\n".join([f"- {w}" for w in warnings]) + "\n\n"
+                response += "**Warnings:**\n" + "\n".join([f"- {w}" for w in warnings]) + "\n\n"
 
             response += "Would you like me to proceed with this? (Reply **'yes'** to execute or tell me what to edit)"
             return response
@@ -258,15 +291,15 @@ class ChatAgent(BaseAgent):
                 self._pending_entities = []
                 self.state = AgentState.IDLE
                 return (
-                    f"💾 **Saved your custom note to memory (Top Priority):**\n"
-                    f"  ✅ \"{custom_note}\"\n\n"
+                    f"**Saved your custom note to memory (Top Priority):**\n"
+                    f"  - \"{custom_note}\"\n\n"
                     "I'll remember this for all future steps. What's next?"
                 )
             except Exception as ex:
                 logger.error(f"Failed to save custom note: {ex}")
                 self._pending_entities = []
                 self.state = AgentState.IDLE
-                return f"⚠️ Could not save custom note: {ex}"
+                return f"Could not save custom note: {ex}"
 
         # ── Hard yes (Save all suggested entities) ───────────────────────────
         selected = []
@@ -302,8 +335,8 @@ class ChatAgent(BaseAgent):
                     self._pending_entities = []
                     self.state = AgentState.IDLE
                     return (
-                        f"💾 **Saved custom note to memory (Top Priority):**\n"
-                        f"  ✅ \"{msg_raw}\"\n\n"
+                        f"**Saved custom note to memory (Top Priority):**\n"
+                        f"  - \"{msg_raw}\"\n\n"
                         "What would you like to do next?"
                     )
                 except Exception as ex:
@@ -333,13 +366,13 @@ class ChatAgent(BaseAgent):
             logger.error(f"Failed to save entities: {ex}")
             self._pending_entities = []
             self.state = AgentState.IDLE
-            return f"⚠️ Could not save to memory: {ex}"
+            return f"Could not save to memory: {ex}"
 
         self._pending_entities = []
         self.state = AgentState.IDLE
-        saved_list = "\n".join([f"  ✅ {l}" for l in saved_labels])
+        saved_list = "\n".join([f"  - {l}" for l in saved_labels])
         return (
-            f"💾 Saved to session memory:\n{saved_list}\n\n"
+            f"Saved to session memory:\n{saved_list}\n\n"
             "I'll use these directly in future responses — no need to re-fetch. What's next?"
         )
 
@@ -366,14 +399,14 @@ class ChatAgent(BaseAgent):
             tool_name = step.get("tool")
             arguments = step.get("arguments", {})
 
-            yield f"\n⏳ Executing Task {i+1}: Calling `{tool_name}`...\n"
+            yield f"\nExecuting Task {i+1}: Calling `{tool_name}`...\n"
 
             try:
                 result = await anyio.to_thread.run_sync(
                     lambda t=tool_name, a=arguments: mcp_registry.call_tool(t, a)
                 )
                 result_str = str(result)
-                yield f"✅ Result for `{tool_name}`:\n{result_str[:1000]}\n"
+                yield f"Result for `{tool_name}`:\n{result_str[:1000]}\n"
 
                 # Collect result for entity extraction
                 tool_results.append({
@@ -383,14 +416,14 @@ class ChatAgent(BaseAgent):
                 })
             except Exception as e:
                 logger.error(f"Tool execution failed: {e}")
-                yield f"❌ Error executing `{tool_name}`: {e}\n"
+                yield f"Error executing `{tool_name}`: {e}\n"
                 break
 
-        yield "\n🎉 Execution complete!"
+        yield "\nExecution complete!"
 
         # ── Entity extraction ────────────────────────────────────────────────
-        if tool_results:
-            yield "\n\n🔍 Analysing results for things worth remembering...\n"
+        if tool_results and self.requires_entity_extraction:
+            yield "\n\nAnalysing results for things worth remembering...\n"
             try:
                 entities_json_str = await anyio.to_thread.run_sync(
                     lambda: self.extractor.extract_entities(tool_results)
@@ -405,7 +438,7 @@ class ChatAgent(BaseAgent):
                 self._pending_entities = proposed
                 self.state = AgentState.WAITING_MEMORY_CONFIRMATION
 
-                lines = ["\n💾 I found these items worth remembering for this session:\n"]
+                lines = ["\nI found these items worth remembering for this session:\n"]
                 for idx, e in enumerate(proposed, start=1):
                     lines.append(f"  {idx}. **{e.get('label')}** ({e.get('type')})")
                 lines.append(
