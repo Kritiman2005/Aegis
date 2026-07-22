@@ -3,12 +3,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Any, List
 
-try:
-    from llama_cpp import Llama
-except ImportError:
-    logging.warning("llama_cpp is not installed. LLM features will not work.")
-    Llama = None
-
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -29,7 +23,7 @@ class LLMManager:
         # Store configurations for available models
         self.available_models: Dict[str, ModelConfig] = {}
         # Cache for loaded models so we don't reload them into memory
-        self.loaded_models: Dict[str, Llama] = {}
+        self.loaded_models: Dict[str, Any] = {}
         
         # Register the default models
         self._register_default_models()
@@ -72,7 +66,7 @@ class LLMManager:
         """Add a new model configuration."""
         self.available_models[config.name] = config
         
-    def get_model(self, model_name: str) -> 'Llama':
+    def get_model(self, model_name: str) -> Any:
         """Get a loaded model, loading it if necessary."""
         if model_name not in self.available_models:
             raise ValueError(f"Model {model_name} not found in available configurations.")
@@ -84,11 +78,13 @@ class LLMManager:
         
     def _load_model(self, model_name: str):
         """Actually load the model into memory."""
+        try:
+            from llama_cpp import Llama
+        except ImportError:
+            raise ImportError("llama-cpp-python is not installed.")
+
         config = self.available_models[model_name]
         logger.info(f"Loading model: {model_name}")
-        
-        if Llama is None:
-            raise ImportError("llama-cpp-python is not installed.")
             
         kwargs = config.kwargs or {}
         

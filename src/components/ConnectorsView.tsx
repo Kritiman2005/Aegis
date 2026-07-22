@@ -11,7 +11,13 @@ import {
   ExternalLink,
   ShieldCheck,
   Clock,
-  AlertCircle
+  AlertCircle,
+  Mail,
+  MessageSquare,
+  FileText,
+  Users,
+  Database,
+  Box
 } from 'lucide-react';
 import ConfigModal, { CatalogConnector } from './ConfigModal';
 
@@ -25,6 +31,16 @@ interface ConnectedServer {
 interface ConnectorsViewProps {
   onSelectConnector?: (connectorName: string) => void;
 }
+
+const getConnectorIcon = (name: string) => {
+  const n = name.toLowerCase();
+  if (n.includes('google')) return <Mail className="w-6 h-6" />;
+  if (n.includes('slack')) return <MessageSquare className="w-6 h-6" />;
+  if (n.includes('notion')) return <FileText className="w-6 h-6" />;
+  if (n.includes('hubspot') || n.includes('salesforce')) return <Users className="w-6 h-6" />;
+  if (n.includes('airtable')) return <Database className="w-6 h-6" />;
+  return <Box className="w-6 h-6" />;
+};
 
 export default function ConnectorsView({ onSelectConnector }: ConnectorsViewProps) {
   const [catalog, setCatalog] = useState<CatalogConnector[]>([]);
@@ -65,6 +81,13 @@ export default function ConnectorsView({ onSelectConnector }: ConnectorsViewProp
 
   useEffect(() => {
     fetchData();
+    const handleMessage = (event: MessageEvent) => {
+      if (event.data === 'auth_success') {
+        fetchData();
+      }
+    };
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
   }, []);
 
   // Handle Connect Click
@@ -73,8 +96,8 @@ export default function ConnectorsView({ onSelectConnector }: ConnectorsViewProp
       // 1-Click OAuth flow: trigger browser login
       const service = connector.oauth_service || connector.name;
       const targetUrl = service === 'google_workspace' 
-        ? 'http://127.0.0.1:8000/auth/google/login' 
-        : `http://127.0.0.1:8000/auth/${service}/login`;
+        ? 'http://localhost:8000/auth/google/login' 
+        : `http://localhost:8000/auth/${service}/login`;
       window.open(targetUrl, '_blank');
     } else if (connector.auth_type === 'none') {
       // Direct connection with no auth required
@@ -110,27 +133,9 @@ export default function ConnectorsView({ onSelectConnector }: ConnectorsViewProp
   };
 
   // Filter categories
-  const categories = ['All', 'HR', 'Marketing', 'Sales', 'Developer Tools', 'Productivity', 'Payments & E-Commerce'];
-
   const filteredConnectors = catalog.filter((c) => {
-    const matchesCategory =
-      activeCategory === 'All'
-        ? true
-        : activeCategory === 'Developer Tools'
-        ? c.category === 'Developer Tools' || c.target_audience?.includes('developer')
-        : activeCategory === 'HR'
-        ? c.target_audience?.includes('hr')
-        : activeCategory === 'Marketing'
-        ? c.target_audience?.includes('marketing')
-        : activeCategory === 'Sales'
-        ? c.target_audience?.includes('sales')
-        : c.category.toLowerCase().includes(activeCategory.toLowerCase());
-
-    const matchesSearch =
-      c.display_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      c.description.toLowerCase().includes(searchQuery.toLowerCase());
-
-    return matchesCategory && matchesSearch;
+    return c.display_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+           c.description.toLowerCase().includes(searchQuery.toLowerCase());
   });
 
   // ── Sync / Detail View (Matching Image 3) ───────────────────────────────────
@@ -159,7 +164,7 @@ export default function ConnectorsView({ onSelectConnector }: ConnectorsViewProp
             <div className="bg-white rounded-2xl border border-gray-200 p-6 flex items-center justify-between shadow-sm">
               <div className="flex items-center gap-4">
                 <div className="w-14 h-14 rounded-2xl bg-gray-900 flex items-center justify-center text-white text-2xl font-bold">
-                  {selectedDetailConnector.display_name.charAt(0)}
+                  {getConnectorIcon(selectedDetailConnector.name)}
                 </div>
                 <div>
                   <h2 className="text-xl font-bold text-gray-900">{selectedDetailConnector.display_name}</h2>
@@ -289,22 +294,8 @@ export default function ConnectorsView({ onSelectConnector }: ConnectorsViewProp
 
       {/* Filter & Search Bar (Matching Image 1) */}
       <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-        {/* Left Category Filter Pills */}
-        <div className="flex items-center gap-1.5 p-1 bg-gray-200/50 rounded-2xl border border-gray-200/60 overflow-x-auto max-w-full">
-          {categories.map((cat) => (
-            <button
-              key={cat}
-              onClick={() => setActiveCategory(cat)}
-              className={`px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-all whitespace-nowrap ${
-                activeCategory === cat
-                  ? 'bg-black text-white shadow-sm'
-                  : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100/50'
-              }`}
-            >
-              {cat}
-            </button>
-          ))}
-        </div>
+        {/* Left spacer to push search to right if needed, or just let search take full width */}
+        <div className="flex-1"></div>
 
         {/* Right Search Input */}
         <div className="relative w-full sm:w-72">
@@ -341,7 +332,7 @@ export default function ConnectorsView({ onSelectConnector }: ConnectorsViewProp
                   {/* Top Card Row: Icon + Connect Button / Toggle */}
                   <div className="flex items-start justify-between mb-4">
                     <div className="w-12 h-12 rounded-xl bg-gray-900 flex items-center justify-center text-white text-xl font-bold shadow-sm">
-                      {connector.display_name.charAt(0)}
+                      {getConnectorIcon(connector.name)}
                     </div>
 
                     {/* Connect Button or Active Toggle */}

@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 import logging
 import anyio
 
@@ -17,9 +17,9 @@ AUTH_STATES = {}
 def google_login():
     """Triggered by the frontend to start the Google OAuth flow."""
     try:
-        state, flow = initiate_oauth_flow()
+        auth_url, state, flow = initiate_oauth_flow()
         AUTH_STATES[state] = flow
-        return JSONResponse(content={"message": "Browser opened for authentication", "state": state})
+        return RedirectResponse(url=auth_url)
     except Exception as e:
         logger.error(f"Error initiating OAuth flow: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -82,11 +82,11 @@ async def google_callback(request: Request):
                 <head><title>Authentication Successful</title></head>
                 <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
                     <h1>Authentication Successful!</h1>
-                    <p>The Google Drive MCP Server has been securely initialized.</p>
-                    <p>Check your terminal to see the available tools!</p>
-                    <p>You can close this tab and return to Aegis.</p>
+                    <p>You can safely close this tab and return to Aegis.</p>
+                    <button onclick="window.close()" style="padding: 10px 20px; font-size: 16px; cursor: pointer; border-radius: 8px; background: #000; color: #fff; border: none; margin-top: 20px;">Close Window</button>
                     <script>
-                        setTimeout(() => window.close(), 3000);
+                        if (window.opener) { window.opener.postMessage('auth_success', '*'); }
+                        window.close();
                     </script>
                 </body>
             </html>

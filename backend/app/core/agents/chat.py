@@ -7,12 +7,21 @@ from app.core.llm_manager import LLMManager
 from app.mcp.registry import mcp_registry
 from app.db.database import SessionLocal
 from app.db.crud import save_entity, build_entity_context_block
-from app.prompts import build_planner_prompt, ENTITY_EXTRACTOR_SYSTEM, build_entity_extractor_user_msg
+
+from .base import BaseAgent
+from .planner import PlannerAgent
+from .extractor import EntityExtractorAgent
 
 logger = logging.getLogger(__name__)
 
-# Initialize a global LLM manager for the workflow
-llm_manager = LLMManager()
+# Lazy initialization of LLM manager to prevent DB queries at import time
+_llm_manager = None
+
+def get_llm_manager():
+    global _llm_manager
+    if _llm_manager is None:
+        _llm_manager = LLMManager()
+    return _llm_manager
 
 
 class AgentState:
@@ -22,8 +31,10 @@ class AgentState:
     WAITING_MEMORY_CONFIRMATION = "WAITING_MEMORY_CONFIRMATION"  # User decides what to remember
 
 
-class AgentSession:
+class ChatAgent(BaseAgent):
     def __init__(self, connection_id: str):
+        llm_mgr = get_llm_manager()
+        super().__init__(llm_mgr)
         self.connection_id = connection_id
         self.state = AgentState.IDLE
         self.plan: Optional[List[Dict]] = None
@@ -32,6 +43,10 @@ class AgentSession:
         # Entities proposed after execution — awaiting user confirmation
         # Format: [{"label": ..., "type": ..., "id": ..., "data": {...}}, ...]
         self._pending_entities: List[Dict] = []
+        
+        # Instantiate sub-agents
+        self.planner = PlannerAgent(llm_mgr)
+        self.extractor = EntityExtractorAgent(llm_mgr)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Helpers
@@ -55,77 +70,6 @@ class AgentSession:
         except Exception as e:
             logger.warning(f"Could not load entity context: {e}")
             return ""
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # LLM calls (all synchronous — run via anyio thread pool)
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _generate_plan_sync(self, user_message: str, tools_str: str, token_callback=None) -> str:
-        """Generates a tool execution plan as a JSON string."""
-        try:
-            llm = llm_manager.get_model("gemma-local")
-        except Exception as e:
-            return json.dumps({"error": f"LLM not loaded: {e}"})
-
-        # Inject confirmed session entities so LLM can reference them directly
-        entity_context = self._get_entity_context()
-
-        # Build system prompt from the prompts package
-        system_prompt = build_planner_prompt(tools_str, entity_context)
-
-        messages = [{"role": "system", "content": system_prompt}]
-        messages.extend(self.chat_history)
-        messages.append({"role": "user", "content": user_message})
-
-        try:
-            response = llm.create_chat_completion(
-                messages=messages,
-                response_format={"type": "json_object"},
-                temperature=0.1,
-                stream=True
-            )
-            full_response = ""
-            for chunk in response:
-                if "choices" in chunk and len(chunk["choices"]) > 0:
-                    delta = chunk["choices"][0].get("delta", {})
-                    if "content" in delta:
-                        token = delta["content"]
-                        full_response += token
-                        if token_callback:
-                            token_callback(token)
-            return full_response
-        except Exception as e:
-            logger.error(f"LLM plan generation failed: {e}")
-            return json.dumps({"error": "Failed to generate plan."})
-
-    def _extract_entities_sync(self, tool_results: List[Dict]) -> str:
-        """
-        After execution, asks the LLM to identify entities worth remembering
-        from the tool results. Returns a JSON string.
-        """
-        try:
-            llm = llm_manager.get_model("gemma-local")
-        except Exception as e:
-            return json.dumps({"entities": []})
-
-        results_text = json.dumps(tool_results, indent=2, ensure_ascii=False)
-
-        messages = [
-            {"role": "system", "content": ENTITY_EXTRACTOR_SYSTEM},
-            {"role": "user", "content": build_entity_extractor_user_msg(results_text)}
-        ]
-
-        try:
-            response = llm.create_chat_completion(
-                messages=messages,
-                response_format={"type": "json_object"},
-                temperature=0.0,
-                max_tokens=1024
-            )
-            return response["choices"][0]["message"]["content"]
-        except Exception as e:
-            logger.error(f"Entity extraction failed: {e}")
-            return json.dumps({"entities": []})
 
     # ─────────────────────────────────────────────────────────────────────────
     # State machine
@@ -162,7 +106,7 @@ class AgentSession:
         ]
         msg_lower = message.strip().lower()
         if any(kw in msg_lower for kw in meta_keywords):
-            tools = mcp_manager.list_tools()
+            tools = mcp_registry.list_tools()
             lines = [f"\n🛠️  Available tools ({len(tools)}):\n"]
             for t in tools:
                 lines.append(f"  • **{t['name']}** — {t['description']}")
@@ -171,9 +115,11 @@ class AgentSession:
         # ────────────────────────────────────────────────────────────────────
 
         self.chat_history.append({"role": "user", "content": message})
+        
+        entity_context = self._get_entity_context()
 
         plan_json_str = await anyio.to_thread.run_sync(
-            lambda: self._generate_plan_sync(message, tools_str, token_callback)
+            lambda: self.planner.generate_plan(message, tools_str, entity_context, self.chat_history, token_callback)
         )
 
         try:
@@ -182,6 +128,7 @@ class AgentSession:
             # Validate hallucinated/unsupported tools against active tools in registry
             valid_tool_names = {t["name"] for t in mcp_registry.list_all_tools()}
             self.plan = []
+            warnings = []
             for step in raw_plan:
                 tool_name = step.get("tool")
                 if tool_name in valid_tool_names:
@@ -244,10 +191,11 @@ class AgentSession:
             return "Great! Proceeding with the execution... (Please wait)"
         else:
             tools_str = self.get_available_tools()
+            entity_context = self._get_entity_context()
             plan_json_str = await anyio.to_thread.run_sync(
-                lambda: self._generate_plan_sync(
+                lambda: self.planner.generate_plan(
                     "Please refine the plan based on my previous feedback.",
-                    tools_str, token_callback
+                    tools_str, entity_context, self.chat_history, token_callback
                 )
             )
             try:
@@ -445,7 +393,7 @@ class AgentSession:
             yield "\n\n🔍 Analysing results for things worth remembering...\n"
             try:
                 entities_json_str = await anyio.to_thread.run_sync(
-                    lambda: self._extract_entities_sync(tool_results)
+                    lambda: self.extractor.extract_entities(tool_results)
                 )
                 entities_data = json.loads(entities_json_str)
                 proposed = entities_data.get("entities", [])

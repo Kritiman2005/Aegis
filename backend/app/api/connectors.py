@@ -33,12 +33,14 @@ class ConnectCatalogRequest(BaseModel):
     server_name: str
     env: Optional[Dict[str, str]] = None
     input_params: Optional[Dict[str, str]] = None
+    model_config = {"defer_build": True}
 
 
 class ConnectCustomServerRequest(BaseModel):
     server_name: str
     command: List[str]
     env: Optional[Dict[str, str]] = None
+    model_config = {"defer_build": True}
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────

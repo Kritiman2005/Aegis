@@ -41,7 +41,7 @@ def get_google_flow() -> Flow:
     return flow
 
 def initiate_oauth_flow():
-    """Generates the OAuth URL and opens the user's default system browser."""
+    """Generates the OAuth URL for the user to visit."""
     flow = get_google_flow()
     
     # Generate the authorization URL (this internally creates a code_verifier for PKCE)
@@ -51,8 +51,4 @@ def initiate_oauth_flow():
         prompt='consent' # Force consent to ensure we get a refresh token
     )
     
-    # Open the system's default browser to the Google login page
-    print(f"Opening browser for Google Authentication...")
-    webbrowser.open(auth_url)
-    
-    return state, flow
+    return auth_url, state, flow

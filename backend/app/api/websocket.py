@@ -13,13 +13,13 @@ from typing import Dict
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from app.core.connection_manager import manager
-from app.core.workflow import AgentSession, AgentState
+from app.core.agents import ChatAgent, AgentState
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["WebSocket"])
 
 # Store active agent sessions per connection
-agent_sessions: Dict[str, AgentSession] = {}
+agent_sessions: Dict[str, ChatAgent] = {}
 
 # ─── WebSocket Endpoint ───────────────────────────────────────────────────────
 
@@ -33,7 +33,7 @@ async def websocket_endpoint(
     await manager.connect(websocket, connection_id)
     
     # Initialize an AgentSession for this client
-    session = AgentSession(connection_id)
+    session = ChatAgent(connection_id)
     agent_sessions[connection_id] = session
 
     # Notify client of their assigned connection ID

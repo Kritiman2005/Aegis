@@ -19,6 +19,7 @@ class HealthResponse(BaseModel):
     status: str
     uptime_seconds: float
     version: str
+    model_config = {"defer_build": True}
 
 
 @router.get(
