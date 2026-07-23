@@ -67,19 +67,13 @@ async def websocket_endpoint(
                 logger.info(f"[WS:{connection_id[:8]}] User: {content[:80]!r}")
 
                 try:
-                    # Send a "thinking" indicator so the user knows the LLM is working
-                    await manager.send_json(connection_id, {
-                        "type": "token",
-                        "content": "\nThinking...\n"
-                    })
-
                     # Process the message through the state machine
                     response_text = await session.handle_message(content)
 
-                    # Clear thinking line then print response on a fresh line
+                    # Send the response directly
                     await manager.send_json(connection_id, {
                         "type": "token",
-                        "content": "\r" + " " * 20 + "\r" + response_text
+                        "content": response_text
                     })
 
                     # Signal end of stream
@@ -109,6 +103,27 @@ async def websocket_endpoint(
                     await manager.send_json(connection_id, {
                         "type": "error",
                         "content": f"Workflow failed: {str(exc)}",
+                    })
+
+            # ── Handle Manual Memory Extraction ────────────────────────────────
+            elif msg_type == "extract_memory" and content.strip():
+                logger.info(f"[WS:{connection_id[:8]}] Manual Memory Extraction Triggered")
+                try:
+                    async for progress in session.extract_memory(content):
+                        await manager.send_json(connection_id, {
+                            "type": "token",
+                            "content": progress
+                        })
+                    
+                    await manager.send_json(connection_id, {
+                        "type": "done",
+                        "content": "",
+                    })
+                except Exception as exc:
+                    logger.error(f"[WS:{connection_id[:8]}] Extraction error: {exc}")
+                    await manager.send_json(connection_id, {
+                        "type": "error",
+                        "content": str(exc),
                     })
 
     except WebSocketDisconnect:

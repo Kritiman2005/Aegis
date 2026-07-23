@@ -140,12 +140,15 @@ class ChatAgent(BaseAgent):
 
         try:
             chat_data = json.loads(chat_response_json)
-            if not chat_data.get("requires_planner"):
+            if chat_data.get("tool") != "invoke_planner":
                 direct_response = chat_data.get("response", "I'm not sure how to respond.")
                 self.chat_history.append({"role": "assistant", "content": direct_response})
                 return direct_response
         except Exception as e:
-            logger.error(f"Chat router failed: {e}")
+            logger.warning(f"Chat router failed to parse JSON, treating as raw response: {e}")
+            direct_response = chat_response_json
+            self.chat_history.append({"role": "assistant", "content": direct_response})
+            return direct_response
 
         # ── Plan Generation ──────────────────────────────────────────────────
         plan_json_str = await anyio.to_thread.run_sync(
@@ -421,36 +424,48 @@ class ChatAgent(BaseAgent):
 
         yield "\nExecution complete!"
 
-        # ── Entity extraction ────────────────────────────────────────────────
-        if tool_results and self.requires_entity_extraction:
-            yield "\n\nAnalysing results for things worth remembering...\n"
-            try:
-                entities_json_str = await anyio.to_thread.run_sync(
-                    lambda: self.extractor.extract_entities(tool_results)
-                )
-                entities_data = json.loads(entities_json_str)
-                proposed = entities_data.get("entities", [])
-            except Exception as e:
-                logger.error(f"Entity extraction error: {e}")
-                proposed = []
-
-            if proposed:
-                self._pending_entities = proposed
-                self.state = AgentState.WAITING_MEMORY_CONFIRMATION
-
-                lines = ["\nI found these items worth remembering for this session:\n"]
-                for idx, e in enumerate(proposed, start=1):
-                    lines.append(f"  {idx}. **{e.get('label')}** ({e.get('type')})")
-                lines.append(
-                    "\nSave to session memory? Reply:\n"
-                    "  • **yes** — save all\n"
-                    "  • **no** — skip\n"
-                    "  • **numbers** (e.g. `1 3`) — save only those"
-                )
-                yield "\n".join(lines)
-                return  # Stay in WAITING_MEMORY_CONFIRMATION
-
-        # Nothing to propose — go back to IDLE
+        # Go back to IDLE
         self.state = AgentState.IDLE
         self.plan = None
         yield "\n\nWhat would you like to do next?"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Manual Memory Extraction
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def extract_memory(self, content: str) -> AsyncGenerator[str, None]:
+        """Manually triggered by the UI to extract memory from a context window."""
+        if self.state != AgentState.IDLE:
+            yield "Please finish your current action before saving to memory."
+            return
+
+        yield "\nAnalyzing text for things worth remembering...\n"
+        
+        try:
+            # Wrap content in a generic structure the extractor understands
+            tool_results = [{"tool": "manual_extraction", "arguments": {}, "result": content}]
+            entities_json_str = await anyio.to_thread.run_sync(
+                lambda: self.extractor.extract_entities(tool_results)
+            )
+            entities_data = json.loads(entities_json_str)
+            proposed = entities_data.get("entities", [])
+        except Exception as e:
+            logger.error(f"Entity extraction error: {e}")
+            proposed = []
+
+        if proposed:
+            self._pending_entities = proposed
+            self.state = AgentState.WAITING_MEMORY_CONFIRMATION
+
+            lines = ["\nI found these items worth remembering:\n"]
+            for idx, e in enumerate(proposed, start=1):
+                lines.append(f"  {idx}. **{e.get('label')}** ({e.get('type')})")
+            lines.append(
+                "\nSave to session memory? Reply:\n"
+                "  • **yes** — save all\n"
+                "  • **no** — skip\n"
+                "  • **numbers** (e.g. `1 3`) — save only those"
+            )
+            yield "\n".join(lines)
+        else:
+            yield "\nNo new entities found to save."

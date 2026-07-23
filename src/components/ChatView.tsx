@@ -12,15 +12,19 @@ import {
   User as UserIcon,
   Save,
   Check,
-  X
+  X,
+  Bookmark,
+  Loader2
 } from 'lucide-react';
 import { type ChatMessage, type ConnectionStatus } from '@/hooks/useSocket';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 interface ChatViewProps {
   messages: ChatMessage[];
   status: ConnectionStatus;
   isStreaming: boolean;
-  onSendMessage: (msg: string) => boolean;
+  onSendMessage: (msg: string, msgType?: string) => boolean;
   onClearMessages: () => void;
   activeConnectorName?: string;
 }
@@ -34,8 +38,30 @@ export default function ChatView({
   activeConnectorName = 'GitHub',
 }: ChatViewProps) {
   const [inputVal, setInputVal] = useState('');
+  const [savingMsgId, setSavingMsgId] = useState<string | null>(null);
+  const [savedMsgId, setSavedMsgId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const handleExtractMemory = (index: number, msgId: string) => {
+    setSavingMsgId(msgId);
+    
+    // Gather up to 3 messages for context (the clicked one and 2 preceding ones)
+    const startIndex = Math.max(0, index - 2);
+    const contextWindow = messages
+      .slice(startIndex, index + 1)
+      .map(m => `[${m.role}] ${m.content}`)
+      .join('\n\n');
+      
+    onSendMessage(contextWindow, 'extract_memory');
+    
+    // Simulate UI loading state for UX
+    setTimeout(() => {
+      setSavingMsgId(null);
+      setSavedMsgId(msgId);
+      setTimeout(() => setSavedMsgId(null), 2000);
+    }, 1000);
+  };
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -95,7 +121,7 @@ export default function ChatView({
             </div>
           </div>
         ) : (
-          messages.map((msg) => {
+          messages.map((msg, index) => {
             const isUser = msg.role === 'user';
 
             return (
@@ -119,6 +145,24 @@ export default function ChatView({
                     <span>
                       {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                     </span>
+                    {!msg.isStreaming && (
+                      <button
+                        onClick={() => handleExtractMemory(index, msg.id)}
+                        disabled={savingMsgId === msg.id}
+                        className={`ml-2 p-1 rounded transition-colors ${
+                          savedMsgId === msg.id ? 'text-teal-500' : 'hover:text-gray-900 hover:bg-gray-100'
+                        }`}
+                        title="Save context to memory"
+                      >
+                        {savingMsgId === msg.id ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : savedMsgId === msg.id ? (
+                          <Check className="w-3.5 h-3.5" />
+                        ) : (
+                          <Bookmark className="w-3.5 h-3.5" />
+                        )}
+                      </button>
+                    )}
                   </div>
 
                   {/* Message Body */}
@@ -131,8 +175,20 @@ export default function ChatView({
                     /* Assistant Message Card (White bordered card matching Image 2) */
                     <div className="bg-white border border-gray-200 rounded-2xl p-5 text-xs text-gray-800 leading-relaxed shadow-sm space-y-4">
                       {/* Formatted Markdown Content */}
-                      <div className="whitespace-pre-wrap font-sans">
-                        {msg.content}
+                      <div className="font-sans w-full overflow-hidden">
+                        {msg.isStreaming && !msg.content ? (
+                          <div className="flex items-center gap-1.5 h-6 opacity-70">
+                            <div className="w-1.5 h-1.5 rounded-full bg-gray-500 animate-bounce" style={{ animationDelay: '0ms' }} />
+                            <div className="w-1.5 h-1.5 rounded-full bg-gray-500 animate-bounce" style={{ animationDelay: '150ms' }} />
+                            <div className="w-1.5 h-1.5 rounded-full bg-gray-500 animate-bounce" style={{ animationDelay: '300ms' }} />
+                          </div>
+                        ) : (
+                          <div className="prose prose-sm prose-slate max-w-none break-words marker:text-gray-400 prose-p:leading-relaxed">
+                            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                              {msg.content}
+                            </ReactMarkdown>
+                          </div>
+                        )}
                       </div>
 
                       {/* Interactive Execution Plan Card (if plan response detected) */}

@@ -241,7 +241,7 @@ export function useSocket() {
   // ── Public API ───────────────────────────────────────────────────────────────
 
   const sendMessage = useCallback(
-    (content: string): boolean => {
+    (content: string, msgType: string = 'message'): boolean => {
       const trimmed = content.trim();
       if (!trimmed) return false;
       if (socketRef.current?.readyState !== WebSocket.OPEN) {
@@ -253,16 +253,18 @@ export function useSocket() {
         return false;
       }
 
-      // Optimistically add user message
-      appendMessage({
-        id: generateId(),
-        role: 'user',
-        content: trimmed,
-        timestamp: new Date(),
-      });
+      if (msgType === 'message') {
+        // Optimistically add user message only for standard messages
+        appendMessage({
+          id: generateId(),
+          role: 'user',
+          content: trimmed,
+          timestamp: new Date(),
+        });
+      }
 
       socketRef.current.send(
-        JSON.stringify({ type: 'message', content: trimmed })
+        JSON.stringify({ type: msgType, content: trimmed })
       );
       return true;
     },
