@@ -6,12 +6,14 @@ interface HeaderProps {
   activeConnectorName?: string;
   onSearchChange?: (val: string) => void;
   searchPlaceholder?: string;
+  onOpenMemory?: () => void;
 }
 
 export default function Header({
   activeConnectorName = 'GitHub',
   onSearchChange,
   searchPlaceholder = 'Search Workspace...',
+  onOpenMemory,
 }: HeaderProps) {
   return (
     <header className="h-16 px-8 border-b border-gray-200 bg-white flex items-center justify-between flex-shrink-0">
@@ -56,11 +58,15 @@ export default function Header({
         </div>
 
         {/* Icons */}
-        <button className="p-2 text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-full transition-all">
-          <Bell className="w-4 h-4" />
+        <button 
+          onClick={onOpenMemory}
+          title="Open Global Memory Store"
+          className="p-2 text-indigo-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-full transition-all border border-indigo-100 bg-white shadow-sm"
+        >
+          <Cloud className="w-4 h-4" />
         </button>
         <button className="p-2 text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-full transition-all">
-          <Cloud className="w-4 h-4" />
+          <Bell className="w-4 h-4" />
         </button>
 
         {/* User Profile Avatar */}

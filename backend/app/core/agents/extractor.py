@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 class EntityExtractorAgent(BaseAgent):
     """Responsible for reviewing tool execution results and identifying key entities to save to memory."""
     
-    def extract_entities(self, tool_results: List[Dict]) -> str:
+    def extract_entities(self, tool_results: List[Dict], user_prompt: str = "") -> str:
         llm = self.get_llm()
         if not llm:
             return json.dumps({"entities": []})
@@ -17,7 +17,7 @@ class EntityExtractorAgent(BaseAgent):
         results_text = json.dumps(tool_results, indent=2, ensure_ascii=False)
         messages = [
             {"role": "system", "content": ENTITY_EXTRACTOR_SYSTEM},
-            {"role": "user", "content": build_entity_extractor_user_msg(results_text)}
+            {"role": "user", "content": build_entity_extractor_user_msg(results_text, user_prompt)}
         ]
 
         try:

@@ -241,7 +241,7 @@ export function useSocket() {
   // ── Public API ───────────────────────────────────────────────────────────────
 
   const sendMessage = useCallback(
-    (content: string, msgType: string = 'message'): boolean => {
+    (content: string, msgType: string = 'message', mode: string = 'chat', userPrompt?: string): boolean => {
       const trimmed = content.trim();
       if (!trimmed) return false;
       if (socketRef.current?.readyState !== WebSocket.OPEN) {
@@ -264,7 +264,7 @@ export function useSocket() {
       }
 
       socketRef.current.send(
-        JSON.stringify({ type: msgType, content: trimmed })
+        JSON.stringify({ type: msgType, content: trimmed, mode, user_prompt: userPrompt })
       );
       return true;
     },

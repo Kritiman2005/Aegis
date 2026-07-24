@@ -1,58 +1,41 @@
 """
-Aegis — Generalized Entity Suggestion Engine
+Aegis — Targeted Fact Extraction Engine
 
-Scans tool execution outputs and generates candidate memory suggestions.
-These suggestions are presented to the user, but the user has final authority
-to approve suggestions, reject suggestions, or provide their own custom notes to remember.
+Extracts specific facts from a given text payload based on a user's explicit request.
 """
 
-ENTITY_EXTRACTOR_SYSTEM = """You are an entity suggestion assistant for Aegis local AI platform.
-Analyze the execution output of MCP tools and suggest distinct, identifiable entities \
-that the user might want to save to session memory.
+ENTITY_EXTRACTOR_SYSTEM = """You are a targeted fact extraction assistant for Aegis.
+The user has provided a block of text and an explicit request for what fact(s) to extract.
+Your job is to parse the text and structure exactly what the user asked for.
 
-RULES — follow these strictly:
-1. Suggest ONE candidate entity per distinct item returned by an MCP tool.
-2. "label" MUST be specific and human-readable, derived from actual content:
-   - Gmail / Workspace  : Sender + Subject or Real filename
-   - Slack              : Channel name or Sender + Message snippet
-   - Notion             : Page or Database Title
-   - CRM & Sales        : Contact Name, Company, or Deal Title
-   - Databases          : Table Name + Primary Field
-   - E-Commerce         : Customer Email, Invoice ID, Product Title
-   - Tasks & Issues     : Issue Key + Summary or Ticket Title
-   - Web & Filesystem   : Page Title or File path
-   - NEVER use generic labels like "Result", "Data", "Item", "Record".
+RULES:
+1. Extract exactly what the user explicitly requested.
+2. IMPORTANT: If the user provides a vague or generic request (e.g., 'mail', 'email', 'date', 'contact'), you MUST intelligently identify and extract the most relevant specific data points from the text (e.g., the actual email address like 'user@example.com', the specific date, the person's name). DO NOT just copy the whole sentence verbatim.
+3. Structure the extracted fact into a distinct entity.
+4. "label" MUST be specific and human-readable (e.g. "Priya's Email Address", "Meeting Date"). Do not use generic labels like "mail".
+5. "id" MUST be a generated deterministic ID (e.g. "fact_1234").
+6. "type" should describe the data type (e.g. "email_address", "date", "person", "custom_note").
+7. "data" MUST contain the exact extracted text/value.
 
-3. "id" MUST be the actual unique ID returned by the tool.
-4. "data" MUST contain all useful fields returned by the tool without truncation.
+Return a JSON object with an "entities" array. Respond with valid JSON only.
+"""
 
-"type" MUST be set based on the tool category:
-  - gmail_message | gmail_draft | drive_file | calendar_event
-  - slack_channel | slack_message | slack_user
-  - notion_page | notion_database
-  - crm_contact | crm_deal | crm_company
-  - airtable_record | db_record
-  - stripe_invoice | stripe_customer | shopify_order | shopify_product
-  - jira_issue | linear_issue | zendesk_ticket
-  - github_issue | github_pr | git_commit | sentry_issue
-  - web_page | local_file | custom_note | other
-
-Remember: Your output provides candidate SUGGESTIONS only. The user will make the final decision on what to save.
-
-Return a JSON object with an "entities" array. Respond with valid JSON only."""
-
-
-def build_entity_extractor_user_msg(results_text: str) -> str:
+def build_entity_extractor_user_msg(results_text: str, user_prompt: str = "") -> str:
     """
-    Builds the user-role message for the entity extraction call.
+    Builds the user-role message for targeted fact extraction.
 
     Args:
-        results_text: JSON-serialised list of tool execution results.
+        results_text: The source text (e.g. a chat message or tool output).
+        user_prompt: What the user explicitly wants to extract.
 
     Returns:
         The user message string to send to the LLM.
     """
+    if not user_prompt:
+        user_prompt = "Extract any key facts."
+        
     return (
-        f"MCP Tool Execution Results:\n\n{results_text}\n\n"
-        "Generate candidate memory suggestions for the user from the results above."
+        f"SOURCE TEXT:\n\n{results_text}\n\n"
+        f"USER EXTRACTION REQUEST:\n\"{user_prompt}\"\n\n"
+        "Extract the requested facts and format them as candidate memory suggestions."
     )

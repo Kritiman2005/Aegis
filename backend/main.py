@@ -25,6 +25,7 @@ from app.api.websocket import router as ws_router
 from app.api.auth import router as auth_router
 from app.api.connectors import router as connectors_router
 from app.api.oauth_routes import router as oauth_router   # generic OAuth for Slack, Notion, etc.
+from app.api.memories import router as memories_router
 
 # ─── App Factory ─────────────────────────────────────────────────────────────
 
@@ -59,6 +60,7 @@ app.include_router(ws_router)
 app.include_router(auth_router)          # /auth/google/login  + /auth/google/callback
 app.include_router(oauth_router)         # /auth/{service}/login + /auth/{service}/callback
 app.include_router(connectors_router)    # /api/connectors/*
+app.include_router(memories_router)      # /api/memories/*
 
 # ─── Startup: SQLite Initialization & OAuth Auto-Restore ──────────────────────
 

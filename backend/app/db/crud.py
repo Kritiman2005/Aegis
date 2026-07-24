@@ -278,3 +278,31 @@ def build_entity_context_block(db: Session, conversation_id: str) -> str:
         lines.append("")
 
     return "\n".join(lines)
+
+
+def get_all_entities(db: Session) -> List[ConversationEntity]:
+    """Returns all confirmed entities globally."""
+    return db.query(ConversationEntity).order_by(ConversationEntity.created_at.desc()).all()
+
+
+def delete_entity(db: Session, entity_id: int) -> bool:
+    """Deletes an entity by ID."""
+    entity = db.query(ConversationEntity).filter(ConversationEntity.id == entity_id).first()
+    if entity:
+        db.delete(entity)
+        db.commit()
+        return True
+    return False
+
+
+def update_entity(db: Session, entity_id: int, label: str = None, data_json: str = None) -> ConversationEntity:
+    """Updates an entity's label or data_json."""
+    entity = db.query(ConversationEntity).filter(ConversationEntity.id == entity_id).first()
+    if entity:
+        if label is not None:
+            entity.label = label
+        if data_json is not None:
+            entity.data_json = data_json
+        db.commit()
+        db.refresh(entity)
+    return entity

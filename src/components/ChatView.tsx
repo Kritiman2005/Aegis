@@ -24,7 +24,7 @@ interface ChatViewProps {
   messages: ChatMessage[];
   status: ConnectionStatus;
   isStreaming: boolean;
-  onSendMessage: (msg: string, msgType?: string) => boolean;
+  onSendMessage: (msg: string, msgType?: string, mode?: string, userPrompt?: string) => boolean;
   onClearMessages: () => void;
   activeConnectorName?: string;
 }
@@ -40,22 +40,47 @@ export default function ChatView({
   const [inputVal, setInputVal] = useState('');
   const [savingMsgId, setSavingMsgId] = useState<string | null>(null);
   const [savedMsgId, setSavedMsgId] = useState<string | null>(null);
+  const [chatMode, setChatMode] = useState<'chat' | 'agent'>('chat');
+  
+  // Memory Extraction UI State
+  const [activeBookmarkIndex, setActiveBookmarkIndex] = useState<number | null>(null);
+  const [extractionPrompt, setExtractionPrompt] = useState('');
+  
+  // Plan Editing State
+  const [editingPlanId, setEditingPlanId] = useState<string | null>(null);
+  const [planEditContent, setPlanEditContent] = useState('');
+  
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const handleExtractMemory = (index: number, msgId: string) => {
+  const handleSaveWholeMessage = (index: number, msgId: string) => {
     setSavingMsgId(msgId);
+    setActiveBookmarkIndex(null);
+    const content = messages[index].content;
+    onSendMessage(content, 'save_whole_message', chatMode);
     
-    // Gather up to 3 messages for context (the clicked one and 2 preceding ones)
+    setTimeout(() => {
+      setSavingMsgId(null);
+      setSavedMsgId(msgId);
+      setTimeout(() => setSavedMsgId(null), 2000);
+    }, 1000);
+  };
+
+  const handleExtractSpecificFacts = (index: number, msgId: string) => {
+    if (!extractionPrompt.trim()) return;
+    setSavingMsgId(msgId);
+    setActiveBookmarkIndex(null);
+    
+    // Gather context
     const startIndex = Math.max(0, index - 2);
     const contextWindow = messages
       .slice(startIndex, index + 1)
       .map(m => `[${m.role}] ${m.content}`)
       .join('\n\n');
       
-    onSendMessage(contextWindow, 'extract_memory');
+    onSendMessage(contextWindow, 'extract_specific_facts', chatMode, extractionPrompt);
+    setExtractionPrompt('');
     
-    // Simulate UI loading state for UX
     setTimeout(() => {
       setSavingMsgId(null);
       setSavedMsgId(msgId);
@@ -73,7 +98,7 @@ export default function ChatView({
 
   const handleSend = () => {
     if (!inputVal.trim() || isStreaming || status !== 'connected') return;
-    const sent = onSendMessage(inputVal);
+    const sent = onSendMessage(inputVal, 'message', chatMode);
     if (sent) {
       setInputVal('');
       if (textareaRef.current) {
@@ -146,22 +171,56 @@ export default function ChatView({
                       {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                     </span>
                     {!msg.isStreaming && (
-                      <button
-                        onClick={() => handleExtractMemory(index, msg.id)}
-                        disabled={savingMsgId === msg.id}
-                        className={`ml-2 p-1 rounded transition-colors ${
-                          savedMsgId === msg.id ? 'text-teal-500' : 'hover:text-gray-900 hover:bg-gray-100'
-                        }`}
-                        title="Save context to memory"
-                      >
-                        {savingMsgId === msg.id ? (
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        ) : savedMsgId === msg.id ? (
-                          <Check className="w-3.5 h-3.5" />
-                        ) : (
-                          <Bookmark className="w-3.5 h-3.5" />
+                      <div className="relative">
+                        <button
+                          onClick={() => setActiveBookmarkIndex(activeBookmarkIndex === index ? null : index)}
+                          disabled={savingMsgId === msg.id}
+                          className={`ml-2 p-1 rounded transition-colors ${
+                            savedMsgId === msg.id ? 'text-teal-500' : 'hover:text-gray-900 hover:bg-gray-100'
+                          }`}
+                          title="Save context to memory"
+                        >
+                          {savingMsgId === msg.id ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : savedMsgId === msg.id ? (
+                            <Check className="w-3.5 h-3.5" />
+                          ) : (
+                            <Bookmark className="w-3.5 h-3.5" />
+                          )}
+                        </button>
+                        
+                        {activeBookmarkIndex === index && (
+                          <div className="absolute top-full mt-1 right-0 w-64 bg-white rounded-xl shadow-lg border border-gray-100 p-2 z-10 flex flex-col gap-1 text-left">
+                            <button
+                              onClick={() => handleSaveWholeMessage(index, msg.id)}
+                              className="text-left px-3 py-2 text-xs font-medium text-gray-700 hover:bg-gray-50 rounded-lg w-full"
+                            >
+                              Save Entire Message
+                            </button>
+                            <div className="px-3 py-2 text-xs border-t border-gray-50 mt-1">
+                              <span className="font-semibold text-gray-500 mb-1 block">Extract Specific Fact</span>
+                              <div className="flex gap-1">
+                                <input
+                                  type="text"
+                                  value={extractionPrompt}
+                                  onChange={(e) => setExtractionPrompt(e.target.value)}
+                                  placeholder="e.g. Priya's email"
+                                  className="flex-1 bg-gray-50 border border-gray-200 rounded px-2 py-1 outline-none focus:border-indigo-400"
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') handleExtractSpecificFacts(index, msg.id);
+                                  }}
+                                />
+                                <button
+                                  onClick={() => handleExtractSpecificFacts(index, msg.id)}
+                                  className="bg-indigo-600 text-white rounded px-2 hover:bg-indigo-700 transition-colors"
+                                >
+                                  Save
+                                </button>
+                              </div>
+                            </div>
+                          </div>
                         )}
-                      </button>
+                      </div>
                     )}
                   </div>
 
@@ -202,19 +261,57 @@ export default function ChatView({
                             <span className="text-[10px] text-gray-400">Human-In-The-Loop</span>
                           </div>
 
-                          <div className="flex items-center gap-2 pt-1">
-                            <button
-                              onClick={() => onSendMessage('yes')}
-                              className="px-4 py-2 rounded-xl bg-black text-white text-xs font-semibold hover:bg-neutral-800 transition-all shadow-sm"
-                            >
-                              Proceed & Execute
-                            </button>
-                            <button
-                              onClick={() => onSendMessage('no')}
-                              className="px-4 py-2 rounded-xl bg-gray-200 text-gray-700 text-xs font-medium hover:bg-gray-300 transition-all"
-                            >
-                              Cancel / Edit
-                            </button>
+                          <div className="flex flex-col gap-2 pt-1">
+                            {editingPlanId === msg.id ? (
+                              <div className="space-y-2">
+                                <textarea
+                                  value={planEditContent}
+                                  onChange={(e) => setPlanEditContent(e.target.value)}
+                                  className="w-full text-xs font-mono bg-white border border-gray-200 rounded-lg p-3 h-48 outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
+                                />
+                                <div className="flex gap-2">
+                                  <button
+                                    onClick={() => {
+                                      onSendMessage(`Please use exactly this updated plan:\n\n${planEditContent}`);
+                                      setEditingPlanId(null);
+                                    }}
+                                    className="px-4 py-2 rounded-xl bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700 transition-all shadow-sm"
+                                  >
+                                    Submit Edit
+                                  </button>
+                                  <button
+                                    onClick={() => setEditingPlanId(null)}
+                                    className="px-4 py-2 rounded-xl bg-gray-200 text-gray-700 text-xs font-medium hover:bg-gray-300 transition-all"
+                                  >
+                                    Cancel Edit
+                                  </button>
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="flex flex-wrap gap-2">
+                                <button
+                                  onClick={() => onSendMessage('yes')}
+                                  className="px-4 py-2 rounded-xl bg-black text-white text-xs font-semibold hover:bg-neutral-800 transition-all shadow-sm"
+                                >
+                                  Proceed & Execute
+                                </button>
+                                <button
+                                  onClick={() => {
+                                    setEditingPlanId(msg.id);
+                                    setPlanEditContent(msg.content);
+                                  }}
+                                  className="px-4 py-2 rounded-xl bg-gray-200 text-gray-700 text-xs font-medium hover:bg-gray-300 transition-all"
+                                >
+                                  Edit Payload
+                                </button>
+                                <button
+                                  onClick={() => onSendMessage('cancel')}
+                                  className="px-4 py-2 rounded-xl border border-gray-200 text-red-600 bg-white text-xs font-medium hover:bg-red-50 transition-all"
+                                >
+                                  Cancel Plan
+                                </button>
+                              </div>
+                            )}
                           </div>
                         </div>
                       )}
@@ -236,8 +333,39 @@ export default function ChatView({
       </div>
 
       {/* ── Bottom Input Bar (Matching Image 2) ─────────────────────────────── */}
-      <div className="p-6 pt-2 bg-[#F8F9FA] max-w-4xl w-full mx-auto">
-        <div className="relative bg-white border border-gray-200 rounded-2xl shadow-sm focus-within:border-black focus-within:ring-1 focus-within:ring-black transition-all">
+      <div className="p-6 pt-2 bg-[#F8F9FA] max-w-4xl w-full mx-auto space-y-3">
+        {/* Mode Toggle */}
+        <div className="flex justify-center">
+          <div className="bg-gray-200/50 p-1 rounded-lg flex items-center gap-1">
+            <button
+              onClick={() => setChatMode('chat')}
+              className={`px-4 py-1.5 rounded-md text-xs font-semibold transition-all ${
+                chatMode === 'chat' 
+                  ? 'bg-white text-gray-900 shadow-sm' 
+                  : 'text-gray-500 hover:text-gray-700'
+              }`}
+            >
+              Chat
+            </button>
+            <button
+              onClick={() => setChatMode('agent')}
+              className={`px-4 py-1.5 rounded-md text-xs font-semibold transition-all flex items-center gap-1.5 ${
+                chatMode === 'agent' 
+                  ? 'bg-white text-indigo-600 shadow-sm' 
+                  : 'text-gray-500 hover:text-gray-700'
+              }`}
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              Agent
+            </button>
+          </div>
+        </div>
+
+        <div className={`relative bg-white border rounded-2xl shadow-sm focus-within:ring-1 transition-all ${
+          chatMode === 'agent' 
+            ? 'border-indigo-200 focus-within:border-indigo-500 focus-within:ring-indigo-500/20' 
+            : 'border-gray-200 focus-within:border-black focus-within:ring-black'
+        }`}>
           <textarea
             ref={textareaRef}
             value={inputVal}
@@ -247,7 +375,7 @@ export default function ChatView({
               e.target.style.height = `${Math.min(e.target.scrollHeight, 160)}px`;
             }}
             onKeyDown={handleKeyDown}
-            placeholder={status === 'connected' ? 'Message Aegis...' : 'Connecting to backend...'}
+            placeholder={status === 'connected' ? (chatMode === 'agent' ? 'Ask Agent to perform a task...' : 'Message Aegis...') : 'Connecting to backend...'}
             disabled={status !== 'connected'}
             rows={1}
             className="w-full bg-transparent text-xs text-gray-900 placeholder:text-gray-400 resize-none px-4 pt-3.5 pb-12 focus:outline-none leading-relaxed"
@@ -270,7 +398,11 @@ export default function ChatView({
               <button
                 onClick={handleSend}
                 disabled={!inputVal.trim() || isStreaming || status !== 'connected'}
-                className="w-8 h-8 rounded-xl bg-black text-white flex items-center justify-center hover:bg-neutral-800 disabled:opacity-30 disabled:hover:bg-black transition-all shadow-sm"
+                className={`w-8 h-8 rounded-xl text-white flex items-center justify-center transition-all shadow-sm disabled:opacity-30 ${
+                  chatMode === 'agent' 
+                    ? 'bg-indigo-600 hover:bg-indigo-700 disabled:hover:bg-indigo-600' 
+                    : 'bg-black hover:bg-neutral-800 disabled:hover:bg-black'
+                }`}
               >
                 <Send className="w-3.5 h-3.5" />
               </button>

@@ -99,11 +99,11 @@ class ChatAgent(BaseAgent):
     # State machine
     # ─────────────────────────────────────────────────────────────────────────
 
-    async def handle_message(self, message: str, token_callback=None) -> str:
+    async def handle_message(self, message: str, mode: str = "chat", token_callback=None) -> str:
         """Main state machine dispatcher."""
 
         if self.state == AgentState.IDLE:
-            return await self._handle_idle(message, token_callback)
+            return await self._handle_idle(message, mode, token_callback)
 
         elif self.state == AgentState.WAITING_CONFIRMATION:
             return await self._handle_confirmation(message, token_callback)
@@ -116,7 +116,7 @@ class ChatAgent(BaseAgent):
 
         return "Unknown state."
 
-    async def _handle_idle(self, message: str, token_callback=None) -> str:
+    async def _handle_idle(self, message: str, mode: str = "chat", token_callback=None) -> str:
         """IDLE → generate plan → WAITING_CONFIRMATION."""
         tools_str = self.get_available_tools()
         if "No active Google session" in tools_str:
@@ -129,26 +129,21 @@ class ChatAgent(BaseAgent):
         # We will pass chat history EXCLUDING the current message to planner, as planner appends it.
         history_for_planner = self.chat_history[:-1]
 
-        # ── Chat Router (Decide if tools needed) ─────────────────────────────
-        chat_prompt = build_chat_prompt(tools_str, entity_context)
-        messages = [{"role": "system", "content": chat_prompt}]
-        messages.extend(self.chat_history)
+        # ── Mode Branching ─────────────────────────────
+        if mode == "chat":
+            chat_prompt = build_chat_prompt(tools_str, entity_context)
+            messages = [{"role": "system", "content": chat_prompt}]
+            messages.extend(self.chat_history)
 
-        chat_response_json = await anyio.to_thread.run_sync(
-            lambda: self._call_llm_json(messages)
-        )
+            # In chat mode, we expect pure raw text, no JSON.
+            chat_response = await anyio.to_thread.run_sync(
+                lambda: self._call_llm_json(messages, is_json=False)
+            )
+            
+            self.chat_history.append({"role": "assistant", "content": chat_response})
+            return chat_response
 
-        try:
-            chat_data = json.loads(chat_response_json)
-            if chat_data.get("tool") != "invoke_planner":
-                direct_response = chat_data.get("response", "I'm not sure how to respond.")
-                self.chat_history.append({"role": "assistant", "content": direct_response})
-                return direct_response
-        except Exception as e:
-            logger.warning(f"Chat router failed to parse JSON, treating as raw response: {e}")
-            direct_response = chat_response_json
-            self.chat_history.append({"role": "assistant", "content": direct_response})
-            return direct_response
+        # If mode == "agent", we skip the Chat LLM and go straight to Plan Generation
 
         # ── Plan Generation ──────────────────────────────────────────────────
         plan_json_str = await anyio.to_thread.run_sync(
@@ -225,6 +220,13 @@ class ChatAgent(BaseAgent):
         if is_positive and len(message.split()) < 10:
             self.state = AgentState.EXECUTING
             return "Great! Proceeding with the execution... (Please wait)"
+            
+        cancel_keywords = ['cancel', 'abort', 'stop', 'nevermind']
+        if any(word in message.lower() for word in cancel_keywords):
+            self.state = AgentState.IDLE
+            self.plan = []
+            return "Plan cancelled. What would you like to do next?"
+            
         else:
             tools_str = self.get_available_tools()
             entity_context = self._get_entity_context()
@@ -469,3 +471,65 @@ class ChatAgent(BaseAgent):
             yield "\n".join(lines)
         else:
             yield "\nNo new entities found to save."
+
+    async def save_whole_message(self, content: str) -> AsyncGenerator[str, None]:
+        """Bypasses LLM, generates deterministic ID, saves as raw_message."""
+        import hashlib
+        from app.db.database import SessionLocal
+        from app.db.crud import save_entity
+
+        # Generate cheap deterministic ID and label
+        msg_hash = hashlib.md5(content.encode()).hexdigest()[:10]
+        label = content[:40].replace('\n', ' ') + "..." if len(content) > 40 else content
+        
+        try:
+            db = SessionLocal()
+            save_entity(
+                db=db,
+                conversation_id=self.connection_id,
+                label=label,
+                entity_type="raw_message",
+                entity_id=f"msg_{msg_hash}",
+                data={"raw_content": content, "user_directed": True}
+            )
+            db.close()
+            yield "\n**Message saved to memory successfully!** (Deterministic save)"
+        except Exception as e:
+            logger.error(f"Failed to save whole message: {e}")
+            yield f"\nFailed to save message: {e}"
+
+    async def extract_specific_facts(self, payload: dict) -> AsyncGenerator[str, None]:
+        """Uses the Extractor LLM with a specific user prompt to extract targeted facts."""
+        content = payload.get("content", "")
+        user_prompt = payload.get("user_prompt", "")
+        
+        yield f"\nExtracting specific fact based on your request: *\"{user_prompt}\"*\n"
+        
+        try:
+            # Wrap content in a generic structure the extractor understands
+            tool_results = [{"tool": "manual_extraction", "arguments": {"user_prompt": user_prompt}, "result": content}]
+            entities_json_str = await anyio.to_thread.run_sync(
+                lambda: self.extractor.extract_entities(tool_results, user_prompt)
+            )
+            entities_data = json.loads(entities_json_str)
+            proposed = entities_data.get("entities", [])
+        except Exception as e:
+            logger.error(f"Targeted entity extraction error: {e}")
+            proposed = []
+
+        if proposed:
+            self._pending_entities = proposed
+            self.state = AgentState.WAITING_MEMORY_CONFIRMATION
+
+            lines = ["\nI extracted the following based on your request:\n"]
+            for idx, e in enumerate(proposed, start=1):
+                lines.append(f"  {idx}. **{e.get('label')}** ({e.get('type')})")
+            lines.append(
+                "\nSave to session memory? Reply:\n"
+                "  • **yes** — save all\n"
+                "  • **no** — skip\n"
+                "  • **numbers** (e.g. `1 3`) — save only those"
+            )
+            yield "\n".join(lines)
+        else:
+            yield "\nI could not find facts matching your request in this message."

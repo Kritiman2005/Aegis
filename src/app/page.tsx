@@ -6,11 +6,13 @@ import Header from '@/components/Header';
 import ChatView from '@/components/ChatView';
 import ConnectorsView from '@/components/ConnectorsView';
 import SettingsView from '@/components/SettingsView';
+import MemoryViewer from '@/components/MemoryViewer';
 import { useSocket } from '@/hooks/useSocket';
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState<TabType>('connectors'); // Default to Connectors view matching Stitch Image 1
   const [activeConnectorName, setActiveConnectorName] = useState('GitHub');
+  const [isMemoryOpen, setIsMemoryOpen] = useState(false);
   const { messages, status, isStreaming, sendMessage, clearMessages } = useSocket();
 
   const handleNewChat = useCallback(() => {
@@ -39,7 +41,10 @@ export default function Home() {
               ? 'Search settings...'
               : 'Search Workspace...'
           }
+          onOpenMemory={() => setIsMemoryOpen(true)}
         />
+
+        {isMemoryOpen && <MemoryViewer onClose={() => setIsMemoryOpen(false)} />}
 
         {/* Tab Views */}
         {activeTab === 'chat' && (

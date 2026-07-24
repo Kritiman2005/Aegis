@@ -57,6 +57,7 @@ async def websocket_endpoint(
 
             msg_type = payload.get("type", "message")
             content = payload.get("content", "")
+            mode = payload.get("mode", "chat")
 
             if msg_type == "ping":
                 await manager.send_json(connection_id, {"type": "pong"})
@@ -68,7 +69,7 @@ async def websocket_endpoint(
 
                 try:
                     # Process the message through the state machine
-                    response_text = await session.handle_message(content)
+                    response_text = await session.handle_message(content, mode)
 
                     # Send the response directly
                     await manager.send_json(connection_id, {
@@ -105,26 +106,32 @@ async def websocket_endpoint(
                         "content": f"Workflow failed: {str(exc)}",
                     })
 
-            # ── Handle Manual Memory Extraction ────────────────────────────────
-            elif msg_type == "extract_memory" and content.strip():
-                logger.info(f"[WS:{connection_id[:8]}] Manual Memory Extraction Triggered")
+            # ── Handle Memory Saving Paths ─────────────────────────────────────
+            elif msg_type == "save_whole_message" and content.strip():
+                logger.info(f"[WS:{connection_id[:8]}] Save Whole Message Triggered")
                 try:
-                    async for progress in session.extract_memory(content):
+                    async for progress in session.save_whole_message(content):
                         await manager.send_json(connection_id, {
                             "type": "token",
                             "content": progress
                         })
-                    
-                    await manager.send_json(connection_id, {
-                        "type": "done",
-                        "content": "",
-                    })
+                    await manager.send_json(connection_id, {"type": "done", "content": ""})
+                except Exception as exc:
+                    logger.error(f"[WS:{connection_id[:8]}] Save error: {exc}")
+                    await manager.send_json(connection_id, {"type": "error", "content": str(exc)})
+
+            elif msg_type == "extract_specific_facts" and content.strip():
+                logger.info(f"[WS:{connection_id[:8]}] Extract Specific Facts Triggered")
+                try:
+                    async for progress in session.extract_specific_facts(payload):
+                        await manager.send_json(connection_id, {
+                            "type": "token",
+                            "content": progress
+                        })
+                    await manager.send_json(connection_id, {"type": "done", "content": ""})
                 except Exception as exc:
                     logger.error(f"[WS:{connection_id[:8]}] Extraction error: {exc}")
-                    await manager.send_json(connection_id, {
-                        "type": "error",
-                        "content": str(exc),
-                    })
+                    await manager.send_json(connection_id, {"type": "error", "content": str(exc)})
 
     except WebSocketDisconnect:
         logger.info(f"[WS] Client disconnected: {connection_id[:8]}")
