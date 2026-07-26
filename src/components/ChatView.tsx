@@ -315,6 +315,74 @@ export default function ChatView({
                           </div>
                         </div>
                       )}
+
+                      {/* Interactive Memory Extraction Card */}
+                      {msg.content.includes('Proposed Memory Extraction:') && (
+                        <div className="p-4 rounded-xl bg-indigo-50 border border-indigo-100 space-y-3">
+                          <div className="flex items-center justify-between border-b border-indigo-200 pb-2">
+                            <span className="text-xs font-bold text-indigo-900 flex items-center gap-1.5">
+                              <Save className="w-4 h-4 text-indigo-600" />
+                              Memory Extraction Proposed
+                            </span>
+                            <span className="text-[10px] text-indigo-400">Review Required</span>
+                          </div>
+
+                          <div className="flex flex-col gap-2 pt-1">
+                            {editingPlanId === msg.id ? (
+                              <div className="space-y-2">
+                                <textarea
+                                  value={planEditContent}
+                                  onChange={(e) => setPlanEditContent(e.target.value)}
+                                  className="w-full text-xs font-mono bg-white border border-indigo-200 rounded-lg p-3 h-48 outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
+                                />
+                                <div className="flex gap-2">
+                                  <button
+                                    onClick={() => {
+                                      onSendMessage(`Please use exactly this updated memory:\n\n${planEditContent}`);
+                                      setEditingPlanId(null);
+                                    }}
+                                    className="px-4 py-2 rounded-xl bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700 transition-all shadow-sm"
+                                  >
+                                    Submit Memory Edit
+                                  </button>
+                                  <button
+                                    onClick={() => setEditingPlanId(null)}
+                                    className="px-4 py-2 rounded-xl bg-indigo-200 text-indigo-800 text-xs font-medium hover:bg-indigo-300 transition-all"
+                                  >
+                                    Cancel Edit
+                                  </button>
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="flex flex-wrap gap-2">
+                                <button
+                                  onClick={() => onSendMessage('yes')}
+                                  className="px-4 py-2 rounded-xl bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700 transition-all shadow-sm"
+                                >
+                                  Save Memory
+                                </button>
+                                <button
+                                  onClick={() => {
+                                    setEditingPlanId(msg.id);
+                                    // Strip the blockquotes from the preview text to get raw JSON
+                                    const rawJsonStr = msg.content.split('└ *Preview:*\n> ')[1]?.replace(/\n> /g, '\n') || '';
+                                    setPlanEditContent(rawJsonStr);
+                                  }}
+                                  className="px-4 py-2 rounded-xl bg-indigo-100 text-indigo-700 text-xs font-medium hover:bg-indigo-200 transition-all"
+                                >
+                                  Edit Details
+                                </button>
+                                <button
+                                  onClick={() => onSendMessage('no')}
+                                  className="px-4 py-2 rounded-xl border border-indigo-200 text-red-600 bg-white text-xs font-medium hover:bg-red-50 transition-all"
+                                >
+                                  Cancel Save
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>

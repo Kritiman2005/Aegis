@@ -264,6 +264,17 @@ class ChatAgent(BaseAgent):
         msg_lower = msg_raw.lower()
         entities = self._pending_entities
 
+        # ── JSON Override from UI ────────────────────────────────────────────
+        edit_prefix = "Please use exactly this updated memory:\n\n"
+        if msg_raw.startswith(edit_prefix):
+            edited_json = msg_raw[len(edit_prefix):].strip()
+            try:
+                selected = json.loads(edited_json)
+                msg_lower = "yes" # Force the 'yes' branch to save it
+                entities = selected # Replace pending entities with the edited ones
+            except json.JSONDecodeError:
+                return "Error parsing updated memory JSON. Please try again."
+
         # ── Hard no ──────────────────────────────────────────────────────────
         if msg_lower in ("no", "n", "skip", "nope", "nah", "dont save", "don't save", "nothing"):
             self._pending_entities = []
@@ -459,15 +470,14 @@ class ChatAgent(BaseAgent):
             self._pending_entities = proposed
             self.state = AgentState.WAITING_MEMORY_CONFIRMATION
 
-            lines = ["\nI found these items worth remembering:\n"]
-            for idx, e in enumerate(proposed, start=1):
-                lines.append(f"  {idx}. **{e.get('label')}** ({e.get('type')})")
-            lines.append(
-                "\nSave to session memory? Reply:\n"
-                "  • **yes** — save all\n"
-                "  • **no** — skip\n"
-                "  • **numbers** (e.g. `1 3`) — save only those"
-            )
+            preview_str = json.dumps(proposed, indent=2)
+            formatted_preview = preview_str.strip().replace('\n', '\n> ')
+            
+            lines = [
+                "Proposed Memory Extraction:",
+                "└ *Preview:*",
+                f"> {formatted_preview}"
+            ]
             yield "\n".join(lines)
         else:
             yield "\nNo new entities found to save."
@@ -521,15 +531,14 @@ class ChatAgent(BaseAgent):
             self._pending_entities = proposed
             self.state = AgentState.WAITING_MEMORY_CONFIRMATION
 
-            lines = ["\nI extracted the following based on your request:\n"]
-            for idx, e in enumerate(proposed, start=1):
-                lines.append(f"  {idx}. **{e.get('label')}** ({e.get('type')})")
-            lines.append(
-                "\nSave to session memory? Reply:\n"
-                "  • **yes** — save all\n"
-                "  • **no** — skip\n"
-                "  • **numbers** (e.g. `1 3`) — save only those"
-            )
+            preview_str = json.dumps(proposed, indent=2)
+            formatted_preview = preview_str.strip().replace('\n', '\n> ')
+            
+            lines = [
+                "Proposed Memory Extraction:",
+                "└ *Preview:*",
+                f"> {formatted_preview}"
+            ]
             yield "\n".join(lines)
         else:
             yield "\nI could not find facts matching your request in this message."
