@@ -46,8 +46,13 @@ INSTRUCTIONS:
 3. Output a strict JSON object containing EXACTLY the keys and values required by the TOOL SCHEMA.
 
 CRITICAL RULES:
-- ONLY output a JSON object containing the arguments. Do not nest it inside another key (unless the schema requires it). For example, if the schema requires `file_id`, output `{{"file_id": "123"}}`.
+- ONLY output a JSON object containing the arguments. Do not nest it inside another key (unless the schema requires it).
 - DO NOT hallucinate parameters, properties, or syntax that are not explicitly defined in the TOOL SCHEMA.
-- If a required parameter is missing from the context, infer it from the user's intent or return the closest valid option.
+- NEVER invent or guess IDs (file_id, message_id, thread_id, etc.). IDs MUST come from one of these sources:
+    1. A result from a prior step shown in RESULTS FROM PREVIOUS STEPS above.
+    2. The KNOWN ENTITIES block above.
+    3. Something the user explicitly provided in the Chat History.
+  If the ID is not found in any of these sources, you MUST return {{"error": "Cannot determine <param_name>: no prior step listed the file/resource. Add a listing step first (e.g. drive_list_files) to obtain the correct ID."}}.
+- If a parameter is optional or can be inferred safely from the user's intent (e.g. a search query string), do so.
 
 Respond with valid JSON only. Do not use any markdown formatting or backticks around the JSON."""

@@ -37,9 +37,12 @@ class ConnectionManager:
         self._connections[connection_id] = websocket
         logger.info(f"[WS] Connected: {connection_id} (total: {self.count})")
 
-    def disconnect(self, connection_id: str) -> None:
+    def disconnect(self, connection_id: str, websocket: WebSocket = None) -> None:
         """Remove a connection from the registry."""
         if connection_id in self._connections:
+            if websocket and self._connections[connection_id] != websocket:
+                # A new connection has already taken over this ID
+                return
             del self._connections[connection_id]
             logger.info(f"[WS] Disconnected: {connection_id} (total: {self.count})")
 
@@ -58,7 +61,7 @@ class ConnectionManager:
             return True
         except Exception as exc:
             logger.warning(f"[WS] Send failed for {connection_id}: {exc}")
-            self.disconnect(connection_id)
+            self.disconnect(connection_id, ws)
             return False
 
     async def send_json(self, connection_id: str, data: dict) -> bool:
@@ -71,7 +74,7 @@ class ConnectionManager:
             return True
         except Exception as exc:
             logger.warning(f"[WS] JSON send failed for {connection_id}: {exc}")
-            self.disconnect(connection_id)
+            self.disconnect(connection_id, ws)
             return False
 
     async def broadcast(self, message: str) -> None:

@@ -26,6 +26,7 @@ from app.api.auth import router as auth_router
 from app.api.connectors import router as connectors_router
 from app.api.oauth_routes import router as oauth_router   # generic OAuth for Slack, Notion, etc.
 from app.api.memories import router as memories_router
+from app.api.chat import router as chat_router
 
 # ─── App Factory ─────────────────────────────────────────────────────────────
 
@@ -61,17 +62,20 @@ app.include_router(auth_router)          # /auth/google/login  + /auth/google/ca
 app.include_router(oauth_router)         # /auth/{service}/login + /auth/{service}/callback
 app.include_router(connectors_router)    # /api/connectors/*
 app.include_router(memories_router)      # /api/memories/*
+app.include_router(chat_router)          # /api/chat/*
 
 # ─── Startup: SQLite Initialization & OAuth Auto-Restore ──────────────────────
 
 @app.on_event("startup")
-def on_startup():
+async def on_startup():
     """Initialize SQLite database tables, seed default model, and auto-restore Google OAuth session."""
+    import asyncio
     import logging
     from app.db.database import init_db, SessionLocal
     from app.db.crud import seed_default_model, get_active_google_credentials
     from app.mcp.registry import mcp_registry
     from app.core.scheduler import scheduler_daemon
+    from app.api.websocket import watch_timeouts
     
     _logger = logging.getLogger("startup")
     _logger.info("Initializing SQLite Database...")
@@ -79,6 +83,9 @@ def on_startup():
 
     # Start the Scheduler Daemon for background jobs
     scheduler_daemon.start()
+
+    # Start the WebSocket session timeout watcher
+    asyncio.create_task(watch_timeouts())
 
     with SessionLocal() as db:
         # Seed default local model in SQLite models table

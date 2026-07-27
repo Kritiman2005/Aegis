@@ -44,8 +44,14 @@ INSTRUCTIONS:
 
 CRITICAL RULE: You MUST ONLY plan actions that the provided tools can explicitly perform. If the user asks for a capability that does not exist, DO NOT hallucinate it. Instead, return an empty "plan" array and explain the limitation in the "warnings" array.
 
+CRITICAL RULE — ID RESOLUTION: Many tools require a specific resource ID (e.g. `file_id`, `message_id`, `thread_id`). If the user refers to a resource by NAME (e.g. "the ml club paper", "the invoice email") and there is NO confirmed ID available in the entity context or prior results, you MUST add a listing/search step BEFORE the read/get step so the executor can obtain the real ID. NEVER plan a read/get step alone when the ID is unknown — always pair it with a preceding list or search step.
+
+AMBIGUITY & CLARIFYING QUESTIONS:
+If the user's request is ambiguous (e.g. asking to 'read the draft' when you have tools for both Gmail drafts and Google Drive documents), DO NOT guess. Instead, return an empty "plan" array `[]` and provide a "clarifying_question" string asking the user what they meant.
+
 FORMAT EXAMPLE:
 {{
+  "clarifying_question": "Did you mean the Google Drive document 'Paper-2-Draft', or an email draft?",
   "plan": [
     {{
       "step_id": "step_1",

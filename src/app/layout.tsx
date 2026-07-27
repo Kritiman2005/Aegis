@@ -1,5 +1,6 @@
 import type { Metadata } from 'next';
 import './globals.css';
+import ReduxProvider from '@/components/ReduxProvider';
 
 export const metadata: Metadata = {
   title: 'Aegis — Local AI Agent Platform',
@@ -30,7 +31,7 @@ export default function RootLayout({
         />
       </head>
       <body className="h-full bg-[#080B14] text-[#F1F5F9] antialiased">
-        {children}
+        <ReduxProvider>{children}</ReduxProvider>
       </body>
     </html>
   );

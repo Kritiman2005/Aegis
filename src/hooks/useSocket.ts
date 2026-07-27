@@ -12,6 +12,8 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useAppDispatch, useAppSelector } from '@/hooks/useStore';
+import { setSessionId, generateNewSession, selectSessionId } from '@/store/sessionSlice';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -33,9 +35,10 @@ export type ConnectionStatus =
   | 'error';
 
 interface ServerPayload {
-  type: 'connected' | 'token' | 'done' | 'error' | 'pong';
+  type: 'connected' | 'token' | 'done' | 'error' | 'pong' | 'history';
   content?: string;
   connection_id?: string;
+  history?: Array<{ role: string; content: string }>;
   node_id?: string;
   status?: string;
 }
@@ -45,8 +48,8 @@ interface ServerPayload {
 const WS_URL = 'ws://127.0.0.1:8000/ws';
 const MAX_RECONNECT_DELAY_MS = 30_000;
 const BASE_RECONNECT_DELAY_MS = 1_000;
-const PING_INTERVAL_MS = 25_000;
-const PING_TIMEOUT_MS = 5_000;
+const PING_INTERVAL_MS = 60_000;
+const PING_TIMEOUT_MS = 120_000;
 
 // ─── ID Generator ────────────────────────────────────────────────────────────
 
@@ -58,6 +61,9 @@ function generateId(): string {
 // ─── Hook ─────────────────────────────────────────────────────────────────────
 
 export function useSocket() {
+  const dispatch = useAppDispatch();
+  const sessionId = useAppSelector(selectSessionId);
+
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [isStreaming, setIsStreaming] = useState(false);
@@ -66,7 +72,11 @@ export function useSocket() {
   const [failedNodeIds, setFailedNodeIds] = useState<Set<string>>(new Set());
 
   const socketRef = useRef<WebSocket | null>(null);
-  const connectionIdRef = useRef<string>(generateId()); // Stable client ID across reconnects
+  // Mirror the Redux session ID into a ref for stable access inside WebSocket callbacks
+  const connectionIdRef = useRef<string>(sessionId);
+  const historyLoadedRef = useRef<boolean>(false); // Only load history once per session
+  const isSessionSwitchRef = useRef<boolean>(false); // Prevent reconnect loop during session switch
+
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const pingTimerRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
@@ -129,6 +139,10 @@ export function useSocket() {
 
   const connect = useCallback(() => {
     if (isUnmountedRef.current) return;
+    if (!connectionIdRef.current) {
+      console.log('[useSocket] Waiting for sessionId hydration...');
+      return;
+    }
 
     const wsUrl = `${WS_URL}?client_id=${connectionIdRef.current}`;
     console.log(`[useSocket] Connecting to ${wsUrl}`);
@@ -137,7 +151,7 @@ export function useSocket() {
     socketRef.current = ws;
 
     ws.onopen = () => {
-      if (isUnmountedRef.current) return;
+      if (isUnmountedRef.current || socketRef.current !== ws) return;
       console.log('[useSocket] Connected');
       setStatus('connected');
       reconnectAttemptsRef.current = 0;
@@ -145,7 +159,7 @@ export function useSocket() {
     };
 
     ws.onmessage = (event: MessageEvent<string>) => {
-      if (isUnmountedRef.current) return;
+      if (isUnmountedRef.current || socketRef.current !== ws) return;
 
       let payload: ServerPayload;
       try {
@@ -157,7 +171,21 @@ export function useSocket() {
 
       switch (payload.type) {
         case 'connected':
-          // Server confirmed connection and echoed back its connection_id
+          // Server confirmed connection — history arrives separately in a 'history' event
+          // to avoid blocking the handshake on a DB query.
+          break;
+
+        case 'history':
+          // Load history on the FIRST event only to avoid duplication on reconnects
+          if (!historyLoadedRef.current && payload.history && payload.history.length > 0) {
+            historyLoadedRef.current = true;
+            setMessages(payload.history.map((m: any) => ({
+              id: generateId(),
+              role: m.role as MessageRole,
+              content: m.content,
+              timestamp: new Date(),
+            })));
+          }
           break;
 
         case 'token':
@@ -229,13 +257,19 @@ export function useSocket() {
     };
 
     ws.onclose = (event) => {
-      if (isUnmountedRef.current) return;
+      if (isUnmountedRef.current || socketRef.current !== ws) return;
       stopPingLoop();
       console.log(`[useSocket] Closed — code: ${event.code}, reason: ${event.reason}`);
 
       if (event.code === 1000) {
         // Clean close — no reconnect
         setStatus('disconnected');
+        return;
+      }
+
+      // If we're switching sessions, don't trigger the reconnect loop
+      if (isSessionSwitchRef.current) {
+        isSessionSwitchRef.current = false;
         return;
       }
 
@@ -252,6 +286,7 @@ export function useSocket() {
     };
 
     ws.onerror = (err) => {
+      if (socketRef.current !== ws) return;
       console.error('[useSocket] WebSocket error:', err);
       setStatus('error');
       // onclose will fire after onerror, triggering reconnect
@@ -272,6 +307,14 @@ export function useSocket() {
       socketRef.current?.close(1000, 'Component unmounted');
     };
   }, [connect, stopPingLoop]);
+
+  // Keep the ref in sync whenever the Redux session ID changes
+  useEffect(() => {
+    connectionIdRef.current = sessionId;
+    if (sessionId && (!socketRef.current || socketRef.current.readyState === WebSocket.CLOSED)) {
+      connect();
+    }
+  }, [sessionId, connect]);
 
   // ── Public API ───────────────────────────────────────────────────────────────
 
@@ -310,6 +353,33 @@ export function useSocket() {
     setMessages([]);
   }, []);
 
+  const switchSession = useCallback((newSessionId?: string) => {
+    // Signal that this close is intentional — don't trigger reconnect
+    isSessionSwitchRef.current = true;
+    // Reset history flag so the new session's history gets loaded
+    historyLoadedRef.current = false;
+
+    if (newSessionId) {
+      // Load a historical session — dispatch to Redux (store subscriber writes to localStorage)
+      dispatch(setSessionId(newSessionId));
+      connectionIdRef.current = newSessionId;
+    } else {
+      // Start a fresh session — dispatch generates a new ID and persists it
+      dispatch(generateNewSession());
+      // The new ID will be set in connectionIdRef via the useEffect above,
+      // but we need it immediately for the reconnect below, so read from store.
+      // The store.getState() call handles this synchronously.
+      const { store } = require('@/store');
+      connectionIdRef.current = store.getState().session.sessionId;
+    }
+
+    clearMessages();
+    socketRef.current?.close(1000, 'Switching session');
+    setTimeout(() => {
+      connect();
+    }, 150);
+  }, [dispatch, clearMessages, connect]);
+
   return {
     messages,
     status,
@@ -319,5 +389,6 @@ export function useSocket() {
     failedNodeIds,
     sendMessage,
     clearMessages,
+    switchSession,
   };
 }

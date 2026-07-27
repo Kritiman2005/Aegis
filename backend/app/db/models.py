@@ -105,3 +105,16 @@ class ScheduledJob(Base):
     last_run_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+
+class ChatMessage(Base):
+    """
+    Persistent chat history for a session/conversation.
+    Ensures that context survives server restarts and page reloads.
+    """
+    __tablename__ = "chat_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(String, index=True, nullable=False)
+    role = Column(String, nullable=False)                         # 'user', 'assistant', 'system'
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)

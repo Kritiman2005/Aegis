@@ -325,3 +325,81 @@ def update_entity(db: Session, entity_id: int, label: str = None, data_json: str
         db.commit()
         db.refresh(entity)
     return entity
+
+
+# ─── Chat History Persistence ────────────────────────────────────────────────
+
+from app.db.models import ChatMessage
+
+def add_chat_message(db: Session, conversation_id: str, role: str, content: str) -> ChatMessage:
+    """Adds a new message to the persistent chat history."""
+    msg = ChatMessage(
+        conversation_id=conversation_id,
+        role=role,
+        content=content
+    )
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+    return msg
+
+def get_chat_history(db: Session, conversation_id: str) -> List[dict]:
+    """Retrieves all chat messages for a given session, ordered by time."""
+    messages = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.conversation_id == conversation_id)
+        .order_by(ChatMessage.created_at.asc())
+        .all()
+    )
+    
+    # Return as standard dict array for LLM injection
+    return [{"role": m.role, "content": m.content} for m in messages]
+
+def get_all_sessions(db: Session) -> List[dict]:
+    """Retrieves all distinct chat sessions, with the first user message as a preview."""
+    # Find the earliest message for each conversation
+    subquery = db.query(
+        ChatMessage.conversation_id,
+        func.min(ChatMessage.created_at).label('first_message_time')
+    ).group_by(ChatMessage.conversation_id).subquery()
+    
+    # Get the first message content (preferring 'user' role)
+    sessions = []
+    conversations = db.query(subquery.c.conversation_id, subquery.c.first_message_time).order_by(subquery.c.first_message_time.desc()).all()
+    
+    for conv_id, start_time in conversations:
+        # Get message count
+        msg_count = db.query(ChatMessage).filter(ChatMessage.conversation_id == conv_id).count()
+        
+        # Get preview (first user message, or any first message)
+        first_msg = db.query(ChatMessage).filter(
+            ChatMessage.conversation_id == conv_id,
+            ChatMessage.role == 'user'
+        ).order_by(ChatMessage.created_at.asc()).first()
+        
+        if not first_msg:
+            first_msg = db.query(ChatMessage).filter(
+                ChatMessage.conversation_id == conv_id
+            ).order_by(ChatMessage.created_at.asc()).first()
+            
+        preview = first_msg.content[:100] + "..." if first_msg and len(first_msg.content) > 100 else (first_msg.content if first_msg else "Empty session")
+        
+        sessions.append({
+            "id": conv_id,
+            "preview": preview,
+            "message_count": msg_count,
+            "created_at": start_time.isoformat() if start_time else None
+        })
+        
+    return sessions
+
+def delete_chat_session(db: Session, conversation_id: str) -> int:
+    """Deletes all messages for a given session. Returns the number of rows deleted."""
+    deleted = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.conversation_id == conversation_id)
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return deleted
+

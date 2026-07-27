@@ -39,7 +39,7 @@ class ExecutorAgent(BaseAgent):
 
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Original User Request: {user_request}\n\nPlease generate the exact arguments for `{tool_name}`."}
+            {"role": "user", "content": f"Chat History:\n{user_request}\n\nPlease generate the exact arguments for `{tool_name}`."}
         ]
         
         try:

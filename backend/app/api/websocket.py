@@ -11,6 +11,8 @@ import logging
 import uuid
 from typing import Dict
 
+import anyio
+
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from app.core.connection_manager import manager
 from app.core.agents import ChatAgent, AgentState
@@ -41,9 +43,6 @@ async def watch_timeouts():
                     except Exception as e:
                         logger.error(f"Failed to send timeout toast to {cid}: {e}")
 
-# Start the background watcher
-asyncio.create_task(watch_timeouts())
-
 # ─── WebSocket Endpoint ───────────────────────────────────────────────────────
 
 @router.websocket("/ws")
@@ -60,13 +59,31 @@ async def websocket_endpoint(
         agent_sessions[connection_id] = ChatAgent(connection_id)
     session = agent_sessions[connection_id]
 
-    # Notify client of their assigned connection ID
-    await manager.send_json(connection_id, {
-        "type": "connected",
-        "connection_id": connection_id,
-    })
-
     try:
+        # Send connected handshake — ignore failure if client already dropped (React Strict Mode)
+        try:
+            await websocket.send_json({
+                "type": "connected",
+                "connection_id": connection_id,
+            })
+        except Exception:
+            # Client disconnected before we could say hello — clean up and exit
+            manager.disconnect(connection_id, websocket)
+            return
+
+        # Load history from DB in a thread so we don't block the event loop,
+        # then push it to the client as a dedicated "history" event.
+        try:
+            await anyio.to_thread.run_sync(session.load_history)
+            if session.chat_history:
+                await websocket.send_json({
+                    "type": "history",
+                    "history": session.chat_history,
+                })
+        except Exception as e:
+            logger.warning(f"Failed to load/send history for {connection_id}: {e}")
+
+
         while True:
             raw = await websocket.receive_text()
 
@@ -94,14 +111,24 @@ async def websocket_endpoint(
                 try:
                     streamed = False
                     loop = asyncio.get_running_loop()
+                    token_queue = asyncio.Queue()
 
                     def send_token_sync(token: str):
                         nonlocal streamed
                         streamed = True
-                        asyncio.run_coroutine_threadsafe(manager.send_json(connection_id, {
-                            "type": "token",
-                            "content": token
-                        }), loop)
+                        loop.call_soon_threadsafe(token_queue.put_nowait, token)
+
+                    async def token_sender_loop():
+                        while True:
+                            token = await token_queue.get()
+                            if token is None:
+                                break
+                            await manager.send_json(connection_id, {
+                                "type": "token",
+                                "content": token
+                            })
+
+                    sender_task = asyncio.create_task(token_sender_loop())
 
                     async def send_status(msg: str):
                         await manager.send_json(connection_id, {
@@ -117,6 +144,10 @@ async def websocket_endpoint(
                         token_callback=send_token_sync,
                         status_callback=send_status
                     )
+                    
+                    # Stop the token sender task
+                    loop.call_soon_threadsafe(token_queue.put_nowait, None)
+                    await sender_task
 
                     if response_text.startswith("__system_toast__:"):
                         toast_msg = response_text.split(":", 1)[1]
@@ -244,9 +275,16 @@ async def websocket_endpoint(
 
     except WebSocketDisconnect:
         logger.info(f"[WS] Client disconnected: {connection_id[:8]}")
+    except RuntimeError as exc:
+        if "WebSocket is not connected" in str(exc) or "Need to call \"accept\" first" in str(exc):
+            # This happens if the client drops the connection immediately after connecting,
+            # especially in React Strict Mode which double-mounts components.
+            logger.info(f"[WS] Client disconnected abruptly: {connection_id[:8]}")
+        else:
+            logger.error(f"[WS] Unexpected RuntimeError for {connection_id[:8]}: {exc}")
     except Exception as exc:
         logger.error(f"[WS] Unexpected error for {connection_id[:8]}: {exc}")
     finally:
-        manager.disconnect(connection_id)
+        manager.disconnect(connection_id, websocket)
         if connection_id in agent_sessions:
             del agent_sessions[connection_id]

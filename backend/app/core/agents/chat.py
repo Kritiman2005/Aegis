@@ -42,6 +42,8 @@ class ChatAgent(BaseAgent):
         self._state = AgentState.IDLE
         self.state_entered_at = time.time()
         self.plan: Optional[List[Dict]] = None
+        
+        # Start with empty history — loaded lazily after WebSocket handshake via load_history()
         self.chat_history: List[Dict] = []
 
         # Entities proposed after execution — awaiting user confirmation
@@ -53,6 +55,17 @@ class ChatAgent(BaseAgent):
         self.planner = PlannerAgent(llm_mgr)
         self.executor = ExecutorAgent(llm_mgr)
         self.extractor = EntityExtractorAgent(llm_mgr)
+
+    def load_history(self):
+        """Load chat history from DB. Called after WebSocket handshake to avoid blocking."""
+        try:
+            from app.db.crud import get_chat_history
+            db = SessionLocal()
+            self.chat_history = get_chat_history(db, self.connection_id)
+            db.close()
+        except Exception as e:
+            logger.warning(f"Could not load chat history: {e}")
+            self.chat_history = []
 
     @property
     def state(self):
@@ -174,10 +187,27 @@ class ChatAgent(BaseAgent):
         """IDLE → generate plan → WAITING_CONFIRMATION."""
         self.chat_history.append({"role": "user", "content": message})
         
+        # Persist user message to DB
+        try:
+            from app.db.crud import add_chat_message
+            db = SessionLocal()
+            add_chat_message(db, self.connection_id, "user", message)
+            db.close()
+        except Exception as e:
+            logger.warning(f"Failed to persist user message: {e}")
+        
         entity_context = self._get_entity_context()
 
         # We will pass chat history EXCLUDING the current message to planner, as planner appends it.
-        history_for_planner = self.chat_history[:-1]
+        # Trim to the last 6 messages and cap each message to 600 chars to stay within the
+        # local LLM's 4096-token context window and prevent the planner from hanging.
+        _MAX_PLANNER_HISTORY = 6
+        _MAX_MSG_CHARS = 600
+        raw_history = self.chat_history[:-1]
+        history_for_planner = [
+            {"role": m["role"], "content": m["content"][:_MAX_MSG_CHARS] + ("..." if len(m["content"]) > _MAX_MSG_CHARS else "")}
+            for m in raw_history[-_MAX_PLANNER_HISTORY:]
+        ]
 
         # ── Mode Branching ─────────────────────────────
         if mode == "chat":
@@ -192,6 +222,16 @@ class ChatAgent(BaseAgent):
             )
             
             self.chat_history.append({"role": "assistant", "content": chat_response})
+            
+            # Persist assistant message to DB
+            try:
+                from app.db.crud import add_chat_message
+                db = SessionLocal()
+                add_chat_message(db, self.connection_id, "assistant", chat_response)
+                db.close()
+            except Exception as e:
+                logger.warning(f"Failed to persist assistant message: {e}")
+
             return chat_response
 
         # If mode == "agent", we skip the Chat LLM and go straight to Plan Generation
@@ -209,7 +249,7 @@ class ChatAgent(BaseAgent):
             await status_callback("Drafting execution plan...")
 
         plan_json_str = await anyio.to_thread.run_sync(
-            lambda: self.planner.generate_plan(message, tools_str, entity_context, history_for_planner)
+            lambda: self.planner.generate_plan(message, tools_str, entity_context, history_for_planner, token_callback)
         )
 
         try:
@@ -221,9 +261,32 @@ class ChatAgent(BaseAgent):
             raw_plan = plan_data
         else:
             raw_plan = plan_data.get("plan", [])
+            
+        # Handle clarification escape hatch
+        if isinstance(plan_data, dict) and plan_data.get("clarifying_question"):
+            question = plan_data.get("clarifying_question")
+            self.state = AgentState.IDLE
+            self.chat_history.append({"role": "assistant", "content": question})
+            
+            # Persist clarifying question to DB
+            try:
+                from app.db.crud import add_chat_message
+                db = SessionLocal()
+                add_chat_message(db, self.connection_id, "assistant", question)
+                db.close()
+            except Exception as e:
+                logger.warning(f"Failed to persist clarifying question: {e}")
+
+            return question
         
         # Filter out placeholder tools that the LLM might hallucinate when no tools are needed
-        raw_plan = [step for step in raw_plan if step.get("tool") and str(step.get("tool")).lower() not in ("none", "none_available", "null", "n/a", "unknown")]
+        valid_plan = []
+        for step in raw_plan:
+            if isinstance(step, dict) and step.get("tool"):
+                tool_name = str(step.get("tool")).lower()
+                if tool_name not in ("none", "none_available", "null", "n/a", "unknown"):
+                    valid_plan.append(step)
+        raw_plan = valid_plan
         
         # Basic validation
         validation_errors = []
@@ -312,6 +375,16 @@ class ChatAgent(BaseAgent):
     async def _handle_confirmation(self, message: str, token_callback=None) -> str:
         """WAITING_CONFIRMATION → confirm → EXECUTING  or  refine plan."""
         self.chat_history.append({"role": "user", "content": message})
+        
+        # Persist user message to DB
+        try:
+            from app.db.crud import add_chat_message
+            db = SessionLocal()
+            add_chat_message(db, self.connection_id, "user", message)
+            db.close()
+        except Exception as e:
+            logger.warning(f"Failed to persist user message: {e}")
+
 
         positive_keywords = ['yes', 'proceed', 'go ahead', 'do it', 'sure', 'ok', 'okay', 'yep', 'yeah', 'looks good']
         is_positive = any(word in message.lower() for word in positive_keywords)
@@ -349,7 +422,19 @@ class ChatAgent(BaseAgent):
                 response_text = await anyio.to_thread.run_sync(
                     self._call_llm_text, messages
                 )
-                return response_text + "\n\n*(Plan is still pending. Reply 'yes' to execute or tell me what to change)*"
+                final_response = response_text + "\n\n*(Plan is still pending. Reply 'yes' to execute or tell me what to change)*"
+                self.chat_history.append({"role": "assistant", "content": final_response})
+                
+                # Persist assistant response to DB
+                try:
+                    from app.db.crud import add_chat_message
+                    db = SessionLocal()
+                    add_chat_message(db, self.connection_id, "assistant", final_response)
+                    db.close()
+                except Exception as e:
+                    logger.warning(f"Failed to persist assistant response: {e}")
+                    
+                return final_response
 
             # Otherwise, treat as an edit request and route to Planner
             tools_str = self.get_searched_tools(message)
@@ -366,11 +451,23 @@ class ChatAgent(BaseAgent):
             try:
                 plan_data = json.loads(plan_json_str)
                 self.plan = plan_data.get("plan", [])
-                self.chat_history.append({"role": "assistant", "content": plan_json_str})
+                
                 response = "I have refined the execution plan:\n\n"
                 for i, step in enumerate(self.plan):
                     response += f"{i+1}. **{step.get('tool')}**: {step.get('reason')}\n"
                 response += "\nIs this better? (Reply 'yes' to proceed)"
+                
+                self.chat_history.append({"role": "assistant", "content": response})
+                
+                # Persist refined plan to DB
+                try:
+                    from app.db.crud import add_chat_message
+                    db = SessionLocal()
+                    add_chat_message(db, self.connection_id, "assistant", response)
+                    db.close()
+                except Exception as e:
+                    logger.warning(f"Failed to persist refined plan: {e}")
+                    
                 return response
             except json.JSONDecodeError:
                 return "Error parsing refined plan from LLM."
@@ -540,7 +637,15 @@ class ChatAgent(BaseAgent):
         import traceback
 
         # Retrieve context for the ExecutorAgent
-        user_request = next((msg["content"] for msg in reversed(self.chat_history) if msg["role"] == "user"), "")
+        # Trim chat history to last 6 messages, capped at 600 chars each, to keep the executor
+        # within the local LLM context window.
+        _MAX_EXEC_HISTORY = 6
+        _MAX_EXEC_CHARS = 600
+        trimmed_history = [
+            {"role": m["role"], "content": m["content"][:_MAX_EXEC_CHARS] + ("..." if len(m["content"]) > _MAX_EXEC_CHARS else "")}
+            for m in self.chat_history[-_MAX_EXEC_HISTORY:]
+        ]
+        full_chat_history = json.dumps(trimmed_history, indent=2)
         entity_context = self._get_entity_context()
 
         # Run each tool step and collect raw results
@@ -573,9 +678,18 @@ class ChatAgent(BaseAgent):
                     step_reason=step_reason,
                     prior_results=prior_results_map,
                     entity_context=entity_context,
-                    user_request=user_request
+                    user_request=full_chat_history
                 )
             )
+
+            # Handle Executor Escape Hatch
+            if isinstance(arguments, dict) and "error" in arguments:
+                err_msg = arguments["error"]
+                logger.error(f"Executor aborted for {tool_name}: {err_msg}")
+                yield {"text": f"❌ Plan aborted: {err_msg}\n", "node_id": node_id, "status": "failed"}
+                self.state = AgentState.IDLE
+                self.plan = None
+                return
 
             # Single strict check to catch catastrophic failure
             try:
@@ -592,7 +706,10 @@ class ChatAgent(BaseAgent):
                     lambda t=tool_name, a=arguments: mcp_registry.call_tool(t, a)
                 )
                 result_str = str(result)
-                yield {"text": f"Result for `{tool_name}`:\n{result_str[:1000]}\n", "node_id": node_id, "status": "completed"}
+                
+                # Send the entire output to the UI without truncation
+                display_str = result_str
+                yield {"text": f"Result for `{tool_name}`:\n{display_str}\n", "node_id": node_id, "status": "completed"}
 
                 # Collect result for next steps and extraction
                 prior_results_map[node_id] = result
@@ -618,12 +735,46 @@ class ChatAgent(BaseAgent):
                     
                 yield {"text": f"❌ {msg}\n{progress_msg}\n", "node_id": node_id, "status": "failed"}
                 
+                # Append partial results to chat history so the LLM remembers what worked before the failure
+                if tool_results:
+                    # Provide full text to the LLM context without arbitrary truncation
+                    summary = "\n".join([f"Tool `{r['tool']}` output:\n{r['result']}" for r in tool_results])
+                    content = f"Execution Results (Partial before failure):\n{summary}"
+                    self.chat_history.append({
+                        "role": "assistant",
+                        "content": content
+                    })
+                    try:
+                        from app.db.crud import add_chat_message
+                        db = SessionLocal()
+                        add_chat_message(db, self.connection_id, "assistant", content)
+                        db.close()
+                    except Exception as e:
+                        logger.warning(f"Failed to persist partial execution results: {e}")
+
                 # Hard-fail and reset
                 self.state = AgentState.IDLE
                 self.plan = None
                 return
 
         yield {"text": "\nExecution complete!", "node_id": None}
+
+        # Append summary of results to chat history so the LLM remembers them for the next turn
+        if tool_results:
+            # Provide full text to the LLM context without arbitrary truncation
+            summary = "\n".join([f"Tool `{r['tool']}` output:\n{r['result']}" for r in tool_results])
+            content = f"Execution Results:\n{summary}"
+            self.chat_history.append({
+                "role": "assistant",
+                "content": content
+            })
+            try:
+                from app.db.crud import add_chat_message
+                db = SessionLocal()
+                add_chat_message(db, self.connection_id, "assistant", content)
+                db.close()
+            except Exception as e:
+                logger.warning(f"Failed to persist execution results: {e}")
 
         # Go back to IDLE
         self.state = AgentState.IDLE
