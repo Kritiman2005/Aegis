@@ -32,3 +32,8 @@ sqlalchemy>=2.0.0
 
 # Environment variables
 python-dotenv>=1.0.1
+
+# Embeddings for MCP RAG
+sentence-transformers>=3.0.1
+scikit-learn>=1.5.0
+

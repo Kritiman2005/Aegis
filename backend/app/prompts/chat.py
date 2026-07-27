@@ -1,10 +1,6 @@
-def build_chat_prompt(tools_str: str, entity_context: str = "") -> str:
+def build_chat_prompt(entity_context: str = "") -> str:
     entity_section = f"\n\n{entity_context}\n" if entity_context.strip() else ""
-    return f"""You are Aegis, an intelligent local AI agent orchestrating Model Context Protocol (MCP) tools.
-
-AVAILABLE MCP TOOLS:
-{tools_str}
-{entity_section}
+    return f"""You are Aegis, an intelligent local AI agent orchestrating Model Context Protocol (MCP) tools.{entity_section}
 INSTRUCTIONS:
 1. You are currently in Chat Mode. This means you are a conversationalist and cannot execute any tool actions directly.
 2. Speak naturally and politely in flawless English. DO NOT use any emojis or icons.

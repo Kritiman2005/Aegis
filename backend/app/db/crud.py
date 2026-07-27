@@ -2,6 +2,7 @@ import json
 import logging
 from typing import Optional, List
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 
@@ -229,19 +230,37 @@ def save_entity(
 ) -> ConversationEntity:
     """
     Persists a user-confirmed entity to the conversation_entities table.
+    Uses an UPSERT strategy based on conversation_id and (entity_id OR label).
     `data` is the full raw content (email body, file text, channel messages, etc.)
     """
-    entity = ConversationEntity(
-        conversation_id=conversation_id,
-        label=label,
-        entity_type=entity_type,
-        entity_id=entity_id,
-        data_json=json.dumps(data, ensure_ascii=False)
-    )
-    db.add(entity)
+    existing_entity = db.query(ConversationEntity).filter(
+        ConversationEntity.conversation_id == conversation_id,
+        (ConversationEntity.entity_id == entity_id) | 
+        (func.lower(func.trim(ConversationEntity.label)) == label.strip().lower())
+    ).first()
+
+    data_json = json.dumps(data, ensure_ascii=False)
+
+    if existing_entity:
+        existing_entity.label = label
+        existing_entity.entity_type = entity_type
+        existing_entity.entity_id = entity_id
+        existing_entity.data_json = data_json
+        entity = existing_entity
+        logger.info(f"Upserted (Updated) entity [{entity_type}] '{label}' for session {conversation_id[:8]}")
+    else:
+        entity = ConversationEntity(
+            conversation_id=conversation_id,
+            label=label,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            data_json=data_json
+        )
+        db.add(entity)
+        logger.info(f"Upserted (Inserted) entity [{entity_type}] '{label}' for session {conversation_id[:8]}")
+
     db.commit()
     db.refresh(entity)
-    logger.info(f"Saved entity [{entity_type}] '{label}' for session {conversation_id[:8]}")
     return entity
 
 

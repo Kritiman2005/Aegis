@@ -7,8 +7,9 @@ Generates a structured JSON tool-execution plan for ANY Model Context Protocol (
 Every step produces:
   - tool: Exact MCP tool name
   - reason: Purpose of step
-  - arguments: Valid argument dictionary conforming to tool input schema
-  - payload_preview: Universal human-readable summary of the exact operation/data
+  - step_id: Unique string ID for this step (e.g., 'step_1')
+  - depends_on: Array of step_ids that must complete before this step
+  - foreach: (Optional) A target step_id to loop over
 """
 
 
@@ -35,33 +36,27 @@ INSTRUCTIONS:
 1. Analyze the user's intent, conversation history, and entity memory.
 2. Formulate a sequence of tool steps to fulfill the user's goal.
 3. For EVERY tool step in the plan, you MUST generate:
+   - "step_id"         : A unique string ID for this step (e.g., "step_1", "step_2").
    - "tool"            : Exact tool name from the available MCP list.
-   - "reason"          : Clear explanation of what this step accomplishes.
-   - "arguments"       : Key-value object matching the tool's input schema.
-   - "payload_preview" : A complete, human-readable preview of WHAT data/content will be sent, queried, modified, or fetched.
+   - "reason"          : Clear explanation of what this step accomplishes and why it is needed.
+   - "depends_on"      : An array of step_ids that MUST execute before this step. Empty array `[]` if none.
+   - "foreach"         : (Optional) If this step needs to loop over the output of a previous step, provide the target step_id here. Otherwise, omit or set to null.
 
-UNIVERSAL PAYLOAD PREVIEW GUIDELINES:
-- Communication (Gmail, Slack, Teams): Full message/draft text, recipient, subject.
-- Databases & Search (Postgres, Search, Notion, Airtable): Exact query, SQL statement, filters, or record fields.
-- Files & Workspace (Drive, Filesystem, Local Docs): Target path, file name, content diff, or read range.
-- CRM & E-Commerce (HubSpot, Salesforce, Stripe, Shopify): Target entity, field updates, payment/order amounts.
-- Web & Read Tools (Fetch, Maps, Time): Target URL, location query, or lookup target.
+CRITICAL RULE: You MUST ONLY plan actions that the provided tools can explicitly perform. If the user asks for a capability that does not exist, DO NOT hallucinate it. Instead, return an empty "plan" array and explain the limitation in the "warnings" array.
 
 FORMAT EXAMPLE:
 {{
   "plan": [
     {{
+      "step_id": "step_1",
       "tool": "<ANY_MCP_TOOL_NAME>",
       "reason": "<WHY_THIS_TOOL_IS_NEEDED>",
-      "arguments": {{
-        "<param_1>": "<value_1>",
-        "<param_2>": "<value_2>"
-      }},
-      "payload_preview": "<HUMAN_READABLE_SUMMARY_OR_FULL_DRAFT_TEXT>"
+      "depends_on": [],
+      "foreach": null
     }}
   ]
 }}
 
-If no tools are required or available, return an empty "plan" array with a "warnings" array explaining why.
+If the user is just asking a general question or no tools are required, DO NOT create fake or placeholder tools (like 'none_available'). Return an EMPTY "plan" array `[]` and provide your response in the "warnings" array.
 
 Respond with valid JSON only. Do not use any emojis or icons. Ensure flawless English."""

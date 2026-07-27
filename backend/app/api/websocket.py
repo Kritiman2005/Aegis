@@ -21,6 +21,29 @@ router = APIRouter(tags=["WebSocket"])
 # Store active agent sessions per connection
 agent_sessions: Dict[str, ChatAgent] = {}
 
+import time
+async def watch_timeouts():
+    """Background task to cancel pending states that sit idle for > 5 minutes."""
+    while True:
+        await asyncio.sleep(10)
+        now = time.time()
+        for cid, session in list(agent_sessions.items()):
+            if session.state in [AgentState.WAITING_CONFIRMATION, AgentState.WAITING_MEMORY_CONFIRMATION]:
+                if now - session.state_entered_at > 300: # 5 minutes
+                    session.state = AgentState.IDLE
+                    session.plan = None
+                    session._pending_entities = []
+                    try:
+                        await manager.send_json(cid, {
+                            "type": "toast",
+                            "content": "Action expired, please re-ask."
+                        })
+                    except Exception as e:
+                        logger.error(f"Failed to send timeout toast to {cid}: {e}")
+
+# Start the background watcher
+asyncio.create_task(watch_timeouts())
+
 # ─── WebSocket Endpoint ───────────────────────────────────────────────────────
 
 @router.websocket("/ws")
@@ -32,9 +55,10 @@ async def websocket_endpoint(
     connection_id = client_id
     await manager.connect(websocket, connection_id)
     
-    # Initialize an AgentSession for this client
-    session = ChatAgent(connection_id)
-    agent_sessions[connection_id] = session
+    # Initialize an AgentSession for this client if it doesn't exist
+    if connection_id not in agent_sessions:
+        agent_sessions[connection_id] = ChatAgent(connection_id)
+    session = agent_sessions[connection_id]
 
     # Notify client of their assigned connection ID
     await manager.send_json(connection_id, {
@@ -68,29 +92,67 @@ async def websocket_endpoint(
                 logger.info(f"[WS:{connection_id[:8]}] User: {content[:80]!r}")
 
                 try:
+                    streamed = False
+                    loop = asyncio.get_running_loop()
+
+                    def send_token_sync(token: str):
+                        nonlocal streamed
+                        streamed = True
+                        asyncio.run_coroutine_threadsafe(manager.send_json(connection_id, {
+                            "type": "token",
+                            "content": token
+                        }), loop)
+
+                    async def send_status(msg: str):
+                        await manager.send_json(connection_id, {
+                            "type": "toast",
+                            "content": msg
+                        })
+
                     # Process the message through the state machine
-                    response_text = await session.handle_message(content, mode)
+                    await send_status("Analyzing request...")
+                    response_text = await session.handle_message(
+                        content, 
+                        mode, 
+                        token_callback=send_token_sync,
+                        status_callback=send_status
+                    )
 
-                    # Send the response directly
-                    await manager.send_json(connection_id, {
-                        "type": "token",
-                        "content": response_text
-                    })
+                    if response_text.startswith("__system_toast__:"):
+                        toast_msg = response_text.split(":", 1)[1]
+                        await manager.send_json(connection_id, {
+                            "type": "toast",
+                            "content": toast_msg
+                        })
+                    else:
+                        # Send the response directly only if we didn't stream it token-by-token
+                        if not streamed:
+                            await manager.send_json(connection_id, {
+                                "type": "token",
+                                "content": response_text
+                            })
 
-                    # Signal end of stream
-                    await manager.send_json(connection_id, {
-                        "type": "done",
-                        "content": "",
-                    })
+                        # Signal end of stream
+                        await manager.send_json(connection_id, {
+                            "type": "done",
+                            "content": "",
+                        })
                     
-                    # 2. If the user said "proceed", the state machine moves to EXECUTING
                     if session.state == AgentState.EXECUTING:
                         # Stream the execution progress token by token
                         async for progress in session.execute_plan():
-                            await manager.send_json(connection_id, {
-                                "type": "token",
-                                "content": progress
-                            })
+                            if isinstance(progress, dict):
+                                await manager.send_json(connection_id, {
+                                    "type": "token",
+                                    "content": progress.get("text", ""),
+                                    "node_id": progress.get("node_id"),
+                                    "status": progress.get("status")
+                                })
+                            else:
+                                await manager.send_json(connection_id, {
+                                    "type": "token",
+                                    "content": progress
+                                })
 
                         # End stream when execution finishes
                         # (state is now IDLE or WAITING_MEMORY_CONFIRMATION)
@@ -131,6 +193,53 @@ async def websocket_endpoint(
                     await manager.send_json(connection_id, {"type": "done", "content": ""})
                 except Exception as exc:
                     logger.error(f"[WS:{connection_id[:8]}] Extraction error: {exc}")
+                    await manager.send_json(connection_id, {"type": "error", "content": str(exc)})
+
+            elif msg_type == "schedule_plan":
+                logger.info(f"[WS:{connection_id[:8]}] Scheduling Plan")
+                try:
+                    cron_expr = payload.get("cron", "every_1_hour")
+                    # Ensure the session has a pending plan
+                    if session.state.name != "WAITING_CONFIRMATION" or not session.plan:
+                        raise ValueError("No active plan waiting for confirmation to schedule.")
+                    
+                    # Save to ScheduledJob table
+                    from app.db.database import SessionLocal
+                    from app.db.models import ScheduledJob
+                    from datetime import datetime
+                    
+                    db = SessionLocal()
+                    from app.core.scheduler import scheduler_daemon
+                    next_run = scheduler_daemon._calculate_next_run(cron_expr, datetime.utcnow())
+                    
+                    job = ScheduledJob(
+                        conversation_id=connection_id,
+                        cron_expression=cron_expr,
+                        frozen_plan_json=json.dumps(session.plan),
+                        status="active",
+                        next_run_at=next_run
+                    )
+                    db.add(job)
+                    db.commit()
+                    db.refresh(job)
+                    db.close()
+                    
+                    # Clear session state
+                    session.plan = None
+                    session.state = session.state.IDLE
+                    
+                    await manager.send_json(connection_id, {
+                        "type": "toast",
+                        "content": f"Plan successfully scheduled! (Job ID: {job.id})"
+                    })
+                    
+                    await manager.send_json(connection_id, {
+                        "type": "token",
+                        "content": f"\n\n**Scheduled!** I'll run this plan `{cron_expr}` in the background. What's next?"
+                    })
+                    await manager.send_json(connection_id, {"type": "done", "content": ""})
+                except Exception as exc:
+                    logger.error(f"[WS:{connection_id[:8]}] Schedule error: {exc}")
                     await manager.send_json(connection_id, {"type": "error", "content": str(exc)})
 
     except WebSocketDisconnect:

@@ -107,8 +107,56 @@ class MCPServerRegistry:
         if db:
             from app.db.crud import set_mcp_server_status
             set_mcp_server_status(db, server_name, status="disconnected")
-
+            
         logger.info(f"Disconnected MCP server '{server_name}'.")
+
+    def search_tools(self, query: str, top_k: int = 5) -> List[dict]:
+        """Uses SQLite FTS5 to semantically search available tools."""
+        import re
+        from sqlalchemy import text
+        from app.db.database import SessionLocal
+        
+        # Extract alphanumeric words to form a bag-of-words OR query
+        words = re.findall(r'\w+', query)
+        if not words:
+            return self.list_all_tools()[:top_k]
+            
+        fts_query = " OR ".join(words)
+        
+        db = SessionLocal()
+        try:
+            sql = text("""
+                SELECT name
+                FROM mcp_tools_fts 
+                WHERE mcp_tools_fts MATCH :match_query 
+                ORDER BY rank 
+                LIMIT 20
+            """)
+            rows = db.execute(sql, {"match_query": fts_query}).fetchall()
+            
+            results = []
+            for row in rows:
+                name = row[0]
+                if name in self._tool_to_server:
+                    server_name = self._tool_to_server[name]
+                    client = self._clients[server_name]
+                    for t in client.cached_tools:
+                        if t['name'] == name:
+                            results.append(dict(t))
+                            break
+                            
+                if len(results) >= top_k:
+                    break
+            
+            if not results:
+                return self.list_all_tools()[:top_k]
+                
+            return results
+        except Exception as e:
+            logger.error(f"FTS5 tool search failed: {e}")
+            return self.list_all_tools()[:top_k]
+        finally:
+            db.close()
 
     def list_all_tools(self) -> List[dict]:
         """Returns all tools from all currently connected MCP servers in standard MCP format."""

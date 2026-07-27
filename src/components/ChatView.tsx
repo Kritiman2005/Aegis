@@ -19,7 +19,6 @@ import {
 import { type ChatMessage, type ConnectionStatus } from '@/hooks/useSocket';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-
 interface ChatViewProps {
   messages: ChatMessage[];
   status: ConnectionStatus;
@@ -27,6 +26,9 @@ interface ChatViewProps {
   onSendMessage: (msg: string, msgType?: string, mode?: string, userPrompt?: string) => boolean;
   onClearMessages: () => void;
   activeConnectorName?: string;
+  activeNodeId?: string | null;
+  completedNodeIds?: Set<string>;
+  failedNodeIds?: Set<string>;
 }
 
 export default function ChatView({
@@ -36,15 +38,23 @@ export default function ChatView({
   onSendMessage,
   onClearMessages,
   activeConnectorName = 'GitHub',
+  activeNodeId,
+  completedNodeIds,
+  failedNodeIds,
 }: ChatViewProps) {
   const [inputVal, setInputVal] = useState('');
   const [savingMsgId, setSavingMsgId] = useState<string | null>(null);
   const [savedMsgId, setSavedMsgId] = useState<string | null>(null);
   const [chatMode, setChatMode] = useState<'chat' | 'agent'>('chat');
   
+  // Schedule state
+  const [schedulingPlanId, setSchedulingPlanId] = useState<string | null>(null);
+  const [scheduleCron, setScheduleCron] = useState<string>('every_1_hour');
+  
   // Memory Extraction UI State
   const [activeBookmarkIndex, setActiveBookmarkIndex] = useState<number | null>(null);
   const [extractionPrompt, setExtractionPrompt] = useState('');
+  const [selectedChips, setSelectedChips] = useState<Set<number>>(new Set());
   
   // Plan Editing State
   const [editingPlanId, setEditingPlanId] = useState<string | null>(null);
@@ -137,7 +147,7 @@ export default function ChatView({
               ].map((sample) => (
                 <button
                   key={sample}
-                  onClick={() => onSendMessage(sample)}
+                  onClick={() => onSendMessage(sample, 'message', chatMode)}
                   className="p-3 rounded-xl bg-white border border-gray-200 text-xs text-gray-700 hover:border-gray-400 hover:shadow-sm transition-all"
                 >
                   {sample}
@@ -148,6 +158,17 @@ export default function ChatView({
         ) : (
           messages.map((msg, index) => {
             const isUser = msg.role === 'user';
+            const isSystem = msg.role === 'system';
+            
+            if (isSystem) {
+              return (
+                <div key={msg.id} className="flex justify-center my-4">
+                  <div className="px-4 py-1.5 bg-gray-100 text-gray-500 text-xs font-medium rounded-full shadow-sm border border-gray-200">
+                    {msg.content}
+                  </div>
+                </div>
+              );
+            }
 
             return (
               <div
@@ -233,7 +254,7 @@ export default function ChatView({
                   ) : (
                     /* Assistant Message Card (White bordered card matching Image 2) */
                     <div className="bg-white border border-gray-200 rounded-2xl p-5 text-xs text-gray-800 leading-relaxed shadow-sm space-y-4">
-                      {/* Formatted Markdown Content */}
+                      {/* Formatted Markdown Content (hide JSON blocks of plan) */}
                       <div className="font-sans w-full overflow-hidden">
                         {msg.isStreaming && !msg.content ? (
                           <div className="flex items-center gap-1.5 h-6 opacity-70">
@@ -243,7 +264,18 @@ export default function ChatView({
                           </div>
                         ) : (
                           <div className="prose prose-sm prose-slate max-w-none break-words marker:text-gray-400 prose-p:leading-relaxed">
-                            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                            <ReactMarkdown 
+                              remarkPlugins={[remarkGfm]}
+                              components={{
+                                code({node, inline, className, children, ...props}) {
+                                  // Hide JSON plan blocks from text rendering, as they are handled by Canvas
+                                  if (msg.content.includes('Proposed Execution Plan') && className === 'language-json') {
+                                    return null;
+                                  }
+                                  return <code className={className} {...props}>{children}</code>;
+                                }
+                              }}
+                            >
                               {msg.content}
                             </ReactMarkdown>
                           </div>
@@ -251,17 +283,27 @@ export default function ChatView({
                       </div>
 
                       {/* Interactive Execution Plan Card (if plan response detected) */}
-                      {msg.content.includes('Proposed Execution Plan') && (
-                        <div className="p-4 rounded-xl bg-gray-50 border border-gray-200 space-y-3">
-                          <div className="flex items-center justify-between border-b border-gray-200 pb-2">
-                            <span className="text-xs font-bold text-gray-900 flex items-center gap-1.5">
-                              <CheckCircle2 className="w-4 h-4 text-teal-600" />
-                              Execution Confirmation Required
-                            </span>
-                            <span className="text-[10px] text-gray-400">Human-In-The-Loop</span>
-                          </div>
-
-                          <div className="flex flex-col gap-2 pt-1">
+                      {msg.content.includes('Proposed Execution Plan') && (() => {
+                        let parsedPlan = null;
+                        try {
+                          const jsonMatch = msg.content.match(/```json\n([\s\S]*?)\n```/);
+                          if (jsonMatch && jsonMatch[1]) {
+                            parsedPlan = JSON.parse(jsonMatch[1]);
+                          }
+                        } catch (e) {
+                          console.error("Failed to parse plan json", e);
+                        }
+                        
+                        return (
+                          <div className="p-4 rounded-xl bg-gray-50 border border-gray-200 space-y-3">
+                            <div className="flex items-center justify-between border-b border-gray-200 pb-2">
+                              <span className="text-xs font-bold text-gray-900 flex items-center gap-1.5">
+                                <CheckCircle2 className="w-4 h-4 text-teal-600" />
+                                Execution Confirmation Required
+                              </span>
+                              <span className="text-[10px] text-gray-400">Human-In-The-Loop</span>
+                            </div>
+                            <div className="flex flex-col gap-2 pt-1">
                             {editingPlanId === msg.id ? (
                               <div className="space-y-2">
                                 <textarea
@@ -272,7 +314,7 @@ export default function ChatView({
                                 <div className="flex gap-2">
                                   <button
                                     onClick={() => {
-                                      onSendMessage(`Please use exactly this updated plan:\n\n${planEditContent}`);
+                                      onSendMessage(`Please use exactly this updated plan:\n\n${planEditContent}`, 'message', chatMode);
                                       setEditingPlanId(null);
                                     }}
                                     className="px-4 py-2 rounded-xl bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700 transition-all shadow-sm"
@@ -287,13 +329,49 @@ export default function ChatView({
                                   </button>
                                 </div>
                               </div>
+                            ) : schedulingPlanId === msg.id ? (
+                              <div className="space-y-3 bg-white p-3 rounded-lg border border-gray-200">
+                                <label className="block text-xs font-semibold text-gray-700">Select Schedule Interval</label>
+                                <select 
+                                  value={scheduleCron}
+                                  onChange={(e) => setScheduleCron(e.target.value)}
+                                  className="w-full bg-gray-50 border border-gray-200 rounded-lg p-2 text-xs outline-none focus:ring-2 focus:ring-indigo-100"
+                                >
+                                  <option value="every_1_min">Every 1 Minute (Test)</option>
+                                  <option value="every_1_hour">Every 1 Hour</option>
+                                  <option value="every_1_day">Every 1 Day</option>
+                                </select>
+                                <div className="flex gap-2 pt-2">
+                                  <button
+                                    onClick={() => {
+                                      onSendMessage(scheduleCron, 'schedule_plan', chatMode, scheduleCron);
+                                      setSchedulingPlanId(null);
+                                    }}
+                                    className="px-4 py-2 rounded-xl bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700 transition-all shadow-sm"
+                                  >
+                                    Confirm Schedule
+                                  </button>
+                                  <button
+                                    onClick={() => setSchedulingPlanId(null)}
+                                    className="px-4 py-2 rounded-xl bg-gray-200 text-gray-700 text-xs font-medium hover:bg-gray-300 transition-all"
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              </div>
                             ) : (
-                              <div className="flex flex-wrap gap-2">
+                              <div className="flex flex-wrap gap-2 mt-2">
                                 <button
-                                  onClick={() => onSendMessage('yes')}
-                                  className="px-4 py-2 rounded-xl bg-black text-white text-xs font-semibold hover:bg-neutral-800 transition-all shadow-sm"
+                                  onClick={() => onSendMessage('yes', 'message', chatMode)}
+                                  className="px-4 py-2 rounded-xl bg-black text-white text-xs font-semibold hover:bg-neutral-800 transition-all shadow-sm flex items-center gap-1"
                                 >
                                   Proceed & Execute
+                                </button>
+                                <button
+                                  onClick={() => setSchedulingPlanId(msg.id)}
+                                  className="px-4 py-2 rounded-xl bg-indigo-100 text-indigo-700 text-xs font-semibold hover:bg-indigo-200 transition-all shadow-sm flex items-center gap-1"
+                                >
+                                  Schedule Plan
                                 </button>
                                 <button
                                   onClick={() => {
@@ -305,7 +383,7 @@ export default function ChatView({
                                   Edit Payload
                                 </button>
                                 <button
-                                  onClick={() => onSendMessage('cancel')}
+                                  onClick={() => onSendMessage('cancel', 'message', chatMode)}
                                   className="px-4 py-2 rounded-xl border border-gray-200 text-red-600 bg-white text-xs font-medium hover:bg-red-50 transition-all"
                                 >
                                   Cancel Plan
@@ -314,8 +392,8 @@ export default function ChatView({
                             )}
                           </div>
                         </div>
-                      )}
-
+                      );
+                      })()}
                       {/* Interactive Memory Extraction Card */}
                       {msg.content.includes('Proposed Memory Extraction:') && (
                         <div className="p-4 rounded-xl bg-indigo-50 border border-indigo-100 space-y-3">
@@ -338,7 +416,7 @@ export default function ChatView({
                                 <div className="flex gap-2">
                                   <button
                                     onClick={() => {
-                                      onSendMessage(`Please use exactly this updated memory:\n\n${planEditContent}`);
+                                      onSendMessage(`Please use exactly this updated memory:\n\n${planEditContent}`, 'message', chatMode);
                                       setEditingPlanId(null);
                                     }}
                                     className="px-4 py-2 rounded-xl bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700 transition-all shadow-sm"
@@ -353,33 +431,97 @@ export default function ChatView({
                                   </button>
                                 </div>
                               </div>
-                            ) : (
-                              <div className="flex flex-wrap gap-2">
-                                <button
-                                  onClick={() => onSendMessage('yes')}
-                                  className="px-4 py-2 rounded-xl bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700 transition-all shadow-sm"
-                                >
-                                  Save Memory
-                                </button>
-                                <button
-                                  onClick={() => {
-                                    setEditingPlanId(msg.id);
-                                    // Strip the blockquotes from the preview text to get raw JSON
-                                    const rawJsonStr = msg.content.split('└ *Preview:*\n> ')[1]?.replace(/\n> /g, '\n') || '';
-                                    setPlanEditContent(rawJsonStr);
-                                  }}
-                                  className="px-4 py-2 rounded-xl bg-indigo-100 text-indigo-700 text-xs font-medium hover:bg-indigo-200 transition-all"
-                                >
-                                  Edit Details
-                                </button>
-                                <button
-                                  onClick={() => onSendMessage('no')}
-                                  className="px-4 py-2 rounded-xl border border-indigo-200 text-red-600 bg-white text-xs font-medium hover:bg-red-50 transition-all"
-                                >
-                                  Cancel Save
-                                </button>
-                              </div>
-                            )}
+                            ) : (() => {
+                              let parsedChips = null;
+                              try {
+                                const rawJsonStr = msg.content.split('└ *Preview:*\\n> ')[1]?.replace(/\\n> /g, '\\n') || '';
+                                if (!rawJsonStr) {
+                                  // fallback if formatting differs
+                                  const jsonMatch = msg.content.match(/```json\n([\s\S]*?)\n```/);
+                                  if (jsonMatch) parsedChips = JSON.parse(jsonMatch[1]);
+                                  else {
+                                    // Try to parse the blockquote preview
+                                    const previewParts = msg.content.split('Preview:*');
+                                    if(previewParts.length > 1) {
+                                      const text = previewParts[1].replace(/> /g, '').trim();
+                                      parsedChips = JSON.parse(text);
+                                    }
+                                  }
+                                } else {
+                                  parsedChips = JSON.parse(rawJsonStr);
+                                }
+                              } catch(e) {}
+
+                              return (
+                                <div>
+                                  {parsedChips && Array.isArray(parsedChips) && (
+                                    <div className="flex flex-wrap gap-2 mb-4">
+                                      {parsedChips.map((chip, idx) => (
+                                        <button
+                                          key={idx}
+                                          onClick={() => {
+                                            const next = new Set(selectedChips);
+                                            if (next.has(idx)) next.delete(idx);
+                                            else next.add(idx);
+                                            setSelectedChips(next);
+                                          }}
+                                          className={`px-3 py-2 rounded-lg text-xs font-medium border text-left flex flex-col gap-1 transition-all ${
+                                            selectedChips.has(idx) 
+                                              ? 'bg-indigo-600 border-indigo-600 text-white shadow-md' 
+                                              : 'bg-white border-indigo-200 text-indigo-900 hover:bg-indigo-50'
+                                          }`}
+                                        >
+                                          <strong>{chip.label}</strong>
+                                          <span className={`text-[10px] ${selectedChips.has(idx) ? 'text-indigo-200' : 'text-indigo-500'}`}>
+                                            Type: {chip.type}
+                                          </span>
+                                        </button>
+                                      ))}
+                                    </div>
+                                  )}
+                                  
+                                  <div className="flex flex-wrap gap-2">
+                                    <button
+                                      onClick={() => {
+                                        if (parsedChips && Array.isArray(parsedChips) && selectedChips.size > 0) {
+                                          const selected = Array.from(selectedChips).map(idx => (idx + 1).toString()).join(' ');
+                                          onSendMessage(selected, 'message', chatMode);
+                                        } else {
+                                          onSendMessage('yes', 'message', chatMode);
+                                        }
+                                        setSelectedChips(new Set());
+                                      }}
+                                      className="px-4 py-2 rounded-xl bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700 transition-all shadow-sm"
+                                    >
+                                      {selectedChips.size > 0 ? `Save Selected (${selectedChips.size})` : 'Save All'}
+                                    </button>
+                                    <button
+                                      onClick={() => {
+                                        setEditingPlanId(msg.id);
+                                        let rawJsonStr = '';
+                                        const previewParts = msg.content.split('Preview:*');
+                                        if(previewParts.length > 1) {
+                                          rawJsonStr = previewParts[1].replace(/> /g, '').trim();
+                                        }
+                                        setPlanEditContent(rawJsonStr);
+                                      }}
+                                      className="px-4 py-2 rounded-xl bg-indigo-100 text-indigo-700 text-xs font-medium hover:bg-indigo-200 transition-all"
+                                    >
+                                      Edit Details
+                                    </button>
+                                    <button
+                                      onClick={() => {
+                                        onSendMessage('no', 'message', chatMode);
+                                        setSelectedChips(new Set());
+                                      }}
+                                      className="px-4 py-2 rounded-xl border border-indigo-200 text-red-600 bg-white text-xs font-medium hover:bg-red-50 transition-all"
+                                    >
+                                      Cancel Save
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })()}
                           </div>
                         </div>
                       )}
@@ -406,7 +548,10 @@ export default function ChatView({
         <div className="flex justify-center">
           <div className="bg-gray-200/50 p-1 rounded-lg flex items-center gap-1">
             <button
-              onClick={() => setChatMode('chat')}
+              onClick={() => {
+                if (chatMode === 'agent') onSendMessage('__system_mode_switch__', 'system');
+                setChatMode('chat');
+              }}
               className={`px-4 py-1.5 rounded-md text-xs font-semibold transition-all ${
                 chatMode === 'chat' 
                   ? 'bg-white text-gray-900 shadow-sm' 
@@ -416,7 +561,10 @@ export default function ChatView({
               Chat
             </button>
             <button
-              onClick={() => setChatMode('agent')}
+              onClick={() => {
+                if (chatMode === 'chat') onSendMessage('__system_mode_switch__', 'system');
+                setChatMode('agent');
+              }}
               className={`px-4 py-1.5 rounded-md text-xs font-semibold transition-all flex items-center gap-1.5 ${
                 chatMode === 'agent' 
                   ? 'bg-white text-indigo-600 shadow-sm' 

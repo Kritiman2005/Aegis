@@ -131,6 +131,36 @@ def connect_custom(req: ConnectCustomServerRequest, db: Session = Depends(get_db
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/{server_name}/reload")
+def reload_connector(server_name: str, db: Session = Depends(get_db)):
+    """
+    Hot-reload a running MCP server by dropping its cache and restarting its subprocess.
+    This enables rapid iteration on MCP server schemas without restarting the Uvicorn backend.
+    """
+    try:
+        # Currently, Google Workspace is hardcoded, but this can be genericized 
+        # by pulling the stored command from the `mcp_servers` table.
+        if server_name == "google_workspace":
+            from app.db.crud import get_active_google_credentials
+            credentials = get_active_google_credentials(db)
+            if not credentials:
+                raise HTTPException(status_code=400, detail="No Google credentials found to reload.")
+            
+            # connect_google_workspace natively drops the old server and spawns a new one
+            tools = mcp_registry.connect_google_workspace(credentials.to_json(), db=db)
+            return {
+                "message": f"Successfully hot-reloaded MCP server '{server_name}'",
+                "tools_count": len(tools)
+            }
+        
+        # TODO: Add generic reload using `mcp_servers` table lookup
+        raise HTTPException(status_code=501, detail=f"Reloading server '{server_name}' is not fully supported yet.")
+        
+    except Exception as e:
+        logger.error(f"Error hot-reloading MCP server '{server_name}': {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.delete("/{server_name}")
 def disconnect_connector(server_name: str, db: Session = Depends(get_db)):
     """Disconnect an active MCP server and update database status."""

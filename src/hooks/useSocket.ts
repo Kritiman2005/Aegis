@@ -36,6 +36,8 @@ interface ServerPayload {
   type: 'connected' | 'token' | 'done' | 'error' | 'pong';
   content?: string;
   connection_id?: string;
+  node_id?: string;
+  status?: string;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -59,6 +61,9 @@ export function useSocket() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [isStreaming, setIsStreaming] = useState(false);
+  const [activeNodeId, setActiveNodeId] = useState<string | null>(null);
+  const [completedNodeIds, setCompletedNodeIds] = useState<Set<string>>(new Set());
+  const [failedNodeIds, setFailedNodeIds] = useState<Set<string>>(new Set());
 
   const socketRef = useRef<WebSocket | null>(null);
   const connectionIdRef = useRef<string>(generateId()); // Stable client ID across reconnects
@@ -96,6 +101,7 @@ export function useSocket() {
     });
     streamingIdRef.current = null;
     setIsStreaming(false);
+    setActiveNodeId(null);
   }, []);
 
   // ── Ping / Keepalive ─────────────────────────────────────────────────────────
@@ -155,12 +161,32 @@ export function useSocket() {
           break;
 
         case 'token':
+          // Update workflow node states
+          if (payload.node_id) {
+            if (payload.status === 'running') {
+              setActiveNodeId(payload.node_id);
+            } else if (payload.status === 'completed') {
+              setCompletedNodeIds(prev => new Set(prev).add(payload.node_id as string));
+              setActiveNodeId(null);
+            } else if (payload.status === 'failed') {
+              setFailedNodeIds(prev => new Set(prev).add(payload.node_id as string));
+              setActiveNodeId(null);
+            }
+          }
+
           // Accumulate streaming token into the current assistant message
           if (!streamingIdRef.current) {
             // First token — create the assistant placeholder message
             const msgId = generateId();
             streamingIdRef.current = msgId;
             setIsStreaming(true);
+            
+            // Clear workflow states at the start of a new run
+            if (!payload.node_id) {
+              setCompletedNodeIds(new Set());
+              setFailedNodeIds(new Set());
+            }
+
             appendMessage({
               id: msgId,
               role: 'assistant',
@@ -175,6 +201,15 @@ export function useSocket() {
 
         case 'done':
           finalizeStreamingMessage();
+          break;
+
+        case 'toast':
+          appendMessage({
+            id: generateId(),
+            role: 'system',
+            content: payload.content ?? '',
+            timestamp: new Date(),
+          });
           break;
 
         case 'error':
@@ -279,6 +314,9 @@ export function useSocket() {
     messages,
     status,
     isStreaming,
+    activeNodeId,
+    completedNodeIds,
+    failedNodeIds,
     sendMessage,
     clearMessages,
   };

@@ -71,10 +71,14 @@ def on_startup():
     from app.db.database import init_db, SessionLocal
     from app.db.crud import seed_default_model, get_active_google_credentials
     from app.mcp.registry import mcp_registry
+    from app.core.scheduler import scheduler_daemon
     
     _logger = logging.getLogger("startup")
     _logger.info("Initializing SQLite Database...")
     init_db()
+
+    # Start the Scheduler Daemon for background jobs
+    scheduler_daemon.start()
 
     with SessionLocal() as db:
         # Seed default local model in SQLite models table
@@ -94,6 +98,11 @@ def on_startup():
                 _logger.error(f"Failed to auto-restore Google Workspace MCP server: {e}")
         else:
             _logger.info("No saved Google OAuth credentials found in SQLite.")
+
+@app.on_event("shutdown")
+def on_shutdown():
+    from app.core.scheduler import scheduler_daemon
+    scheduler_daemon.stop()
 
 # ─── Direct Execution ────────────────────────────────────────────────────────
 

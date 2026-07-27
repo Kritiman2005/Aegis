@@ -38,7 +38,11 @@ TOOLS = [
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Optional search query (e.g. 'name contains invoice')"
+                    "description": "Optional Google Drive search query (e.g. 'name contains \"invoice\"'). Do NOT include order by or limit clauses here. Do NOT use relative dates like 'now-1d'; date queries must use exact RFC 3339 timestamps (e.g. modifiedTime > '2024-01-01T12:00:00')."
+                },
+                "order_by": {
+                    "type": "string",
+                    "description": "Optional sorting order. Valid values: 'modifiedTime desc', 'modifiedTime', 'name'"
                 },
                 "max_results": {
                     "type": "integer",
@@ -141,10 +145,12 @@ def _build_services(creds_json_str: str):
         return None, None
 
 
-def _drive_list_files(drive_service, query: str = "", max_results: int = 10) -> str:
+def _drive_list_files(drive_service, query: str = "", order_by: str = "", max_results: int = 10) -> str:
     params = {"pageSize": max_results, "fields": "files(id, name, mimeType, modifiedTime)"}
     if query:
         params["q"] = query
+    if order_by:
+        params["orderBy"] = order_by
     result = drive_service.files().list(**params).execute()
     files = result.get("files", [])
     if not files:
@@ -289,6 +295,7 @@ class GoogleMCPServer:
                 text = _drive_list_files(
                     self._drive_service,
                     query=arguments.get("query", ""),
+                    order_by=arguments.get("order_by", ""),
                     max_results=int(arguments.get("max_results", 10))
                 )
             elif tool_name == "drive_read_file":

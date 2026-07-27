@@ -88,3 +88,20 @@ class ConversationEntity(Base):
     entity_id       = Column(String, nullable=False)              # Actual ID in the external system
     data_json       = Column(Text, nullable=False)                # Full JSON content (email body, file text, channel messages, ...)
     created_at      = Column(DateTime, default=datetime.utcnow)
+
+class ScheduledJob(Base):
+    """
+    Opt-in unattended scheduled jobs.
+    Runs frozen plans with fresh arguments on a schedule.
+    """
+    __tablename__ = "scheduled_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(String, index=True, nullable=False)
+    cron_expression = Column(String, nullable=False)             # e.g., '0 * * * *' (hourly) or a simple interval descriptor
+    frozen_plan_json = Column(Text, nullable=False)              # JSON string of the plan array
+    status = Column(String, default="active")                    # 'active', 'paused', 'missed', 'failed'
+    next_run_at = Column(DateTime, nullable=False)
+    last_run_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+

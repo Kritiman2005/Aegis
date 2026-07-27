@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Dict, List, Optional, AsyncGenerator
+from typing import Dict, List, Optional, AsyncGenerator, Any
 import anyio
 
 from app.core.llm_manager import LLMManager
@@ -10,6 +10,7 @@ from app.db.crud import save_entity, build_entity_context_block
 
 from .base import BaseAgent
 from .planner import PlannerAgent
+from .executor import ExecutorAgent
 from .extractor import EntityExtractorAgent
 from app.prompts.chat import build_chat_prompt
 
@@ -34,10 +35,12 @@ class AgentState:
 
 class ChatAgent(BaseAgent):
     def __init__(self, connection_id: str):
+        import time
         llm_mgr = get_llm_manager()
         super().__init__(llm_mgr)
         self.connection_id = connection_id
-        self.state = AgentState.IDLE
+        self._state = AgentState.IDLE
+        self.state_entered_at = time.time()
         self.plan: Optional[List[Dict]] = None
         self.chat_history: List[Dict] = []
 
@@ -48,7 +51,18 @@ class ChatAgent(BaseAgent):
         
         # Instantiate sub-agents
         self.planner = PlannerAgent(llm_mgr)
+        self.executor = ExecutorAgent(llm_mgr)
         self.extractor = EntityExtractorAgent(llm_mgr)
+
+    @property
+    def state(self):
+        return self._state
+
+    @state.setter
+    def state(self, value):
+        import time
+        self._state = value
+        self.state_entered_at = time.time()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Helpers
@@ -59,6 +73,14 @@ class ChatAgent(BaseAgent):
         tools = mcp_registry.list_all_tools()
         if not tools:
             return "No active MCP servers connected. Please authenticate with Google or connect a server first."
+        tools_desc = [f"- {t['name']}: {t.get('description', '')}" for t in tools]
+        return "\n".join(tools_desc)
+
+    def get_searched_tools(self, query: str) -> str:
+        """Fetches top-k relevant tools from registry using semantic RAG based on the query."""
+        tools = mcp_registry.search_tools(query, top_k=10)
+        if not tools:
+            return ""
         tools_desc = [f"- {t['name']}: {t.get('description', '')}" for t in tools]
         return "\n".join(tools_desc)
 
@@ -95,15 +117,47 @@ class ChatAgent(BaseAgent):
             logger.error(f"LLM JSON call failed: {e}")
             return "{}"
 
+    def _call_llm_text(self, messages, token_callback=None):
+        llm = self.get_llm()
+        if not llm:
+            return ""
+        try:
+            response = llm.create_chat_completion(
+                messages=messages,
+                temperature=0.7,
+                stream=True
+            )
+            full_response = ""
+            for chunk in response:
+                if "choices" in chunk and len(chunk["choices"]) > 0:
+                    delta = chunk["choices"][0].get("delta", {})
+                    if "content" in delta:
+                        token = delta["content"]
+                        full_response += token
+                        if token_callback:
+                            token_callback(token)
+            return full_response
+        except Exception as e:
+            logger.error(f"LLM TEXT call failed: {e}")
+            return ""
+
     # ─────────────────────────────────────────────────────────────────────────
     # State machine
     # ─────────────────────────────────────────────────────────────────────────
 
-    async def handle_message(self, message: str, mode: str = "chat", token_callback=None) -> str:
+    async def handle_message(self, message: str, mode: str = "chat", token_callback=None, status_callback=None) -> str:
         """Main state machine dispatcher."""
+        
+        if message == "__system_mode_switch__":
+            if self.state in [AgentState.WAITING_CONFIRMATION, AgentState.WAITING_MEMORY_CONFIRMATION]:
+                self.state = AgentState.IDLE
+                self.plan = None
+                self._pending_entities = []
+                return "__system_toast__:Pending action discarded."
+            return ""
 
         if self.state == AgentState.IDLE:
-            return await self._handle_idle(message, mode, token_callback)
+            return await self._handle_idle(message, mode, token_callback, status_callback)
 
         elif self.state == AgentState.WAITING_CONFIRMATION:
             return await self._handle_confirmation(message, token_callback)
@@ -116,12 +170,8 @@ class ChatAgent(BaseAgent):
 
         return "Unknown state."
 
-    async def _handle_idle(self, message: str, mode: str = "chat", token_callback=None) -> str:
+    async def _handle_idle(self, message: str, mode: str = "chat", token_callback=None, status_callback=None) -> str:
         """IDLE → generate plan → WAITING_CONFIRMATION."""
-        tools_str = self.get_available_tools()
-        if "No active Google session" in tools_str:
-            return tools_str
-
         self.chat_history.append({"role": "user", "content": message})
         
         entity_context = self._get_entity_context()
@@ -131,84 +181,133 @@ class ChatAgent(BaseAgent):
 
         # ── Mode Branching ─────────────────────────────
         if mode == "chat":
-            chat_prompt = build_chat_prompt(tools_str, entity_context)
+            from app.prompts.chat import build_chat_prompt
+            chat_prompt = build_chat_prompt(entity_context)
             messages = [{"role": "system", "content": chat_prompt}]
             messages.extend(self.chat_history)
 
             # In chat mode, we expect pure raw text, no JSON.
             chat_response = await anyio.to_thread.run_sync(
-                lambda: self._call_llm_json(messages, is_json=False)
+                lambda: self._call_llm_text(messages, token_callback)
             )
             
             self.chat_history.append({"role": "assistant", "content": chat_response})
             return chat_response
 
         # If mode == "agent", we skip the Chat LLM and go straight to Plan Generation
+        tools_str = self.get_searched_tools(message)
+        if not tools_str:
+            return "I couldn't find any connected tools relevant to your request. Are you sure you have the right MCP servers connected?"
 
-        # ── Plan Generation ──────────────────────────────────────────────────
+        # ── Plan Generation & Self-Correction Loop ────────────────────────────
+        import jsonschema
+        all_tools = mcp_registry.list_all_tools()
+        valid_tool_names = {t["name"] for t in all_tools}
+        tool_schemas = {t["name"]: t.get("inputSchema", {}) for t in all_tools}
+        
+        if status_callback:
+            await status_callback("Drafting execution plan...")
+
         plan_json_str = await anyio.to_thread.run_sync(
-            lambda: self.planner.generate_plan(message, tools_str, entity_context, history_for_planner, token_callback)
+            lambda: self.planner.generate_plan(message, tools_str, entity_context, history_for_planner)
         )
 
         try:
             plan_data = json.loads(plan_json_str)
-            raw_plan = plan_data.get("plan", [])
-            # Validate hallucinated/unsupported tools against active tools in registry
-            valid_tool_names = {t["name"] for t in mcp_registry.list_all_tools()}
-            self.plan = []
-            warnings = []
-            for step in raw_plan:
-                tool_name = step.get("tool")
-                if tool_name in valid_tool_names:
-                    self.plan.append(step)
-                else:
-                    warnings.append(f"Tool `{tool_name}` is not currently available.")
-
-            if not self.plan:
-                self.state = AgentState.IDLE
-                if warnings:
-                    return "**Note:**\n" + "\n".join([f"- {w}" for w in warnings])
-                return f"Available tools:\n{tools_str}\n\nWhat would you like me to do with them?"
-
-            # Set requires_entity_extraction to True if any tool is called, since we reverted the planner prompt.
-            # We can default to True when planner is invoked.
-            self.requires_entity_extraction = True
-            self.chat_history.append({"role": "assistant", "content": plan_json_str})
-            self.state = AgentState.WAITING_CONFIRMATION
-
-            response = "**Proposed Execution Plan:**\n\n"
-            for i, step in enumerate(self.plan):
-                response += f"**Step {i+1}: `{step.get('tool')}`**\n"
-                if step.get("reason"):
-                    response += f"└ *Purpose:* {step.get('reason')}\n"
-                
-                args = step.get("arguments", {})
-                if isinstance(args, dict) and args:
-                    response += "└ *Parameters:*\n"
-                    for k, v in args.items():
-                        if isinstance(v, (dict, list)):
-                            val_str = json.dumps(v, ensure_ascii=False)
-                        else:
-                            val_str = str(v)
-                        if len(val_str) > 140:
-                            val_str = val_str[:137] + "..."
-                        response += f"   • `{k}`: {val_str}\n"
-
-                preview = step.get("payload_preview")
-                if preview:
-                    preview_str = json.dumps(preview, indent=2, ensure_ascii=False) if isinstance(preview, (dict, list)) else str(preview)
-                    formatted_preview = preview_str.strip().replace('\n', '\n> ')
-                    response += f"└ *Payload Preview:*\n> {formatted_preview}\n"
-                response += "\n"
-
-            if warnings:
-                response += "**Warnings:**\n" + "\n".join([f"- {w}" for w in warnings]) + "\n\n"
-
-            response += "Would you like me to proceed with this? (Reply **'yes'** to execute or tell me what to edit)"
-            return response
-
         except json.JSONDecodeError:
-            return "Error: LLM did not output valid JSON for the plan."
+            return "Error: Planner output invalid JSON."
+        
+        if isinstance(plan_data, list):
+            raw_plan = plan_data
+        else:
+            raw_plan = plan_data.get("plan", [])
+        
+        # Filter out placeholder tools that the LLM might hallucinate when no tools are needed
+        raw_plan = [step for step in raw_plan if step.get("tool") and str(step.get("tool")).lower() not in ("none", "none_available", "null", "n/a", "unknown")]
+        
+        # Basic validation
+        validation_errors = []
+        for step in raw_plan:
+            tool_name = step.get("tool")
+            if tool_name not in valid_tool_names:
+                validation_errors.append(f"Tool `{tool_name}` does not exist.")
+        
+        if validation_errors:
+            self.state = AgentState.IDLE
+            return f"❌ Planner hallucinated invalid tools: {validation_errors[0]}. Please try rephrasing your request."
+        
+        # 2. Metadata Validation (Dependencies, IDs)
+        self.plan = []
+        
+        if isinstance(plan_data, dict):
+            warnings = plan_data.get("warnings", [])
+        else:
+            warnings = []
+            
+        if isinstance(warnings, str):
+            warnings = [warnings]
+        
+        # First pass: collect all declared step_ids
+        all_step_ids = {step.get("step_id") for step in raw_plan if step.get("step_id")}
+        
+        for step in raw_plan:
+            tool_name = step.get("tool")
+            if tool_name not in valid_tool_names:
+                continue # Already caught above, but safe to skip
+            
+            # Validate depends_on hallucinated IDs
+            depends_on = step.get("depends_on")
+            if isinstance(depends_on, list):
+                for did in depends_on:
+                    if did not in all_step_ids:
+                        self.state = AgentState.IDLE
+                        self.plan = None
+                        return f"❌ Planner generated an invalid dependency (`{did}`). The plan has been aborted for safety. Please try rephrasing your request."
+                step["depends_on"] = depends_on
+            else:
+                step["depends_on"] = []
+                
+            # Validate foreach target
+            foreach_target = step.get("foreach")
+            if foreach_target and foreach_target not in all_step_ids:
+                step["foreach"] = None
+                
+            # Ensure every step has an ID
+            if not step.get("step_id"):
+                import uuid
+                step["step_id"] = f"step_{str(uuid.uuid4())[:8]}"
+                all_step_ids.add(step["step_id"])
+                
+            self.plan.append(step)
+
+        if not self.plan:
+            self.state = AgentState.IDLE
+            if warnings:
+                return "**Note:**\n" + "\n".join([f"- {w}" for w in warnings])
+            return f"Available tools:\n{tools_str}\n\nWhat would you like me to do with them?"
+
+        # Set requires_entity_extraction to True if any tool is called, since we reverted the planner prompt.
+        # We can default to True when planner is invoked.
+        self.requires_entity_extraction = True
+        self.chat_history.append({"role": "assistant", "content": plan_json_str})
+        self.state = AgentState.WAITING_CONFIRMATION
+
+        response = "**Proposed Execution Plan:**\n\n"
+        for i, step in enumerate(self.plan):
+            response += f"**Step {i+1}: `{step.get('tool')}`**\n"
+            if step.get("reason"):
+                response += f"> {step.get('reason')}\n"
+            
+            depends = step.get("depends_on")
+            if depends:
+                response += f"- *Depends on:* {', '.join(depends)}\n"
+            response += "\n"
+
+        if warnings:
+            response += "**Warnings:**\n" + "\n".join([f"- {w}" for w in warnings]) + "\n\n"
+
+        response += "Would you like me to proceed with this? (Reply **'yes'** to execute or tell me what to edit)"
+        return response
 
     async def _handle_confirmation(self, message: str, token_callback=None) -> str:
         """WAITING_CONFIRMATION → confirm → EXECUTING  or  refine plan."""
@@ -228,7 +327,35 @@ class ChatAgent(BaseAgent):
             return "Plan cancelled. What would you like to do next?"
             
         else:
-            tools_str = self.get_available_tools()
+            # ── Plan Refinement Loop: Questions vs Edits ─────────────────────
+            msg_lower = message.lower().strip()
+            edit_verbs = ['change', 'update', 'use', 'make', 'edit', 'add', 'remove', 'instead', 'no', 'dont', 'do not']
+            is_question = "?" in msg_lower and not any(verb in msg_lower for verb in edit_verbs)
+
+            if is_question:
+                entity_context = self._get_entity_context()
+                from app.prompts.chat import build_chat_prompt
+                chat_prompt = build_chat_prompt(entity_context)
+                
+                system_injection = (
+                    f"\n\n[SYSTEM]: The user has a pending plan they are reviewing. "
+                    f"The current plan is: {json.dumps(self.plan)}. "
+                    f"Answer their question about the plan conversationally. Do NOT execute it."
+                )
+                
+                messages = [{"role": "system", "content": chat_prompt + system_injection}]
+                messages.extend(self.chat_history)
+                
+                response_text = await anyio.to_thread.run_sync(
+                    self._call_llm_text, messages
+                )
+                return response_text + "\n\n*(Plan is still pending. Reply 'yes' to execute or tell me what to change)*"
+
+            # Otherwise, treat as an edit request and route to Planner
+            tools_str = self.get_searched_tools(message)
+            if not tools_str:
+                return "I couldn't find any tools relevant to that edit request. Please clarify what you want to do."
+                
             entity_context = self._get_entity_context()
             plan_json_str = await anyio.to_thread.run_sync(
                 lambda: self.planner.generate_plan(
@@ -396,46 +523,107 @@ class ChatAgent(BaseAgent):
     # Plan execution
     # ─────────────────────────────────────────────────────────────────────────
 
-    async def execute_plan(self) -> AsyncGenerator[str, None]:
+    async def execute_plan(self) -> AsyncGenerator[Dict[str, Any], None]:
         """Executes the approved plan step by step, then proposes entities to remember."""
         if self.state != AgentState.EXECUTING or not self.plan:
-            yield "No plan to execute."
+            yield {"text": "No plan to execute.", "node_id": None}
             return
 
         all_tools = mcp_registry.list_all_tools()
         if not all_tools:
-            yield "Error: No connected MCP servers found."
+            yield {"text": "Error: No connected MCP servers found.", "node_id": None}
             self.state = AgentState.IDLE
             return
 
+        tool_schemas = {t["name"]: t.get("inputSchema", {}) for t in all_tools}
+        import jsonschema
+        import traceback
+
+        # Retrieve context for the ExecutorAgent
+        user_request = next((msg["content"] for msg in reversed(self.chat_history) if msg["role"] == "user"), "")
+        entity_context = self._get_entity_context()
+
         # Run each tool step and collect raw results
         tool_results: List[Dict] = []
+        prior_results_map: Dict[str, Any] = {}
+        total_steps = len(self.plan)
 
         for i, step in enumerate(self.plan):
             tool_name = step.get("tool")
-            arguments = step.get("arguments", {})
+            node_id = step.get("step_id")
+            step_reason = step.get("reason", "")
+            
+            yield {"text": f"\nExecuting Task {i+1}/{total_steps}: Calling `{tool_name}`...\n", "node_id": node_id, "status": "running"}
 
-            yield f"\nExecuting Task {i+1}: Calling `{tool_name}`...\n"
+            schema = tool_schemas.get(tool_name, {})
+            if not schema:
+                yield {"text": f"❌ Plan aborted: Tool `{tool_name}` no longer exists.\n", "node_id": node_id, "status": "failed"}
+                self.state = AgentState.IDLE
+                self.plan = None
+                return
+
+            yield {"text": f"Generating exact parameters for `{tool_name}`...\n", "node_id": node_id, "status": "running"}
+
+            # Generate arguments live using the deterministic Executor Agent
+            arguments = await anyio.to_thread.run_sync(
+                lambda: self.executor.generate_arguments(
+                    tool_name=tool_name,
+                    tool_schema=schema,
+                    overall_plan=self.plan,
+                    step_reason=step_reason,
+                    prior_results=prior_results_map,
+                    entity_context=entity_context,
+                    user_request=user_request
+                )
+            )
+
+            # Single strict check to catch catastrophic failure
+            try:
+                jsonschema.validate(instance=arguments, schema=schema)
+            except jsonschema.exceptions.ValidationError as e:
+                logger.error(f"Executor failed schema validation for {tool_name}: {e.message}")
+                yield {"text": f"❌ Plan aborted: Executor generated invalid arguments for `{tool_name}`: {e.message}\n", "node_id": node_id, "status": "failed"}
+                self.state = AgentState.IDLE
+                self.plan = None
+                return
 
             try:
                 result = await anyio.to_thread.run_sync(
                     lambda t=tool_name, a=arguments: mcp_registry.call_tool(t, a)
                 )
                 result_str = str(result)
-                yield f"Result for `{tool_name}`:\n{result_str[:1000]}\n"
+                yield {"text": f"Result for `{tool_name}`:\n{result_str[:1000]}\n", "node_id": node_id, "status": "completed"}
 
-                # Collect result for entity extraction
+                # Collect result for next steps and extraction
+                prior_results_map[node_id] = result
                 tool_results.append({
                     "tool": tool_name,
                     "arguments": arguments,
                     "result": result_str
                 })
             except Exception as e:
-                logger.error(f"Tool execution failed: {e}")
-                yield f"Error executing `{tool_name}`: {e}\n"
-                break
+                logger.error(f"Tool execution failed at step {i+1}: {e}\n{traceback.format_exc()}")
+                
+                error_type = type(e).__name__
+                if "HttpError" in error_type or "RuntimeError" in error_type:
+                    msg = f"API Error executing `{tool_name}`: {e}"
+                else:
+                    msg = f"Internal bug executing `{tool_name}`: {e}"
+                
+                # Report partial progress
+                if i > 0:
+                    progress_msg = f"\nStep {i+1} of {total_steps} failed. Steps 1-{i} completed successfully, but all remaining steps have been aborted."
+                else:
+                    progress_msg = f"\nStep {i+1} of {total_steps} failed. The plan has been aborted."
+                    
+                yield {"text": f"❌ {msg}\n{progress_msg}\n", "node_id": node_id, "status": "failed"}
+                
+                # Hard-fail and reset
+                self.state = AgentState.IDLE
+                self.plan = None
+                return
 
-        yield "\nExecution complete!"
+        yield {"text": "\nExecution complete!", "node_id": None}
 
         # Go back to IDLE
         self.state = AgentState.IDLE

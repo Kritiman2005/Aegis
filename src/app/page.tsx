@@ -13,7 +13,16 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState<TabType>('connectors'); // Default to Connectors view matching Stitch Image 1
   const [activeConnectorName, setActiveConnectorName] = useState('GitHub');
   const [isMemoryOpen, setIsMemoryOpen] = useState(false);
-  const { messages, status, isStreaming, sendMessage, clearMessages } = useSocket();
+  const { 
+    messages, 
+    status, 
+    isStreaming, 
+    activeNodeId,
+    completedNodeIds,
+    failedNodeIds,
+    sendMessage, 
+    clearMessages 
+  } = useSocket();
 
   const handleNewChat = useCallback(() => {
     clearMessages();
@@ -55,6 +64,9 @@ export default function Home() {
             onSendMessage={sendMessage}
             onClearMessages={clearMessages}
             activeConnectorName={activeConnectorName}
+            activeNodeId={activeNodeId}
+            completedNodeIds={completedNodeIds}
+            failedNodeIds={failedNodeIds}
           />
         )}
 
