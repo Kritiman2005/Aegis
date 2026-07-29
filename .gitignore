@@ -36,6 +36,8 @@ dist-info/
 *.bin
 *.db
 *.sqlite3
+qdrant_db/
+backend/qdrant_db/
 
 # ─── Environment Variables ───────────────────────────────
 .env
