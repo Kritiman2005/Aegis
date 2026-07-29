@@ -36,7 +36,7 @@ class LLMManager:
             model_path=str(_models_dir / "qwen2.5-3b-instruct-q4_k_m.gguf"),
             chat_format="chatml",
             kwargs={
-                "n_ctx": 4096,
+                "n_ctx": 6144,
                 "verbose": False
             }
         )

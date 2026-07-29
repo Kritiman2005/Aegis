@@ -249,7 +249,7 @@ class ChatAgent(BaseAgent):
             await status_callback("Drafting execution plan...")
 
         plan_json_str = await anyio.to_thread.run_sync(
-            lambda: self.planner.generate_plan(message, tools_str, entity_context, history_for_planner, token_callback)
+            lambda: self.planner.generate_plan(message, tools_str, entity_context, history_for_planner, None)
         )
 
         try:
