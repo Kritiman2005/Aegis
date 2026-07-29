@@ -89,6 +89,21 @@ class ConversationEntity(Base):
     data_json       = Column(Text, nullable=False)                # Full JSON content (email body, file text, channel messages, ...)
     created_at      = Column(DateTime, default=datetime.utcnow)
 
+class UserDocument(Base):
+    """
+    Tracks files uploaded by the user for RAG/Chat Mode.
+    """
+    __tablename__ = "user_documents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(String, index=True, nullable=True) # Optional link to a specific chat session
+    filename = Column(String, nullable=False)
+    file_path = Column(String, nullable=False)
+    file_type = Column(String, nullable=False) # e.g. pdf, pptx, txt, image
+    status = Column(String, default="processing") # processing, ready, failed
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
 class ScheduledJob(Base):
     """
     Opt-in unattended scheduled jobs.

@@ -19,6 +19,9 @@ import {
 import { type ChatMessage, type ConnectionStatus } from '@/hooks/useSocket';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { useAppSelector } from '@/hooks/useStore';
+import { selectSessionId } from '@/store/sessionSlice';
+
 interface ChatViewProps {
   messages: ChatMessage[];
   status: ConnectionStatus;
@@ -42,6 +45,7 @@ export default function ChatView({
   completedNodeIds,
   failedNodeIds,
 }: ChatViewProps) {
+  const sessionId = useAppSelector(selectSessionId);
   const [inputVal, setInputVal] = useState('');
   const [savingMsgId, setSavingMsgId] = useState<string | null>(null);
   const [savedMsgId, setSavedMsgId] = useState<string | null>(null);
@@ -60,6 +64,39 @@ export default function ChatView({
   const [editingPlanId, setEditingPlanId] = useState<string | null>(null);
   const [planEditContent, setPlanEditContent] = useState('');
   
+  // Document Upload State
+  const [isUploading, setIsUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !sessionId) return;
+    
+    setIsUploading(true);
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('conversation_id', sessionId);
+    
+    try {
+      const res = await fetch('http://127.0.0.1:8000/api/documents/upload', {
+        method: 'POST',
+        body: formData,
+      });
+      if (res.ok) {
+        // Create a fake system message locally to show the upload success
+        onSendMessage(`[System] Successfully uploaded document: **${file.name}**. It is now available for RAG in Chat Mode.`, 'toast', chatMode);
+      } else {
+        onSendMessage(`[System] Failed to upload document.`, 'toast', chatMode);
+      }
+    } catch (err) {
+      console.error(err);
+      onSendMessage(`[System] Failed to connect to upload endpoint.`, 'toast', chatMode);
+    } finally {
+      setIsUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -601,9 +638,23 @@ export default function ChatView({
           {/* Input Bar Bottom Toolbar */}
           <div className="absolute bottom-2.5 left-3 right-3 flex items-center justify-between pointer-events-none">
             {/* Attachment Button */}
-            <button className="pointer-events-auto p-1.5 text-gray-400 hover:text-gray-700 transition-colors">
-              <Paperclip className="w-4 h-4" />
-            </button>
+            <div className="pointer-events-auto">
+              <input 
+                type="file" 
+                ref={fileInputRef} 
+                onChange={handleFileUpload} 
+                className="hidden" 
+                accept=".txt,.md,.pdf,.ppt,.pptx,.png,.jpg,.jpeg"
+              />
+              <button 
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isUploading}
+                className={`p-1.5 transition-colors ${isUploading ? 'text-indigo-400 animate-pulse' : 'text-gray-400 hover:text-gray-700'}`}
+                title="Upload Document for RAG"
+              >
+                {isUploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Paperclip className="w-4 h-4" />}
+              </button>
+            </div>
 
             {/* Right Buttons: Sparkles + Dark Send Button */}
             <div className="flex items-center gap-2 pointer-events-auto">

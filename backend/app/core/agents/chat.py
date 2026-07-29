@@ -211,8 +211,28 @@ class ChatAgent(BaseAgent):
 
         # ── Mode Branching ─────────────────────────────
         if mode == "chat":
+            # 1. RAG Retrieval for Uploaded Documents
+            try:
+                from app.core.rag.processor import hybrid_search
+                # Retrieve top 5 most relevant chunks across user's docs for this session
+                relevant_chunks = hybrid_search(query=message, conversation_id=self.connection_id, top_k=5)
+            except Exception as e:
+                logger.warning(f"RAG search failed: {e}")
+                relevant_chunks = []
+                
+            document_context = ""
+            if relevant_chunks:
+                document_context = "Relevant excerpts from your uploaded documents:\n\n"
+                for chunk in relevant_chunks:
+                    document_context += f"--- Source: {chunk.get('filename')} ---\n{chunk.get('content')}\n\n"
+
             from app.prompts.chat import build_chat_prompt
-            chat_prompt = build_chat_prompt(entity_context)
+            # Append document context to the base entity context
+            full_context = entity_context
+            if document_context:
+                full_context += "\n" + document_context
+                
+            chat_prompt = build_chat_prompt(full_context)
             messages = [{"role": "system", "content": chat_prompt}]
             messages.extend(self.chat_history)
 

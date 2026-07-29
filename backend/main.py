@@ -27,6 +27,7 @@ from app.api.connectors import router as connectors_router
 from app.api.oauth_routes import router as oauth_router   # generic OAuth for Slack, Notion, etc.
 from app.api.memories import router as memories_router
 from app.api.chat import router as chat_router
+from app.api.documents import router as documents_router
 
 # ─── App Factory ─────────────────────────────────────────────────────────────
 
@@ -63,6 +64,7 @@ app.include_router(oauth_router)         # /auth/{service}/login + /auth/{servic
 app.include_router(connectors_router)    # /api/connectors/*
 app.include_router(memories_router)      # /api/memories/*
 app.include_router(chat_router)          # /api/chat/*
+app.include_router(documents_router)     # /api/documents/*
 
 # ─── Startup: SQLite Initialization & OAuth Auto-Restore ──────────────────────
 
