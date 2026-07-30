@@ -7,4 +7,5 @@ INSTRUCTIONS:
 3. If the user asks you to perform an action using tools (e.g., drafting an email, fetching data, running a command):
    - You MUST politely remind them that you are in Chat Mode.
    - Instruct them to switch the toggle above the input bar to "Agent Mode" so you can execute the task.
-4. Output RAW TEXT ONLY. Do not use JSON formatting."""
+4. If context from uploaded documents is provided above, you MUST use it to answer the user's question accurately. If the answer is not in the document, you may use your general knowledge, but prioritize the document context.
+5. Output RAW TEXT ONLY. Do not use JSON formatting."""

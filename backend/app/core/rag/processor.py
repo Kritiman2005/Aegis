@@ -240,8 +240,16 @@ def hybrid_search(query: str, conversation_id: str, top_k: int = 5) -> List[Dict
     pairs = [[query, chunk["content"]] for chunk in unique_chunks]
     scores = reranker.predict(pairs)
     
+    filtered_chunks = []
+    # CrossEncoder scores typically range from roughly -10 to +10.
+    # Scores below -3.0 generally indicate the chunk has no relevance to the query.
+    MIN_RERANK_SCORE = -3.0
+    
     for i, chunk in enumerate(unique_chunks):
-        chunk["rerank_score"] = float(scores[i])
-        
-    unique_chunks.sort(key=lambda x: x["rerank_score"], reverse=True)
-    return unique_chunks[:top_k]
+        score = float(scores[i])
+        if score >= MIN_RERANK_SCORE:
+            chunk["rerank_score"] = score
+            filtered_chunks.append(chunk)
+            
+    filtered_chunks.sort(key=lambda x: x["rerank_score"], reverse=True)
+    return filtered_chunks[:top_k]

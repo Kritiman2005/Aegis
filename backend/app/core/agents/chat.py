@@ -372,7 +372,6 @@ class ChatAgent(BaseAgent):
         # Set requires_entity_extraction to True if any tool is called, since we reverted the planner prompt.
         # We can default to True when planner is invoked.
         self.requires_entity_extraction = True
-        self.chat_history.append({"role": "assistant", "content": plan_json_str})
         self.state = AgentState.WAITING_CONFIRMATION
 
         response = "**Proposed Execution Plan:**\n\n"
@@ -389,7 +388,20 @@ class ChatAgent(BaseAgent):
         if warnings:
             response += "**Warnings:**\n" + "\n".join([f"- {w}" for w in warnings]) + "\n\n"
 
+        # Inject the raw JSON block invisibly at the end so the UI can parse it for the interactive card
+        response += f"\n```json\n{plan_json_str}\n```\n\n"
+
         response += "Would you like me to proceed with this? (Reply **'yes'** to execute or tell me what to edit)"
+        
+        self.chat_history.append({"role": "assistant", "content": response})
+        try:
+            from app.db.crud import add_chat_message
+            db = SessionLocal()
+            add_chat_message(db, self.connection_id, "assistant", response)
+            db.close()
+        except Exception as e:
+            logger.warning(f"Failed to persist planner response: {e}")
+
         return response
 
     async def _handle_confirmation(self, message: str, token_callback=None) -> str:
@@ -837,7 +849,20 @@ class ChatAgent(BaseAgent):
                 "└ *Preview:*",
                 f"> {formatted_preview}"
             ]
-            yield "\n".join(lines)
+            
+            response = "\n".join(lines)
+            
+            # Save the preview to history so it survives refresh
+            self.chat_history.append({"role": "assistant", "content": response})
+            try:
+                from app.db.crud import add_chat_message
+                db = SessionLocal()
+                add_chat_message(db, self.connection_id, "assistant", response)
+                db.close()
+            except Exception as e:
+                logger.warning(f"Failed to persist extraction preview: {e}")
+                
+            yield response
         else:
             yield "\nNo new entities found to save."
 
