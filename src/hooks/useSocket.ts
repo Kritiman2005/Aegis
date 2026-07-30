@@ -83,6 +83,9 @@ export function useSocket() {
   const pongTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const streamingIdRef = useRef<string | null>(null);
   const isUnmountedRef = useRef(false);
+  
+  // Custom external handlers (e.g. for components listening to raw WebSocket events)
+  const externalHandlersRef = useRef<Array<(payload: any) => void>>([]);
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -168,6 +171,9 @@ export function useSocket() {
         console.warn('[useSocket] Non-JSON message received:', event.data);
         return;
       }
+      
+      // Dispatch to external listeners
+      externalHandlersRef.current.forEach(handler => handler(payload));
 
       switch (payload.type) {
         case 'connected':
@@ -380,6 +386,13 @@ export function useSocket() {
     }, 150);
   }, [dispatch, clearMessages, connect]);
 
+  const addMessageHandler = useCallback((handler: (payload: any) => void) => {
+    externalHandlersRef.current.push(handler);
+    return () => {
+      externalHandlersRef.current = externalHandlersRef.current.filter(h => h !== handler);
+    };
+  }, []);
+
   return {
     messages,
     status,
@@ -390,5 +403,6 @@ export function useSocket() {
     sendMessage,
     clearMessages,
     switchSession,
+    addMessageHandler,
   };
 }

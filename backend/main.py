@@ -28,6 +28,7 @@ from app.api.oauth_routes import router as oauth_router   # generic OAuth for Sl
 from app.api.memories import router as memories_router
 from app.api.chat import router as chat_router
 from app.api.documents import router as documents_router
+from app.api.models_hub import router as models_hub_router
 
 # ─── App Factory ─────────────────────────────────────────────────────────────
 
@@ -65,6 +66,7 @@ app.include_router(connectors_router)    # /api/connectors/*
 app.include_router(memories_router)      # /api/memories/*
 app.include_router(chat_router)          # /api/chat/*
 app.include_router(documents_router)     # /api/documents/*
+app.include_router(models_hub_router)    # /api/hub/*
 
 # ─── Startup: SQLite Initialization & OAuth Auto-Restore ──────────────────────
 

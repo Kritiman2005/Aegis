@@ -10,7 +10,7 @@ import {
   Shield 
 } from 'lucide-react';
 
-export type TabType = 'chat' | 'connectors' | 'settings' | 'history' | 'sync_detail';
+export type TabType = 'chat' | 'connectors' | 'settings' | 'history' | 'sync_detail' | 'model_hub';
 
 interface SidebarProps {
   activeTab: TabType;
@@ -77,6 +77,19 @@ export default function Sidebar({ activeTab, setActiveTab, onNewChat }: SidebarP
         >
           <History className="w-4 h-4 text-gray-500" />
           History
+        </button>
+        
+        {/* Model Hub */}
+        <button
+          onClick={() => setActiveTab('model_hub')}
+          className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-medium transition-all ${
+            activeTab === 'model_hub'
+              ? 'bg-gray-200/60 text-gray-900 font-semibold'
+              : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
+          }`}
+        >
+          <Blocks className="w-4 h-4 text-gray-500" />
+          Model Hub
         </button>
 
         {/* Connectors */}
