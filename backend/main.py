@@ -80,10 +80,12 @@ async def on_startup():
     from app.mcp.registry import mcp_registry
     from app.core.scheduler import scheduler_daemon
     from app.api.websocket import watch_timeouts
+    from app.core.rag.processor import init_qdrant
     
     _logger = logging.getLogger("startup")
-    _logger.info("Initializing SQLite Database...")
+    _logger.info("Initializing Databases...")
     init_db()
+    init_qdrant()
 
     # Start the Scheduler Daemon for background jobs
     scheduler_daemon.start()

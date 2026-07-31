@@ -89,9 +89,49 @@ class ChatAgent(BaseAgent):
         tools_desc = [f"- {t['name']}: {t.get('description', '')}" for t in tools]
         return "\n".join(tools_desc)
 
+    def _rewrite_query_for_search(self, query: str) -> str:
+        """Uses a fast LLM pass to expand the user's query with keywords likely to hit the FTS5 tool index."""
+        llm = self.get_llm()
+        if not llm:
+            return query
+            
+        all_tools = mcp_registry.list_all_tools()
+        if not all_tools:
+            return query
+            
+        tool_names = ", ".join([t["name"] for t in all_tools])
+        
+        prompt = f"""You are a search query expansion assistant for a keyword-based tool registry.
+The user's query is: "{query}"
+
+Available tools in the registry: [{tool_names}]
+
+If the user is asking a general question about what tools are available (e.g., "what tools do I have?", "show tools", "what can you do?"), output EXACTLY the word: ALL_TOOLS
+
+Otherwise, output ONLY a comma-separated list of 3-5 keywords (no quotes or extra text) that represent the core intent of the user's query. Your goal is to output keywords that will successfully keyword-match the names or descriptions of the relevant tools. 
+Example: If user says 'reach out to marketing team', output 'slack, message, channel, post'."""
+
+        try:
+            response = llm.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=30
+            )
+            expanded_keywords = response["choices"][0]["message"]["content"].strip()
+            logger.info(f"Query rewritten for tool search: '{query}' -> '{expanded_keywords}'")
+            return expanded_keywords
+        except Exception as e:
+            logger.error(f"Query rewrite failed: {e}")
+            return query
+
     def get_searched_tools(self, query: str) -> str:
-        """Fetches top-k relevant tools from registry using semantic RAG based on the query."""
-        tools = mcp_registry.search_tools(query, top_k=10)
+        """Fetches top-k relevant tools from registry using keyword expansion and SQLite FTS5."""
+        optimized_query = self._rewrite_query_for_search(query)
+        
+        if "ALL_TOOLS" in optimized_query:
+            return self.get_available_tools()
+            
+        tools = mcp_registry.search_tools(optimized_query, top_k=10)
         if not tools:
             return ""
         tools_desc = [f"- {t['name']}: {t.get('description', '')}" for t in tools]
@@ -222,9 +262,12 @@ class ChatAgent(BaseAgent):
                 
             document_context = ""
             if relevant_chunks:
+                logger.info(f"RAG retrieved {len(relevant_chunks)} chunks for query: {message}")
                 document_context = "Relevant excerpts from your uploaded documents:\n\n"
                 for chunk in relevant_chunks:
                     document_context += f"--- Source: {chunk.get('filename')} ---\n{chunk.get('content')}\n\n"
+            else:
+                logger.info(f"RAG retrieved 0 chunks for query: {message}")
 
             from app.prompts.chat import build_chat_prompt
             # Append document context to the base entity context
@@ -232,7 +275,10 @@ class ChatAgent(BaseAgent):
             if document_context:
                 full_context += "\n" + document_context
                 
-            chat_prompt = build_chat_prompt(full_context)
+            all_tools_str = self.get_available_tools()
+            chat_prompt = build_chat_prompt(full_context, all_tools_str)
+            logger.info("Generated Chat Prompt successfully.")
+            
             messages = [{"role": "system", "content": chat_prompt}]
             messages.extend(self.chat_history)
 
@@ -366,8 +412,20 @@ class ChatAgent(BaseAgent):
         if not self.plan:
             self.state = AgentState.IDLE
             if warnings:
-                return "**Note:**\n" + "\n".join([f"- {w}" for w in warnings])
-            return f"Available tools:\n{tools_str}\n\nWhat would you like me to do with them?"
+                response = "**Note:**\n" + "\n".join([f"- {w}" for w in warnings])
+            else:
+                response = f"Available tools:\n{tools_str}\n\nWhat would you like me to do with them?"
+                
+            self.chat_history.append({"role": "assistant", "content": response})
+            try:
+                from app.db.crud import add_chat_message
+                db = SessionLocal()
+                add_chat_message(db, self.connection_id, "assistant", response)
+                db.close()
+            except Exception as e:
+                logger.warning(f"Failed to persist planner empty response: {e}")
+                
+            return response
 
         # Set requires_entity_extraction to True if any tool is called, since we reverted the planner prompt.
         # We can default to True when planner is invoked.

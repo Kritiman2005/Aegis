@@ -23,8 +23,36 @@ QDRANT_DB_DIR = BASE_DIR / "qdrant_db"
 
 COLLECTION_NAME = "aegis_documents"
 
-# Initialize Qdrant persistent client
-qdrant_client = QdrantClient(path=str(QDRANT_DB_DIR))
+# Initialize Qdrant persistent client on the event loop thread
+_qdrant_client = None
+
+def init_qdrant():
+    """Called on FastAPI startup to bind QdrantClient to the main event loop thread."""
+    global _qdrant_client
+    if _qdrant_client is None:
+        logger.info("Initializing QdrantClient on Uvicorn event loop thread...")
+        _qdrant_client = QdrantClient(path=str(QDRANT_DB_DIR))
+        # Ensure Collection Exists
+        if not _qdrant_client.collection_exists(COLLECTION_NAME):
+            _qdrant_client.create_collection(
+                collection_name=COLLECTION_NAME,
+                vectors_config={
+                    "text-dense": models.VectorParams(
+                        size=384,  # BAAI/bge-small-en-v1.5 output size
+                        distance=models.Distance.COSINE
+                    )
+                },
+                sparse_vectors_config={
+                    "text-sparse": models.SparseVectorParams(
+                        modifier=models.Modifier.IDF
+                    )
+                }
+            )
+
+def get_qdrant_client():
+    if _qdrant_client is None:
+        init_qdrant()
+    return _qdrant_client
 
 # Initialize FastEmbed models (Downloaded automatically on first run)
 logger.info("Initializing Dense & Sparse Embedding Models...")
@@ -39,23 +67,6 @@ def get_reranker():
         logger.info("Initializing CrossEncoder Reranker...")
         _reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
     return _reranker
-
-# Ensure Collection Exists
-if not qdrant_client.collection_exists(COLLECTION_NAME):
-    qdrant_client.create_collection(
-        collection_name=COLLECTION_NAME,
-        vectors_config={
-            "text-dense": models.VectorParams(
-                size=384,  # BAAI/bge-small-en-v1.5 output size
-                distance=models.Distance.COSINE
-            )
-        },
-        sparse_vectors_config={
-            "text-sparse": models.SparseVectorParams(
-                modifier=models.Modifier.IDF
-            )
-        }
-    )
 
 # Initialize EasyOCR reader (Lazy load)
 _ocr_reader = None
@@ -159,7 +170,8 @@ def ingest_document(document_id: int, file_path: str, file_type: str, filename: 
         )
         points.append(point)
         
-    qdrant_client.upsert(
+    client = get_qdrant_client()
+    client.upsert(
         collection_name=COLLECTION_NAME,
         points=points
     )
@@ -190,15 +202,25 @@ def hybrid_search(query: str, conversation_id: str, top_k: int = 5) -> List[Dict
     query_dense = list(dense_model.embed([query]))[0]
     query_sparse = list(sparse_model.embed([query]))[0]
     
+    doc_filter = models.Filter(
+        must=[
+            models.FieldCondition(
+                key="document_id",
+                match=models.MatchAny(any=valid_doc_ids)
+            )
+        ]
+    )
+
     # Query Qdrant with Reciprocal Rank Fusion (RRF) implicitly by querying both
     # Qdrant's query_points automatically fuses multiple prefetches
-    results = qdrant_client.query_points(
+    results = get_qdrant_client().query_points(
         collection_name=COLLECTION_NAME,
         prefetch=[
             models.Prefetch(
                 query=query_dense.tolist(),
                 using="text-dense",
-                limit=15
+                limit=15,
+                filter=doc_filter
             ),
             models.Prefetch(
                 query=models.SparseVector(
@@ -206,18 +228,11 @@ def hybrid_search(query: str, conversation_id: str, top_k: int = 5) -> List[Dict
                     values=query_sparse.values.tolist()
                 ),
                 using="text-sparse",
-                limit=15
+                limit=15,
+                filter=doc_filter
             )
         ],
         query=models.FusionQuery(fusion=models.Fusion.RRF),
-        query_filter=models.Filter(
-            must=[
-                models.FieldCondition(
-                    key="document_id",
-                    match=models.MatchAny(any=valid_doc_ids)
-                )
-            ]
-        ),
         limit=15
     )
     
@@ -241,15 +256,10 @@ def hybrid_search(query: str, conversation_id: str, top_k: int = 5) -> List[Dict
     scores = reranker.predict(pairs)
     
     filtered_chunks = []
-    # CrossEncoder scores typically range from roughly -10 to +10.
-    # Scores below -3.0 generally indicate the chunk has no relevance to the query.
-    MIN_RERANK_SCORE = -3.0
-    
     for i, chunk in enumerate(unique_chunks):
         score = float(scores[i])
-        if score >= MIN_RERANK_SCORE:
-            chunk["rerank_score"] = score
-            filtered_chunks.append(chunk)
+        chunk["rerank_score"] = score
+        filtered_chunks.append(chunk)
             
     filtered_chunks.sort(key=lambda x: x["rerank_score"], reverse=True)
     return filtered_chunks[:top_k]

@@ -345,6 +345,16 @@ export function useSocket() {
           content: trimmed,
           timestamp: new Date(),
         });
+      } else if (msgType === 'toast') {
+        // Add a local system message for visual feedback
+        appendMessage({
+          id: generateId(),
+          role: 'assistant', // Render as assistant so it looks like system message
+          content: trimmed,
+          timestamp: new Date(),
+        });
+        // We do not need to send purely local toasts to the backend
+        return true;
       }
 
       socketRef.current.send(

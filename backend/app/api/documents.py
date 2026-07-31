@@ -14,6 +14,9 @@ router = APIRouter(prefix="/api/documents", tags=["Documents"])
 UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent.parent / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+import logging
+logger = logging.getLogger(__name__)
+
 def process_upload_task(doc_id: int, file_path: str, file_type: str, filename: str):
     """Background task to extract, chunk, and embed document."""
     from app.db.database import SessionLocal
@@ -23,26 +26,28 @@ def process_upload_task(doc_id: int, file_path: str, file_type: str, filename: s
         db.close()
         return
         
+    logger.info(f"Starting RAG processing for document: {filename} (ID: {doc_id})")
     try:
         # Call RAG processor
         ingest_document(doc_id, file_path, file_type, filename)
         doc.status = "ready"
         db.commit()
+        logger.info(f"Successfully processed and embedded document: {filename}")
     except Exception as e:
         doc.status = "failed"
         doc.error_message = str(e)
         db.commit()
+        logger.error(f"Failed to process document {filename}: {e}")
     finally:
         db.close()
 
 @router.post("/upload")
 async def upload_document(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     conversation_id: str = Form(...),
     db = Depends(get_db)
 ):
-    """Uploads a document and queues it for RAG ingestion."""
+    """Uploads a document and synchronously processes it for RAG ingestion."""
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file uploaded")
         
@@ -64,16 +69,17 @@ async def upload_document(
     db.commit()
     db.refresh(doc)
     
-    # Trigger background ingestion (Dense + Sparse)
-    background_tasks.add_task(
-        process_upload_task,
+    logger.info(f"Received document upload: {file.filename} -> starting synchronous RAG ingestion.")
+    
+    # Process synchronously on the main thread to avoid Qdrant/SQLite cross-thread errors
+    process_upload_task(
         doc_id=doc.id,
         file_path=doc.file_path,
         file_type=doc.file_type,
         filename=doc.filename
     )
     
-    return {"message": "Upload successful, processing started.", "document_id": doc.id}
+    return {"message": "Upload successful and processed.", "document_id": doc.id}
 
 @router.get("")
 async def list_documents(conversation_id: str, db = Depends(get_db)):
