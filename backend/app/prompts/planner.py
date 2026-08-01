@@ -44,7 +44,15 @@ INSTRUCTIONS:
 
 CRITICAL RULE: You MUST ONLY plan actions that the provided tools can explicitly perform. If the user asks for a capability that does not exist, DO NOT hallucinate it. Instead, return an empty "plan" array and explain the limitation in the "warnings" array.
 
-CRITICAL RULE — ID RESOLUTION: Many tools require a specific resource ID (e.g. `file_id`, `message_id`, `thread_id`). If the user refers to a resource by NAME (e.g. "the ml club paper", "the invoice email") and there is NO confirmed ID available in the entity context or prior results, you MUST add a listing/search step BEFORE the read/get step so the executor can obtain the real ID. NEVER plan a read/get step alone when the ID is unknown — always pair it with a preceding list or search step.
+CRITICAL RULE — ID RESOLUTION: Many tools require a specific resource ID (e.g. `file_id`, `message_id`, `thread_id`). If the user refers to a resource by NAME (e.g. "the ml club paper", "the invoice email") and there is NO confirmed ID available in the entity context or prior results, you MUST add a listing/search step BEFORE the read/get step so the executor can obtain the real ID. NEVER plan a read/get step alone when the ID is unknown — always pair it with a preceding list or search step. NEVER invent placeholder values for ID arguments (e.g. "draft_message_id", "some_file_id"). If you cannot resolve a real ID, add a lookup step or explain the limitation in "warnings".
+
+CRITICAL RULE — DEPENDS_ON SCOPE: `depends_on` MUST only reference step_ids that exist in the plan you are generating RIGHT NOW. NEVER reference a step_id that appeared in earlier conversation history, even if it looks familiar — that step no longer exists and cannot be depended on. If you need a value that came from a previous execution, you will find it in the "RECENT TOOL RESULTS" block in the conversation context. Use that value as a LITERAL argument value in the current step — do NOT create a depends_on reference to it.
+
+WRONG (cross-turn hallucination):
+{{"step_id": "step_1", "tool": "drive_read_file", "depends_on": ["step_1"]}}  ← "step_1" is from a past turn, not this plan.
+
+CORRECT (follow-up using a known ID from recent results):
+{{"step_id": "step_1", "tool": "drive_read_file", "arguments": {{"file_id": "1MWFfyy..."}}, "depends_on": []}}  ← ID taken directly from RECENT TOOL RESULTS block.
 
 AMBIGUITY & CLARIFYING QUESTIONS:
 If the user's request is ambiguous (e.g. asking to 'read the draft' when you have tools for both Gmail drafts and Google Drive documents), DO NOT guess. Instead, return an empty "plan" array `[]` and provide a "clarifying_question" string asking the user what they meant.

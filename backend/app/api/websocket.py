@@ -83,6 +83,17 @@ async def websocket_endpoint(
         except Exception as e:
             logger.warning(f"Failed to load/send history for {connection_id}: {e}")
 
+        # Reconnect resilience: if the client dropped its WebSocket during LLM inference
+        # (e.g. React Strict Mode remount, brief network blip), the plan response was
+        # cached in session._pending_response. Replay it now so the client sees the card.
+        if session._pending_response and session.state == AgentState.WAITING_CONFIRMATION:
+            logger.info(f"[WS:{connection_id[:8]}] Replaying cached plan response after reconnect.")
+            try:
+                await websocket.send_json({"type": "token", "content": session._pending_response})
+                await websocket.send_json({"type": "done", "content": ""})
+            except Exception as e:
+                logger.warning(f"[WS:{connection_id[:8]}] Failed to replay pending response: {e}")
+
 
         while True:
             raw = await websocket.receive_text()
@@ -286,5 +297,13 @@ async def websocket_endpoint(
         logger.error(f"[WS] Unexpected error for {connection_id[:8]}: {exc}")
     finally:
         manager.disconnect(connection_id, websocket)
-        if connection_id in agent_sessions:
+        # Only destroy the ChatAgent if this WebSocket is still the active connection.
+        # If the client reconnected and a new socket has already taken over this session ID,
+        # the old disconnect must NOT wipe the ChatAgent (which holds in-progress LLM state,
+        # _last_tool_results, _turn_counter, and plan data for the new connection).
+        current_ws = manager._connections.get(connection_id)
+        if current_ws is None and connection_id in agent_sessions:
             del agent_sessions[connection_id]
+            logger.info(f"[WS] ChatAgent destroyed for {connection_id[:8]} (no active socket remaining)")
+        elif current_ws is not None:
+            logger.info(f"[WS] Skipping ChatAgent destroy for {connection_id[:8]} — new socket already active")

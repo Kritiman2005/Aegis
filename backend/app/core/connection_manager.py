@@ -72,8 +72,19 @@ class ConnectionManager:
         try:
             await ws.send_json(data)
             return True
-        except Exception as exc:
+        except RuntimeError as exc:
+            if "Unexpected ASGI message" in str(exc):
+                # Starlette/FastAPI raises this if the endpoint has already returned
+                # (meaning the client disconnected). It's a normal lifecycle event.
+                self.disconnect(connection_id, ws)
+                return False
             logger.warning(f"[WS] JSON send failed for {connection_id}: {exc}")
+            self.disconnect(connection_id, ws)
+            return False
+        except Exception as exc:
+            import traceback
+            tb = "".join(traceback.format_stack())
+            logger.warning(f"[WS] JSON send failed for {connection_id}: {exc}\n{tb}")
             self.disconnect(connection_id, ws)
             return False
 

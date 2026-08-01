@@ -50,6 +50,22 @@ class ChatAgent(BaseAgent):
         # Format: [{"label": ..., "type": ..., "id": ..., "data": {...}}, ...]
         self._pending_entities: List[Dict] = []
         self.requires_entity_extraction: bool = False
+
+        # Fix 1: Session-wide monotonically increasing step counter.
+        # Ensures step IDs are globally unique across turns (e.g. t1_step_1, t2_step_1)
+        # so the Planner never confuses a stale step reference from chat history
+        # with a live step in the current plan.
+        self._turn_counter: int = 0
+
+        # Fix 3: Structured recent tool results injected into the Planner context.
+        # Keyed by tool_name -> truncated result string. Cleared each new turn.
+        # This bypasses prose chat history entirely for the "act on what I just found" case.
+        self._last_tool_results: List[Dict] = []  # [{tool, result_snippet}]
+
+        # Reconnect resilience: cache the last plan response so it can be replayed
+        # if the client's WebSocket dropped during LLM inference and reconnects.
+        # Cleared when the plan is confirmed, cancelled, or a new plan is built.
+        self._pending_response: Optional[str] = None
         
         # Instantiate sub-agents
         self.planner = PlannerAgent(llm_mgr)
@@ -101,15 +117,15 @@ class ChatAgent(BaseAgent):
             
         tool_names = ", ".join([t["name"] for t in all_tools])
         
-        prompt = f"""You are a search query expansion assistant for a keyword-based tool registry.
+        prompt = f"""You are a fast tool selector for an AI agent.
 The user's query is: "{query}"
 
 Available tools in the registry: [{tool_names}]
 
 If the user is asking a general question about what tools are available (e.g., "what tools do I have?", "show tools", "what can you do?"), output EXACTLY the word: ALL_TOOLS
 
-Otherwise, output ONLY a comma-separated list of 3-5 keywords (no quotes or extra text) that represent the core intent of the user's query. Your goal is to output keywords that will successfully keyword-match the names or descriptions of the relevant tools. 
-Example: If user says 'reach out to marketing team', output 'slack, message, channel, post'."""
+Otherwise, select the 1 to 5 most relevant tools from the list above that the agent might need to fulfill the request. Output ONLY a comma-separated list of the exact tool names (no quotes, no extra text, no markdown). Do NOT invent new tool names.
+Example output: slack_send_message, google_drive_find_file"""
 
         try:
             response = llm.create_chat_completion(
@@ -249,6 +265,19 @@ Example: If user says 'reach out to marketing team', output 'slack, message, cha
             for m in raw_history[-_MAX_PLANNER_HISTORY:]
         ]
 
+        # Fix 3: Inject structured recent tool results as a clean context block.
+        # This gives the Planner real IDs/values from the last execution without
+        # forcing it to re-parse prose from the 600-char-truncated chat history.
+        if self._last_tool_results:
+            _MAX_RESULT_SNIPPET = 400
+            recent_block_lines = ["RECENT TOOL RESULTS (use values as literal arguments — NEVER reference these as a depends_on target):"]
+            for r in self._last_tool_results:
+                snippet = r["result"][:_MAX_RESULT_SNIPPET] + ("..." if len(r["result"]) > _MAX_RESULT_SNIPPET else "")
+                recent_block_lines.append(f"- {r['tool']} output: {snippet}")
+            recent_block = "\n".join(recent_block_lines)
+            # Inject as a system note at the front of history, not mixed in with chat turns.
+            history_for_planner = [{"role": "system", "content": recent_block}] + history_for_planner
+
         # ── Mode Branching ─────────────────────────────
         if mode == "chat":
             # 1. RAG Retrieval for Uploaded Documents
@@ -376,7 +405,30 @@ Example: If user says 'reach out to marketing team', output 'slack, message, cha
         if isinstance(warnings, str):
             warnings = [warnings]
         
-        # First pass: collect all declared step_ids
+        # Fix 1: Increment the session-wide turn counter and rewrite all step IDs
+        # from the LLM (e.g. "step_1") to globally unique IDs (e.g. "t3_step_1").
+        # This makes it structurally impossible for the Planner to form a valid
+        # depends_on reference to a step from a previous turn, since old step IDs
+        # (e.g. "t1_step_1") will never appear in all_step_ids for this new plan.
+        self._turn_counter += 1
+        turn_prefix = f"t{self._turn_counter}"
+
+        # Rewrite step IDs with turn prefix before validation
+        id_remap: Dict[str, str] = {}  # old_id -> new_id
+        for step in raw_plan:
+            old_id = step.get("step_id")
+            if old_id:
+                new_id = f"{turn_prefix}_{old_id}"
+                id_remap[old_id] = new_id
+                step["step_id"] = new_id
+
+        # Also rewrite depends_on references using the same map
+        for step in raw_plan:
+            depends_on = step.get("depends_on")
+            if isinstance(depends_on, list):
+                step["depends_on"] = [id_remap.get(did, did) for did in depends_on]
+
+        # First pass: collect all declared step_ids IN THIS PLAN ONLY
         all_step_ids = {step.get("step_id") for step in raw_plan if step.get("step_id")}
         
         for step in raw_plan:
@@ -384,15 +436,22 @@ Example: If user says 'reach out to marketing team', output 'slack, message, cha
             if tool_name not in valid_tool_names:
                 continue # Already caught above, but safe to skip
             
-            # Validate depends_on hallucinated IDs
+            # Validate depends_on — must only reference steps in the current plan.
+            # If the LLM hallucinated a cross-turn stale step reference (e.g. "step_1" from
+            # a prior turn), strip it to [] with a warning rather than aborting the whole plan.
+            # The correct value for the argument is available in the RECENT TOOL RESULTS block.
             depends_on = step.get("depends_on")
             if isinstance(depends_on, list):
+                valid_deps = []
                 for did in depends_on:
-                    if did not in all_step_ids:
-                        self.state = AgentState.IDLE
-                        self.plan = None
-                        return f"❌ Planner generated an invalid dependency (`{did}`). The plan has been aborted for safety. Please try rephrasing your request."
-                step["depends_on"] = depends_on
+                    if did in all_step_ids:
+                        valid_deps.append(did)
+                    else:
+                        logger.warning(
+                            f"Stripped stale/cross-turn depends_on '{did}' "
+                            f"from step '{step.get('step_id')}' — not in current plan."
+                        )
+                step["depends_on"] = valid_deps
             else:
                 step["depends_on"] = []
                 
@@ -401,10 +460,10 @@ Example: If user says 'reach out to marketing team', output 'slack, message, cha
             if foreach_target and foreach_target not in all_step_ids:
                 step["foreach"] = None
                 
-            # Ensure every step has an ID
+            # Ensure every step has an ID (fallback for steps that had no step_id at all)
             if not step.get("step_id"):
                 import uuid
-                step["step_id"] = f"step_{str(uuid.uuid4())[:8]}"
+                step["step_id"] = f"{turn_prefix}_step_{str(uuid.uuid4())[:8]}"
                 all_step_ids.add(step["step_id"])
                 
             self.plan.append(step)
@@ -460,10 +519,16 @@ Example: If user says 'reach out to marketing team', output 'slack, message, cha
         except Exception as e:
             logger.warning(f"Failed to persist planner response: {e}")
 
+        # Cache the plan response so it can be replayed on reconnect if the client
+        # dropped its WebSocket during LLM inference (e.g. React Strict Mode remount).
+        self._pending_response = response
+
         return response
 
     async def _handle_confirmation(self, message: str, token_callback=None) -> str:
         """WAITING_CONFIRMATION → confirm → EXECUTING  or  refine plan."""
+        # Plan was seen and acted on by the user — clear the reconnect cache.
+        self._pending_response = None
         self.chat_history.append({"role": "user", "content": message})
         
         # Persist user message to DB
@@ -865,6 +930,15 @@ Example: If user says 'reach out to marketing team', output 'slack, message, cha
                 db.close()
             except Exception as e:
                 logger.warning(f"Failed to persist execution results: {e}")
+
+            # Fix 3: Persist structured last tool results for the NEXT turn's Planner context block.
+            # Store only the raw result string; the block builder will truncate to 400 chars.
+            self._last_tool_results = [
+                {"tool": r["tool"], "result": r["result"]}
+                for r in tool_results
+            ]
+        else:
+            self._last_tool_results = []
 
         # Go back to IDLE
         self.state = AgentState.IDLE

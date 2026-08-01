@@ -117,6 +117,14 @@ export function useSocket() {
     setActiveNodeId(null);
   }, []);
 
+  // ── Stable callback refs (prevents connect from being recreated on every render) ──
+  const appendMessageRef = useRef(appendMessage);
+  const updateLastRef = useRef(updateLastAssistantMessage);
+  const finalizeRef = useRef(finalizeStreamingMessage);
+  useEffect(() => { appendMessageRef.current = appendMessage; }, [appendMessage]);
+  useEffect(() => { updateLastRef.current = updateLastAssistantMessage; }, [updateLastAssistantMessage]);
+  useEffect(() => { finalizeRef.current = finalizeStreamingMessage; }, [finalizeStreamingMessage]);
+
   // ── Ping / Keepalive ─────────────────────────────────────────────────────────
 
   const startPingLoop = useCallback(() => {
@@ -138,8 +146,18 @@ export function useSocket() {
     clearTimeout(pongTimeoutRef.current);
   }, []);
 
+  // Stable refs for ping so connect doesn't depend on them
+  const startPingLoopRef = useRef(startPingLoop);
+  const stopPingLoopRef = useRef(stopPingLoop);
+  useEffect(() => { startPingLoopRef.current = startPingLoop; }, [startPingLoop]);
+  useEffect(() => { stopPingLoopRef.current = stopPingLoop; }, [stopPingLoop]);
+
   // ── Connect ──────────────────────────────────────────────────────────────────
 
+  // connect is intentionally stable (no deps) so that the useEffect below never
+  // re-fires mid-inference and closes the socket. All internal callbacks are
+  // accessed via refs which are kept in sync via their own useEffects above.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const connect = useCallback(() => {
     if (isUnmountedRef.current) return;
     if (!connectionIdRef.current) {
@@ -158,7 +176,7 @@ export function useSocket() {
       console.log('[useSocket] Connected');
       setStatus('connected');
       reconnectAttemptsRef.current = 0;
-      startPingLoop();
+      startPingLoopRef.current();
     };
 
     ws.onmessage = (event: MessageEvent<string>) => {
@@ -177,12 +195,9 @@ export function useSocket() {
 
       switch (payload.type) {
         case 'connected':
-          // Server confirmed connection — history arrives separately in a 'history' event
-          // to avoid blocking the handshake on a DB query.
           break;
 
         case 'history':
-          // Load history on the FIRST event only to avoid duplication on reconnects
           if (!historyLoadedRef.current && payload.history && payload.history.length > 0) {
             historyLoadedRef.current = true;
             setMessages(payload.history.map((m: any) => ({
@@ -195,7 +210,6 @@ export function useSocket() {
           break;
 
         case 'token':
-          // Update workflow node states
           if (payload.node_id) {
             if (payload.status === 'running') {
               setActiveNodeId(payload.node_id);
@@ -208,20 +222,17 @@ export function useSocket() {
             }
           }
 
-          // Accumulate streaming token into the current assistant message
           if (!streamingIdRef.current) {
-            // First token — create the assistant placeholder message
             const msgId = generateId();
             streamingIdRef.current = msgId;
             setIsStreaming(true);
             
-            // Clear workflow states at the start of a new run
             if (!payload.node_id) {
               setCompletedNodeIds(new Set());
               setFailedNodeIds(new Set());
             }
 
-            appendMessage({
+            appendMessageRef.current({
               id: msgId,
               role: 'assistant',
               content: payload.content ?? '',
@@ -229,16 +240,16 @@ export function useSocket() {
               isStreaming: true,
             });
           } else {
-            updateLastAssistantMessage((prev) => prev + (payload.content ?? ''));
+            updateLastRef.current((prev) => prev + (payload.content ?? ''));
           }
           break;
 
         case 'done':
-          finalizeStreamingMessage();
+          finalizeRef.current();
           break;
 
         case 'toast':
-          appendMessage({
+          appendMessageRef.current({
             id: generateId(),
             role: 'system',
             content: payload.content ?? '',
@@ -247,8 +258,8 @@ export function useSocket() {
           break;
 
         case 'error':
-          finalizeStreamingMessage();
-          appendMessage({
+          finalizeRef.current();
+          appendMessageRef.current({
             id: generateId(),
             role: 'system',
             content: `⚠ Backend error: ${payload.content ?? 'Unknown error'}`,
@@ -264,22 +275,19 @@ export function useSocket() {
 
     ws.onclose = (event) => {
       if (isUnmountedRef.current || socketRef.current !== ws) return;
-      stopPingLoop();
+      stopPingLoopRef.current();
       console.log(`[useSocket] Closed — code: ${event.code}, reason: ${event.reason}`);
 
       if (event.code === 1000) {
-        // Clean close — no reconnect
         setStatus('disconnected');
         return;
       }
 
-      // If we're switching sessions, don't trigger the reconnect loop
       if (isSessionSwitchRef.current) {
         isSessionSwitchRef.current = false;
         return;
       }
 
-      // Exponential backoff reconnect
       const delay = Math.min(
         BASE_RECONNECT_DELAY_MS * 2 ** reconnectAttemptsRef.current,
         MAX_RECONNECT_DELAY_MS
@@ -295,9 +303,8 @@ export function useSocket() {
       if (socketRef.current !== ws) return;
       console.error('[useSocket] WebSocket error:', err);
       setStatus('error');
-      // onclose will fire after onerror, triggering reconnect
     };
-  }, [appendMessage, updateLastAssistantMessage, finalizeStreamingMessage, startPingLoop, stopPingLoop]);
+  }, []);
 
   // ── Lifecycle ────────────────────────────────────────────────────────────────
 
@@ -312,7 +319,9 @@ export function useSocket() {
       // Close cleanly with code 1000 to prevent reconnect loop
       socketRef.current?.close(1000, 'Component unmounted');
     };
-  }, [connect, stopPingLoop]);
+    // connect is stable (empty deps) so this effect only fires once on mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Keep the ref in sync whenever the Redux session ID changes
   useEffect(() => {

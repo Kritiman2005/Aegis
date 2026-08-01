@@ -53,6 +53,8 @@ CRITICAL RULES:
     2. The KNOWN ENTITIES block above.
     3. Something the user explicitly provided in the Chat History.
   If the ID is not found in any of these sources, you MUST return {{"error": "Cannot determine <param_name>: no prior step listed the file/resource. Add a listing step first (e.g. drive_list_files) to obtain the correct ID."}}.
+- CRITICAL — NAME DISAMBIGUATION: When selecting a specific item (file, email, etc.) by name from a list in prior results, you MUST match the exact name that the user stated in the Chat History. Do NOT use the Current Step Goal or Planner warning text as the name source — the Planner may have guessed wrong. Always scan the prior results list yourself and pick the item whose name most closely matches what the user explicitly said.
+  Example: User said "Paper-2-Draft", prior results contain both "evaluation paper 2" and "Paper-2-Draft" → you MUST use "Paper-2-Draft"'s ID, even if the step_reason mentions a different file.
 - If a parameter is optional or can be inferred safely from the user's intent (e.g. a search query string), do so.
 
 Respond with valid JSON only. Do not use any markdown formatting or backticks around the JSON."""

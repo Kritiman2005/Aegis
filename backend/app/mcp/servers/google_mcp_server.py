@@ -38,7 +38,7 @@ TOOLS = [
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Optional Google Drive search query (e.g. 'name contains \"invoice\"'). Do NOT include order by or limit clauses here. Do NOT use relative dates like 'now-1d'; date queries must use exact RFC 3339 timestamps (e.g. modifiedTime > '2024-01-01T12:00:00')."
+                    "description": "Optional Google Drive search query (e.g. 'name contains \"invoice\"'). CRITICAL: NEVER put 'orderBy' or 'limit' in this string. The API will crash. If you want to sort or limit, use the separate 'order_by' and 'max_results' arguments instead. Do NOT use relative dates like 'now-1d'; date queries must use exact RFC 3339 timestamps."
                 },
                 "order_by": {
                     "type": "string",
@@ -148,7 +148,12 @@ def _build_services(creds_json_str: str):
 def _drive_list_files(drive_service, query: str = "", order_by: str = "", max_results: int = 10) -> str:
     params = {"pageSize": max_results, "fields": "files(id, name, mimeType, modifiedTime)"}
     if query:
-        params["q"] = query
+        # LLMs often hallucinate SQL-like clauses into the 'q' parameter despite schema warnings.
+        # Google's API strictly rejects them, so we strip them out defensively.
+        import re
+        sanitized_q = re.sub(r"(?i)\b(order\s*by|limit)\s*(=|:)?\s*['\"]?[^'\"]*['\"]?", "", query).strip()
+        if sanitized_q:
+            params["q"] = sanitized_q
     if order_by:
         params["orderBy"] = order_by
     result = drive_service.files().list(**params).execute()
