@@ -19,7 +19,8 @@ export default function Home() {
   const { 
     messages, 
     status, 
-    isStreaming, 
+    isStreaming,
+    streamingContent, 
     activeNodeId,
     completedNodeIds,
     failedNodeIds,
@@ -91,6 +92,7 @@ export default function Home() {
             messages={messages}
             status={status}
             isStreaming={isStreaming}
+            streamingContent={streamingContent}
             onSendMessage={sendMessage}
             onClearMessages={clearMessages}
             activeConnectorName={activeConnectorName}

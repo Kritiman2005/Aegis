@@ -67,6 +67,11 @@ export function useSocket() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [isStreaming, setIsStreaming] = useState(false);
+  const [streamingContent, setStreamingContent] = useState('');
+  const bufferRef = useRef("");
+  const streamingContentRef = useRef("");
+  const rafPending = useRef(false);
+
   const [activeNodeId, setActiveNodeId] = useState<string | null>(null);
   const [completedNodeIds, setCompletedNodeIds] = useState<Set<string>>(new Set());
   const [failedNodeIds, setFailedNodeIds] = useState<Set<string>>(new Set());
@@ -106,12 +111,25 @@ export function useSocket() {
   }, []);
 
   const finalizeStreamingMessage = useCallback(() => {
-    setMessages((prev) => {
-      if (prev.length === 0) return prev;
-      const last = prev[prev.length - 1];
-      if (last.role !== 'assistant') return prev;
-      return [...prev.slice(0, -1), { ...last, isStreaming: false }];
-    });
+    const finalContent = streamingContentRef.current + bufferRef.current;
+    
+    bufferRef.current = '';
+    streamingContentRef.current = '';
+    setStreamingContent('');
+    
+    if (finalContent.trim()) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: streamingIdRef.current || generateId(),
+          role: 'assistant',
+          content: finalContent,
+          timestamp: new Date(),
+          isStreaming: false
+        }
+      ]);
+    }
+    
     streamingIdRef.current = null;
     setIsStreaming(false);
     setActiveNodeId(null);
@@ -223,24 +241,26 @@ export function useSocket() {
           }
 
           if (!streamingIdRef.current) {
-            const msgId = generateId();
-            streamingIdRef.current = msgId;
+            streamingIdRef.current = generateId();
             setIsStreaming(true);
             
             if (!payload.node_id) {
               setCompletedNodeIds(new Set());
               setFailedNodeIds(new Set());
             }
+          }
 
-            appendMessageRef.current({
-              id: msgId,
-              role: 'assistant',
-              content: payload.content ?? '',
-              timestamp: new Date(),
-              isStreaming: true,
-            });
-          } else {
-            updateLastRef.current((prev) => prev + (payload.content ?? ''));
+          if (payload.content) {
+            bufferRef.current += payload.content;
+            if (!rafPending.current) {
+              rafPending.current = true;
+              requestAnimationFrame(() => {
+                streamingContentRef.current += bufferRef.current;
+                setStreamingContent(streamingContentRef.current);
+                bufferRef.current = "";
+                rafPending.current = false;
+              });
+            }
           }
           break;
 
@@ -416,6 +436,7 @@ export function useSocket() {
     messages,
     status,
     isStreaming,
+    streamingContent,
     activeNodeId,
     completedNodeIds,
     failedNodeIds,

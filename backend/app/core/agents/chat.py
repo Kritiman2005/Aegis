@@ -541,8 +541,12 @@ Example output: slack_send_message, google_drive_find_file"""
         if warnings:
             response += "**Warnings:**\n" + "\n".join([f"- {w}" for w in warnings]) + "\n\n"
 
-        # Inject the raw JSON block invisibly at the end so the UI can parse it for the interactive card
-        response += f"\n```json\n{plan_json_str}\n```\n\n"
+        # Inject the updated JSON block invisibly at the end so the UI can parse it for the interactive card
+        updated_plan_data = {"plan": self.plan}
+        if isinstance(plan_data, dict) and plan_data.get("direct_response"):
+            updated_plan_data["direct_response"] = plan_data.get("direct_response")
+        
+        response += f"\n```json\n{json.dumps(updated_plan_data, indent=2)}\n```\n\n"
 
         response += "Would you like me to proceed with this? (Reply **'yes'** to execute or tell me what to edit)"
         

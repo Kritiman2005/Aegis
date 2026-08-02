@@ -32,6 +32,7 @@ interface ChatViewProps {
   activeNodeId?: string | null;
   completedNodeIds?: Set<string>;
   failedNodeIds?: Set<string>;
+  streamingContent?: string;
 }
 
 export default function ChatView({
@@ -44,6 +45,7 @@ export default function ChatView({
   activeNodeId,
   completedNodeIds,
   failedNodeIds,
+  streamingContent,
 }: ChatViewProps) {
   const sessionId = useAppSelector(selectSessionId);
   const [inputVal, setInputVal] = useState('');
@@ -139,9 +141,19 @@ export default function ChatView({
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
+  const [isNearBottom, setIsNearBottom] = useState(true);
+
+  const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    const { scrollTop, scrollHeight, clientHeight } = e.currentTarget;
+    const distanceToBottom = scrollHeight - scrollTop - clientHeight;
+    setIsNearBottom(distanceToBottom < 100);
+  };
+
   useEffect(() => {
-    scrollToBottom();
-  }, [messages, isStreaming]);
+    if (isNearBottom) {
+      scrollToBottom();
+    }
+  }, [messages, streamingContent, isNearBottom]);
 
   const handleSend = () => {
     if (!inputVal.trim() || isStreaming || status !== 'connected') return;
@@ -164,8 +176,8 @@ export default function ChatView({
   return (
     <div className="flex-1 flex flex-col h-full bg-[#F8F9FA] overflow-hidden">
       {/* ── Chat Messages Thread (Matching Image 2) ─────────────────────────── */}
-      <div className="flex-1 overflow-y-auto p-6 md:p-8 space-y-6">
-        {messages.length === 0 ? (
+      <div className="flex-1 overflow-y-auto p-6 md:p-8 space-y-6" onScroll={handleScroll}>
+        {messages.length === 0 && !streamingContent && !isStreaming ? (
           /* Welcome Banner when starting new chat */
           <div className="h-full flex flex-col items-center justify-center text-center max-w-md mx-auto my-auto py-12">
             <div className="w-12 h-12 rounded-2xl bg-black flex items-center justify-center text-white text-xl mb-4 shadow-md">
@@ -343,7 +355,36 @@ export default function ChatView({
                               <span className="text-[10px] text-gray-400">Human-In-The-Loop</span>
                             </div>
                             <div className="flex flex-col gap-2 pt-1">
-                            {editingPlanId === msg.id ? (
+                              {/* Render Plan Steps with Live Status */}
+                              <div className="space-y-1 mb-2">
+                                {(Array.isArray(parsedPlan) ? parsedPlan : parsedPlan.plan || []).map((step: any, i: number) => {
+                                  const isRunning = activeNodeId === step.step_id;
+                                  const isCompleted = completedNodeIds?.has(step.step_id);
+                                  const isFailed = failedNodeIds?.has(step.step_id);
+                                  
+                                  return (
+                                    <div key={step.step_id || i} className={`flex items-start gap-2.5 p-2 rounded-lg transition-colors ${isRunning ? 'bg-indigo-50/50' : ''}`}>
+                                      <div className="mt-0.5">
+                                        {isCompleted ? (
+                                          <CheckCircle2 className="w-4 h-4 text-teal-600" />
+                                        ) : isFailed ? (
+                                          <X className="w-4 h-4 text-red-600" />
+                                        ) : isRunning ? (
+                                          <Loader2 className="w-4 h-4 text-indigo-600 animate-spin" />
+                                        ) : (
+                                          <div className="w-4 h-4 rounded-full border-2 border-gray-300" />
+                                        )}
+                                      </div>
+                                      <div className="flex-1 min-w-0">
+                                        <div className="text-xs font-semibold text-gray-900 font-mono truncate">{step.tool}</div>
+                                        <div className="text-[11px] text-gray-500 line-clamp-2 mt-0.5 leading-relaxed">{step.reason}</div>
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                              
+                              {editingPlanId === msg.id ? (
                               <div className="space-y-2">
                                 <textarea
                                   value={planEditContent}
@@ -578,6 +619,43 @@ export default function ChatView({
             );
           })
         )}
+
+        {/* ── Streaming Bubble ── */}
+        {isStreaming && streamingContent && (
+          <div className="flex gap-3 max-w-4xl mx-auto justify-start">
+            <div className="w-8 h-8 rounded-xl bg-black flex items-center justify-center text-white flex-shrink-0 mt-0.5 shadow-sm">
+              <Zap className="w-4 h-4 fill-white text-black" />
+            </div>
+            <div className="space-y-2 max-w-2xl items-start w-full">
+              <div className="flex items-center gap-2 text-[11px] text-gray-400 justify-start">
+                <span className="font-semibold text-gray-700">Aegis</span>
+                <span>•</span>
+                <span className="italic text-gray-500">Generating...</span>
+              </div>
+              <div className="bg-white border border-gray-200 rounded-2xl p-5 text-xs text-gray-800 leading-relaxed shadow-sm space-y-4">
+                <div className="font-sans w-full overflow-hidden">
+                  <div className="prose prose-sm prose-slate max-w-none break-words marker:text-gray-400 prose-p:leading-relaxed">
+                    <ReactMarkdown 
+                      remarkPlugins={[remarkGfm]}
+                      components={{
+                        code({node, inline, className, children, ...props}) {
+                          if (streamingContent.includes('Proposed Execution Plan') && className === 'language-json') {
+                            return null;
+                          }
+                          return <code className={className} {...props}>{children}</code>;
+                        }
+                      }}
+                    >
+                      {streamingContent}
+                    </ReactMarkdown>
+                    <span className="inline-block w-1.5 h-3 ml-1 bg-gray-500 animate-pulse align-middle rounded-sm" />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         <div ref={messagesEndRef} />
       </div>
 
