@@ -1,0 +1,18 @@
+{
+  "chat": {
+    "max_history_messages": 4,
+    "max_msg_chars": 3700,
+    "max_rag_chunks": 5
+  },
+  "planner": {
+    "max_history_messages": 6,
+    "max_msg_chars": 2000,
+    "max_result_snippet": 2000
+  },
+  "executor": {
+    "description": "Executor is isolated by design. It receives only the tool schema for the current step and no chat history, ensuring deterministic JSON argument generation."
+  },
+  "extractor": {
+    "max_tokens": 1200
+  }
+}

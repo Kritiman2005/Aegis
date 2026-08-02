@@ -7,10 +7,11 @@ import {
   Settings, 
   User, 
   HelpCircle, 
-  Shield 
+  Shield,
+  SlidersHorizontal
 } from 'lucide-react';
 
-export type TabType = 'chat' | 'connectors' | 'settings' | 'history' | 'sync_detail' | 'model_hub';
+export type TabType = 'chat' | 'connectors' | 'settings' | 'history' | 'sync_detail' | 'model_hub' | 'context';
 
 interface SidebarProps {
   activeTab: TabType;
@@ -103,6 +104,19 @@ export default function Sidebar({ activeTab, setActiveTab, onNewChat }: SidebarP
         >
           <Blocks className="w-4 h-4 text-gray-700" />
           Connectors
+        </button>
+
+        {/* Context Management */}
+        <button
+          onClick={() => setActiveTab('context')}
+          className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-medium transition-all ${
+            activeTab === 'context'
+              ? 'bg-indigo-50 text-indigo-700 font-semibold border border-indigo-100'
+              : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
+          }`}
+        >
+          <SlidersHorizontal className={`w-4 h-4 ${activeTab === 'context' ? 'text-indigo-500' : 'text-gray-500'}`} />
+          Context
         </button>
 
         {/* Settings */}

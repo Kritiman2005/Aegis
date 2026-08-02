@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 # Lazy initialization of LLM manager to prevent DB queries at import time
 _llm_manager = None
 
+import concurrent.futures
+# Single-thread executor for all LLM calls to prevent Metal (Apple GPU) cross-thread segfaults
+llm_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
 def get_llm_manager():
     global _llm_manager
     if _llm_manager is None:
@@ -254,28 +258,32 @@ Example output: slack_send_message, google_drive_find_file"""
         
         entity_context = self._get_entity_context()
 
-        # We will pass chat history EXCLUDING the current message to planner, as planner appends it.
-        # Trim to the last 6 messages and cap each message to 600 chars to stay within the
-        # local LLM's 4096-token context window and prevent the planner from hanging.
-        _MAX_PLANNER_HISTORY = 6
-        _MAX_MSG_CHARS = 600
+        # Load context window config live from the JSON config store so changes
+        # from the Context Management UI take effect without a backend restart.
+        from app.core import context_config as ctx_cfg
+        _planner_cfg = ctx_cfg.get("planner")
+        _chat_cfg    = ctx_cfg.get("chat")
+
+        _MAX_PLANNER_HISTORY  = _planner_cfg.get("max_history_messages", 6)
+        _MAX_MSG_CHARS        = _planner_cfg.get("max_msg_chars", 2000)
+        _MAX_RESULT_SNIPPET   = _planner_cfg.get("max_result_snippet", 2000)
+        _MAX_CHAT_HISTORY     = _chat_cfg.get("max_history_messages", 20)
+        _MAX_CHAT_MSG_CHARS   = _chat_cfg.get("max_msg_chars", 4000)
+        _MAX_RAG_CHUNKS       = _chat_cfg.get("max_rag_chunks", 5)
+
         raw_history = self.chat_history[:-1]
         history_for_planner = [
             {"role": m["role"], "content": m["content"][:_MAX_MSG_CHARS] + ("..." if len(m["content"]) > _MAX_MSG_CHARS else "")}
             for m in raw_history[-_MAX_PLANNER_HISTORY:]
         ]
 
-        # Fix 3: Inject structured recent tool results as a clean context block.
-        # This gives the Planner real IDs/values from the last execution without
-        # forcing it to re-parse prose from the 600-char-truncated chat history.
+        # Inject structured recent tool results as a clean context block.
         if self._last_tool_results:
-            _MAX_RESULT_SNIPPET = 400
             recent_block_lines = ["RECENT TOOL RESULTS (use values as literal arguments — NEVER reference these as a depends_on target):"]
             for r in self._last_tool_results:
                 snippet = r["result"][:_MAX_RESULT_SNIPPET] + ("..." if len(r["result"]) > _MAX_RESULT_SNIPPET else "")
                 recent_block_lines.append(f"- {r['tool']} output: {snippet}")
             recent_block = "\n".join(recent_block_lines)
-            # Inject as a system note at the front of history, not mixed in with chat turns.
             history_for_planner = [{"role": "system", "content": recent_block}] + history_for_planner
 
         # ── Mode Branching ─────────────────────────────
@@ -283,8 +291,7 @@ Example output: slack_send_message, google_drive_find_file"""
             # 1. RAG Retrieval for Uploaded Documents
             try:
                 from app.core.rag.processor import hybrid_search
-                # Retrieve top 5 most relevant chunks across user's docs for this session
-                relevant_chunks = hybrid_search(query=message, conversation_id=self.connection_id, top_k=5)
+                relevant_chunks = hybrid_search(query=message, conversation_id=self.connection_id, top_k=_MAX_RAG_CHUNKS)
             except Exception as e:
                 logger.warning(f"RAG search failed: {e}")
                 relevant_chunks = []
@@ -309,10 +316,31 @@ Example output: slack_send_message, google_drive_find_file"""
             logger.info("Generated Chat Prompt successfully.")
             
             messages = [{"role": "system", "content": chat_prompt}]
-            messages.extend(self.chat_history)
+            
+            import re
+            # Apply Chat history cap and per-message char cap from the live config.
+            capped_history = [
+                {"role": m["role"], "content": m["content"][:_MAX_CHAT_MSG_CHARS] + ("..." if len(m["content"]) > _MAX_CHAT_MSG_CHARS else "")}
+                for m in self.chat_history[-_MAX_CHAT_HISTORY:]
+            ]
+            sanitized_history = []
+            for msg in capped_history:
+                content = msg["content"]
+                if msg["role"] == "assistant" and "Proposed Execution Plan" in content:
+                    content = content.replace("**Proposed Execution Plan:**", "**Past Action Plan:**")
+                    content = content.replace("Proposed Execution Plan:", "Past Action Plan:")
+                    content = re.sub(r'\n```json\n[\s\S]*?\n```\n\n', '', content)
+                    content = content.replace("Would you like me to proceed with this? (Reply **'yes'** to execute or tell me what to edit)", "")
+                    content = content.replace("Would you like me to proceed with this? (Reply 'yes' to execute or tell me what to edit)", "")
+                sanitized_history.append({"role": msg["role"], "content": content})
+                
+            messages.extend(sanitized_history)
 
             # In chat mode, we expect pure raw text, no JSON.
-            chat_response = await anyio.to_thread.run_sync(
+            import asyncio
+            loop = asyncio.get_running_loop()
+            chat_response = await loop.run_in_executor(
+                llm_executor,
                 lambda: self._call_llm_text(messages, token_callback)
             )
             
@@ -330,7 +358,9 @@ Example output: slack_send_message, google_drive_find_file"""
             return chat_response
 
         # If mode == "agent", we skip the Chat LLM and go straight to Plan Generation
-        tools_str = self.get_searched_tools(message)
+        import asyncio
+        loop = asyncio.get_running_loop()
+        tools_str = await loop.run_in_executor(llm_executor, self.get_searched_tools, message)
         if not tools_str:
             return "I couldn't find any connected tools relevant to your request. Are you sure you have the right MCP servers connected?"
 
@@ -343,12 +373,15 @@ Example output: slack_send_message, google_drive_find_file"""
         if status_callback:
             await status_callback("Drafting execution plan...")
 
-        plan_json_str = await anyio.to_thread.run_sync(
+        import asyncio
+        loop = asyncio.get_running_loop()
+        plan_json_str = await loop.run_in_executor(
+            llm_executor,
             lambda: self.planner.generate_plan(message, tools_str, entity_context, history_for_planner, None)
         )
 
         try:
-            plan_data = json.loads(plan_json_str)
+            plan_data = json.loads(plan_json_str, strict=False)
         except json.JSONDecodeError:
             return "Error: Planner output invalid JSON."
         
@@ -470,7 +503,10 @@ Example output: slack_send_message, google_drive_find_file"""
 
         if not self.plan:
             self.state = AgentState.IDLE
-            if warnings:
+            direct_response = plan_data.get("direct_response") if isinstance(plan_data, dict) else None
+            if direct_response:
+                response = direct_response
+            elif warnings:
                 response = "**Note:**\n" + "\n".join([f"- {w}" for w in warnings])
             else:
                 response = f"Available tools:\n{tools_str}\n\nWhat would you like me to do with them?"
@@ -573,9 +609,11 @@ Example output: slack_send_message, google_drive_find_file"""
                 
                 messages = [{"role": "system", "content": chat_prompt + system_injection}]
                 messages.extend(self.chat_history)
-                
-                response_text = await anyio.to_thread.run_sync(
-                    self._call_llm_text, messages
+                import asyncio
+                loop = asyncio.get_running_loop()
+                response_text = await loop.run_in_executor(
+                    llm_executor,
+                    lambda: self._call_llm_text(messages, token_callback)
                 )
                 final_response = response_text + "\n\n*(Plan is still pending. Reply 'yes' to execute or tell me what to change)*"
                 self.chat_history.append({"role": "assistant", "content": final_response})
@@ -597,7 +635,10 @@ Example output: slack_send_message, google_drive_find_file"""
                 return "I couldn't find any tools relevant to that edit request. Please clarify what you want to do."
                 
             entity_context = self._get_entity_context()
-            plan_json_str = await anyio.to_thread.run_sync(
+            import asyncio
+            loop = asyncio.get_running_loop()
+            plan_json_str = await loop.run_in_executor(
+                llm_executor,
                 lambda: self.planner.generate_plan(
                     "Please refine the plan based on my previous feedback.",
                     tools_str, entity_context, self.chat_history, token_callback
@@ -825,7 +866,10 @@ Example output: slack_send_message, google_drive_find_file"""
             yield {"text": f"Generating exact parameters for `{tool_name}`...\n", "node_id": node_id, "status": "running"}
 
             # Generate arguments live using the deterministic Executor Agent
-            arguments = await anyio.to_thread.run_sync(
+            import asyncio
+            loop = asyncio.get_running_loop()
+            arguments = await loop.run_in_executor(
+                llm_executor,
                 lambda: self.executor.generate_arguments(
                     tool_name=tool_name,
                     tool_schema=schema,
@@ -960,7 +1004,10 @@ Example output: slack_send_message, google_drive_find_file"""
         try:
             # Wrap content in a generic structure the extractor understands
             tool_results = [{"tool": "manual_extraction", "arguments": {}, "result": content}]
-            entities_json_str = await anyio.to_thread.run_sync(
+            import asyncio
+            loop = asyncio.get_running_loop()
+            entities_json_str = await loop.run_in_executor(
+                llm_executor,
                 lambda: self.extractor.extract_entities(tool_results)
             )
             entities_data = json.loads(entities_json_str)
@@ -1034,7 +1081,10 @@ Example output: slack_send_message, google_drive_find_file"""
         try:
             # Wrap content in a generic structure the extractor understands
             tool_results = [{"tool": "manual_extraction", "arguments": {"user_prompt": user_prompt}, "result": content}]
-            entities_json_str = await anyio.to_thread.run_sync(
+            import asyncio
+            loop = asyncio.get_running_loop()
+            entities_json_str = await loop.run_in_executor(
+                llm_executor,
                 lambda: self.extractor.extract_entities(tool_results, user_prompt)
             )
             entities_data = json.loads(entities_json_str)

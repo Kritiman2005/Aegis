@@ -8,6 +8,7 @@ import ConnectorsView from '@/components/ConnectorsView';
 import SettingsView from '@/components/SettingsView';
 import MemoryViewer from '@/components/MemoryViewer';
 import ModelHub from '@/components/ModelHub';
+import ContextManagement from '@/components/ContextManagement';
 import { useSocket } from '@/hooks/useSocket';
 import { Trash2 } from 'lucide-react';
 
@@ -110,6 +111,8 @@ export default function Home() {
         {activeTab === 'settings' && <SettingsView />}
 
         {activeTab === 'model_hub' && <ModelHub />}
+
+        {activeTab === 'context' && <ContextManagement />}
 
         {activeTab === 'history' && (
           <div className="flex-1 p-8 overflow-y-auto">

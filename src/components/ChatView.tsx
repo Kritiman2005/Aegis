@@ -331,6 +331,8 @@ export default function ChatView({
                           console.error("Failed to parse plan json", e);
                         }
                         
+                        if (!parsedPlan) return null;
+
                         return (
                           <div className="p-4 rounded-xl bg-gray-50 border border-gray-200 space-y-3">
                             <div className="flex items-center justify-between border-b border-gray-200 pb-2">

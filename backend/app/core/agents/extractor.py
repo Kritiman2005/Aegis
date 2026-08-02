@@ -21,11 +21,13 @@ class EntityExtractorAgent(BaseAgent):
         ]
 
         try:
+            from app.core import context_config as ctx_cfg
+            _max_tokens = ctx_cfg.get("extractor").get("max_tokens", 1024)
             response = llm.create_chat_completion(
                 messages=messages,
                 response_format={"type": "json_object"},
                 temperature=0.0,
-                max_tokens=1024
+                max_tokens=_max_tokens
             )
             return response["choices"][0]["message"]["content"]
         except Exception as e:

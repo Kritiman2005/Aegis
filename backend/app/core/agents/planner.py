@@ -24,17 +24,21 @@ class PlannerAgent(BaseAgent):
                 messages=messages,
                 response_format={"type": "json_object"},
                 temperature=0.1,
-                stream=True
+                stream=True,
+                max_tokens=1024
             )
             full_response = ""
+            print("\n--- PLANNER OUTPUT STREAM ---")
             for chunk in response:
                 if "choices" in chunk and len(chunk["choices"]) > 0:
                     delta = chunk["choices"][0].get("delta", {})
                     if "content" in delta:
                         token = delta["content"]
                         full_response += token
+                        print(token, end="", flush=True)
                         if token_callback:
                             token_callback(token)
+            print("\n-----------------------------\n")
             return full_response
         except Exception as e:
             logger.error(f"LLM plan generation failed: {e}")

@@ -47,7 +47,8 @@ class ExecutorAgent(BaseAgent):
             response = llm.create_chat_completion(
                 messages=messages,
                 response_format={"type": "json_object"},
-                temperature=0.0 # Strict deterministic output
+                temperature=0.0, # Strict deterministic output
+                max_tokens=1024
             )
             
             raw_content = response.get("choices", [])[0].get("message", {}).get("content", "{}")

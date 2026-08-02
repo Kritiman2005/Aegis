@@ -59,6 +59,7 @@ If the user's request is ambiguous (e.g. asking to 'read the draft' when you hav
 
 FORMAT EXAMPLE:
 {{
+  "direct_response": "These are the solutions you requested: ...",
   "clarifying_question": "Did you mean the Google Drive document 'Paper-2-Draft', or an email draft?",
   "plan": [
     {{
@@ -71,6 +72,6 @@ FORMAT EXAMPLE:
   ]
 }}
 
-If the user is just asking a general question or no tools are required, DO NOT create fake or placeholder tools (like 'none_available'). Return an EMPTY "plan" array `[]` and provide your response in the "warnings" array.
+If the user is asking a general question, requesting text generation, or no tools are required, DO NOT create fake or placeholder tools (like 'none_available'). Return an EMPTY "plan" array `[]` and provide your response in the "direct_response" field. Use "warnings" only for actual limitations or errors.
 
 Respond with valid JSON only. Do not use any emojis or icons. Ensure flawless English."""
