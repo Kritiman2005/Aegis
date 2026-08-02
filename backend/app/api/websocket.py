@@ -74,11 +74,11 @@ async def websocket_endpoint(
         # Load history from DB in a thread so we don't block the event loop,
         # then push it to the client as a dedicated "history" event.
         try:
-            await anyio.to_thread.run_sync(session.load_history)
-            if session.chat_history:
+            full_history = await session._get_history()
+            if full_history:
                 await websocket.send_json({
                     "type": "history",
-                    "history": session.chat_history,
+                    "history": full_history,
                 })
         except Exception as e:
             logger.warning(f"Failed to load/send history for {connection_id}: {e}")

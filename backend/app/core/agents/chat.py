@@ -23,6 +23,9 @@ import concurrent.futures
 # Single-thread executor for all LLM calls to prevent Metal (Apple GPU) cross-thread segfaults
 llm_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
+# Dedicated thread pool for SQLite DB operations to decouple I/O from the LLM GPU constraints
+db_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+
 def get_llm_manager():
     global _llm_manager
     if _llm_manager is None:
@@ -46,9 +49,6 @@ class ChatAgent(BaseAgent):
         self._state = AgentState.IDLE
         self.state_entered_at = time.time()
         self.plan: Optional[List[Dict]] = None
-        
-        # Start with empty history — loaded lazily after WebSocket handshake via load_history()
-        self.chat_history: List[Dict] = []
 
         # Entities proposed after execution — awaiting user confirmation
         # Format: [{"label": ..., "type": ..., "id": ..., "data": {...}}, ...]
@@ -76,16 +76,47 @@ class ChatAgent(BaseAgent):
         self.executor = ExecutorAgent(llm_mgr)
         self.extractor = EntityExtractorAgent(llm_mgr)
 
-    def load_history(self):
-        """Load chat history from DB. Called after WebSocket handshake to avoid blocking."""
+    async def _append_history(self, role: str, content: str):
+        """Asynchronously persist a chat message to SQLite via db_executor."""
+        import asyncio
+        loop = asyncio.get_running_loop()
+        
+        def _write():
+            from app.db.database import SessionLocal
+            from app.db.crud import add_chat_message
+            db = SessionLocal()
+            try:
+                add_chat_message(db, self.connection_id, role, content)
+            except Exception as e:
+                logger.error(f"Critical failure saving chat message to DB: {e}")
+                raise e
+            finally:
+                db.close()
+                
         try:
+            await loop.run_in_executor(db_executor, _write)
+        except Exception as e:
+            # Re-raise to abort the turn and allow handle_message to catch it
+            raise RuntimeError(f"Database write failed: {e}")
+
+    async def _get_history(self) -> List[Dict]:
+        """Asynchronously load history from SQLite via db_executor."""
+        import asyncio
+        loop = asyncio.get_running_loop()
+        
+        def _read():
+            from app.db.database import SessionLocal
             from app.db.crud import get_chat_history
             db = SessionLocal()
-            self.chat_history = get_chat_history(db, self.connection_id)
-            db.close()
-        except Exception as e:
-            logger.warning(f"Could not load chat history: {e}")
-            self.chat_history = []
+            try:
+                return get_chat_history(db, self.connection_id)
+            except Exception as e:
+                logger.error(f"Failed to load chat history from DB: {e}")
+                return []
+            finally:
+                db.close()
+                
+        return await loop.run_in_executor(db_executor, _read)
 
     @property
     def state(self):
@@ -245,16 +276,7 @@ Example output: slack_send_message, google_drive_find_file"""
 
     async def _handle_idle(self, message: str, mode: str = "chat", token_callback=None, status_callback=None) -> str:
         """IDLE → generate plan → WAITING_CONFIRMATION."""
-        self.chat_history.append({"role": "user", "content": message})
-        
-        # Persist user message to DB
-        try:
-            from app.db.crud import add_chat_message
-            db = SessionLocal()
-            add_chat_message(db, self.connection_id, "user", message)
-            db.close()
-        except Exception as e:
-            logger.warning(f"Failed to persist user message: {e}")
+        await self._append_history("user", message)
         
         entity_context = self._get_entity_context()
 
@@ -271,7 +293,8 @@ Example output: slack_send_message, google_drive_find_file"""
         _MAX_CHAT_MSG_CHARS   = _chat_cfg.get("max_msg_chars", 4000)
         _MAX_RAG_CHUNKS       = _chat_cfg.get("max_rag_chunks", 5)
 
-        raw_history = self.chat_history[:-1]
+        full_history = await self._get_history()
+        raw_history = full_history[:-1] if full_history else []
         history_for_planner = [
             {"role": m["role"], "content": m["content"][:_MAX_MSG_CHARS] + ("..." if len(m["content"]) > _MAX_MSG_CHARS else "")}
             for m in raw_history[-_MAX_PLANNER_HISTORY:]
@@ -321,7 +344,7 @@ Example output: slack_send_message, google_drive_find_file"""
             # Apply Chat history cap and per-message char cap from the live config.
             capped_history = [
                 {"role": m["role"], "content": m["content"][:_MAX_CHAT_MSG_CHARS] + ("..." if len(m["content"]) > _MAX_CHAT_MSG_CHARS else "")}
-                for m in self.chat_history[-_MAX_CHAT_HISTORY:]
+                for m in full_history[-_MAX_CHAT_HISTORY:]
             ]
             sanitized_history = []
             for msg in capped_history:
@@ -344,16 +367,7 @@ Example output: slack_send_message, google_drive_find_file"""
                 lambda: self._call_llm_text(messages, token_callback)
             )
             
-            self.chat_history.append({"role": "assistant", "content": chat_response})
-            
-            # Persist assistant message to DB
-            try:
-                from app.db.crud import add_chat_message
-                db = SessionLocal()
-                add_chat_message(db, self.connection_id, "assistant", chat_response)
-                db.close()
-            except Exception as e:
-                logger.warning(f"Failed to persist assistant message: {e}")
+            await self._append_history("assistant", chat_response)
 
             return chat_response
 
@@ -394,16 +408,7 @@ Example output: slack_send_message, google_drive_find_file"""
         if isinstance(plan_data, dict) and plan_data.get("clarifying_question"):
             question = plan_data.get("clarifying_question")
             self.state = AgentState.IDLE
-            self.chat_history.append({"role": "assistant", "content": question})
-            
-            # Persist clarifying question to DB
-            try:
-                from app.db.crud import add_chat_message
-                db = SessionLocal()
-                add_chat_message(db, self.connection_id, "assistant", question)
-                db.close()
-            except Exception as e:
-                logger.warning(f"Failed to persist clarifying question: {e}")
+            await self._append_history("assistant", question)
 
             return question
         
@@ -511,14 +516,7 @@ Example output: slack_send_message, google_drive_find_file"""
             else:
                 response = f"Available tools:\n{tools_str}\n\nWhat would you like me to do with them?"
                 
-            self.chat_history.append({"role": "assistant", "content": response})
-            try:
-                from app.db.crud import add_chat_message
-                db = SessionLocal()
-                add_chat_message(db, self.connection_id, "assistant", response)
-                db.close()
-            except Exception as e:
-                logger.warning(f"Failed to persist planner empty response: {e}")
+            await self._append_history("assistant", response)
                 
             return response
 
@@ -550,14 +548,7 @@ Example output: slack_send_message, google_drive_find_file"""
 
         response += "Would you like me to proceed with this? (Reply **'yes'** to execute or tell me what to edit)"
         
-        self.chat_history.append({"role": "assistant", "content": response})
-        try:
-            from app.db.crud import add_chat_message
-            db = SessionLocal()
-            add_chat_message(db, self.connection_id, "assistant", response)
-            db.close()
-        except Exception as e:
-            logger.warning(f"Failed to persist planner response: {e}")
+        await self._append_history("assistant", response)
 
         # Cache the plan response so it can be replayed on reconnect if the client
         # dropped its WebSocket during LLM inference (e.g. React Strict Mode remount).
@@ -569,16 +560,7 @@ Example output: slack_send_message, google_drive_find_file"""
         """WAITING_CONFIRMATION → confirm → EXECUTING  or  refine plan."""
         # Plan was seen and acted on by the user — clear the reconnect cache.
         self._pending_response = None
-        self.chat_history.append({"role": "user", "content": message})
-        
-        # Persist user message to DB
-        try:
-            from app.db.crud import add_chat_message
-            db = SessionLocal()
-            add_chat_message(db, self.connection_id, "user", message)
-            db.close()
-        except Exception as e:
-            logger.warning(f"Failed to persist user message: {e}")
+        await self._append_history("user", message)
 
 
         positive_keywords = ['yes', 'proceed', 'go ahead', 'do it', 'sure', 'ok', 'okay', 'yep', 'yeah', 'looks good']
@@ -612,7 +594,8 @@ Example output: slack_send_message, google_drive_find_file"""
                 )
                 
                 messages = [{"role": "system", "content": chat_prompt + system_injection}]
-                messages.extend(self.chat_history)
+                full_history = await self._get_history()
+                messages.extend(full_history)
                 import asyncio
                 loop = asyncio.get_running_loop()
                 response_text = await loop.run_in_executor(
@@ -620,17 +603,8 @@ Example output: slack_send_message, google_drive_find_file"""
                     lambda: self._call_llm_text(messages, token_callback)
                 )
                 final_response = response_text + "\n\n*(Plan is still pending. Reply 'yes' to execute or tell me what to change)*"
-                self.chat_history.append({"role": "assistant", "content": final_response})
+                await self._append_history("assistant", final_response)
                 
-                # Persist assistant response to DB
-                try:
-                    from app.db.crud import add_chat_message
-                    db = SessionLocal()
-                    add_chat_message(db, self.connection_id, "assistant", final_response)
-                    db.close()
-                except Exception as e:
-                    logger.warning(f"Failed to persist assistant response: {e}")
-                    
                 return final_response
 
             # Otherwise, treat as an edit request and route to Planner
@@ -641,11 +615,12 @@ Example output: slack_send_message, google_drive_find_file"""
             entity_context = self._get_entity_context()
             import asyncio
             loop = asyncio.get_running_loop()
+            full_history = await self._get_history()
             plan_json_str = await loop.run_in_executor(
                 llm_executor,
                 lambda: self.planner.generate_plan(
                     "Please refine the plan based on my previous feedback.",
-                    tools_str, entity_context, self.chat_history, token_callback
+                    tools_str, entity_context, full_history, token_callback
                 )
             )
             try:
@@ -657,16 +632,7 @@ Example output: slack_send_message, google_drive_find_file"""
                     response += f"{i+1}. **{step.get('tool')}**: {step.get('reason')}\n"
                 response += "\nIs this better? (Reply 'yes' to proceed)"
                 
-                self.chat_history.append({"role": "assistant", "content": response})
-                
-                # Persist refined plan to DB
-                try:
-                    from app.db.crud import add_chat_message
-                    db = SessionLocal()
-                    add_chat_message(db, self.connection_id, "assistant", response)
-                    db.close()
-                except Exception as e:
-                    logger.warning(f"Failed to persist refined plan: {e}")
+                await self._append_history("assistant", response)
                     
                 return response
             except json.JSONDecodeError:
@@ -841,9 +807,10 @@ Example output: slack_send_message, google_drive_find_file"""
         # within the local LLM context window.
         _MAX_EXEC_HISTORY = 6
         _MAX_EXEC_CHARS = 600
+        full_history = await self._get_history()
         trimmed_history = [
             {"role": m["role"], "content": m["content"][:_MAX_EXEC_CHARS] + ("..." if len(m["content"]) > _MAX_EXEC_CHARS else "")}
-            for m in self.chat_history[-_MAX_EXEC_HISTORY:]
+            for m in full_history[-_MAX_EXEC_HISTORY:]
         ]
         full_chat_history = json.dumps(trimmed_history, indent=2)
         entity_context = self._get_entity_context()
@@ -940,20 +907,17 @@ Example output: slack_send_message, google_drive_find_file"""
                 
                 # Append partial results to chat history so the LLM remembers what worked before the failure
                 if tool_results:
-                    # Provide full text to the LLM context without arbitrary truncation
-                    summary = "\n".join([f"Tool `{r['tool']}` output:\n{r['result']}" for r in tool_results])
-                    content = f"Execution Results (Partial before failure):\n{summary}"
-                    self.chat_history.append({
-                        "role": "assistant",
-                        "content": content
-                    })
-                    try:
-                        from app.db.crud import add_chat_message
-                        db = SessionLocal()
-                        add_chat_message(db, self.connection_id, "assistant", content)
-                        db.close()
-                    except Exception as e:
-                        logger.warning(f"Failed to persist partial execution results: {e}")
+                    # Provide full text to the LLM context without arbitrary truncation in a structured format
+                    lines = ["```json", "["]
+                    for idx, r in enumerate(tool_results):
+                        block = {"tool": r["tool"], "output": r["result"]}
+                        comma = "," if idx < len(tool_results) - 1 else ""
+                        lines.append(json.dumps(block) + comma)
+                    lines.append("]")
+                    lines.append("```")
+                    content = "**Execution Results (Partial before failure):**\n" + "\n".join(lines)
+                    
+                    await self._append_history("assistant", content)
 
                 # Hard-fail and reset
                 self.state = AgentState.IDLE
@@ -964,20 +928,17 @@ Example output: slack_send_message, google_drive_find_file"""
 
         # Append summary of results to chat history so the LLM remembers them for the next turn
         if tool_results:
-            # Provide full text to the LLM context without arbitrary truncation
-            summary = "\n".join([f"Tool `{r['tool']}` output:\n{r['result']}" for r in tool_results])
-            content = f"Execution Results:\n{summary}"
-            self.chat_history.append({
-                "role": "assistant",
-                "content": content
-            })
-            try:
-                from app.db.crud import add_chat_message
-                db = SessionLocal()
-                add_chat_message(db, self.connection_id, "assistant", content)
-                db.close()
-            except Exception as e:
-                logger.warning(f"Failed to persist execution results: {e}")
+            # Provide full text to the LLM context without arbitrary truncation in a structured format
+            lines = ["```json", "["]
+            for idx, r in enumerate(tool_results):
+                block = {"tool": r["tool"], "output": r["result"]}
+                comma = "," if idx < len(tool_results) - 1 else ""
+                lines.append(json.dumps(block) + comma)
+            lines.append("]")
+            lines.append("```")
+            content = "**Execution Results:**\n" + "\n".join(lines)
+            
+            await self._append_history("assistant", content)
 
             # Fix 3: Persist structured last tool results for the NEXT turn's Planner context block.
             # Store only the raw result string; the block builder will truncate to 400 chars.
@@ -1036,14 +997,7 @@ Example output: slack_send_message, google_drive_find_file"""
             response = "\n".join(lines)
             
             # Save the preview to history so it survives refresh
-            self.chat_history.append({"role": "assistant", "content": response})
-            try:
-                from app.db.crud import add_chat_message
-                db = SessionLocal()
-                add_chat_message(db, self.connection_id, "assistant", response)
-                db.close()
-            except Exception as e:
-                logger.warning(f"Failed to persist extraction preview: {e}")
+            await self._append_history("assistant", response)
                 
             yield response
         else:
