@@ -892,7 +892,7 @@ Example output: slack_send_message, google_drive_find_file"""
                 # batching it into the streaming text bubble.
                 yield {
                     "type": "step_result",
-                    "text": f"Result for `{tool_name}`:\n{display_str}\n",
+                    "text": f"Result for `{tool_name}`:\n{result_str}\n",
                     "node_id": node_id,
                     "status": "completed",
                     "tool": tool_name,
