@@ -625,8 +625,34 @@ Example output: slack_send_message, google_drive_find_file"""
             )
             try:
                 plan_data = json.loads(plan_json_str)
-                self.plan = plan_data.get("plan", [])
-                
+                raw_refined = plan_data.get("plan", [])
+
+                # Apply the same turn-prefix rewriting as the main plan path so that
+                # step IDs are globally unique and cross-turn depends_on refs are stripped.
+                self._turn_counter += 1
+                turn_prefix = f"t{self._turn_counter}"
+                id_remap: Dict[str, str] = {}
+                for step in raw_refined:
+                    old_id = step.get("step_id")
+                    if old_id:
+                        new_id = f"{turn_prefix}_{old_id}"
+                        id_remap[old_id] = new_id
+                        step["step_id"] = new_id
+
+                for step in raw_refined:
+                    depends_on = step.get("depends_on")
+                    if isinstance(depends_on, list):
+                        step["depends_on"] = [id_remap.get(did, did) for did in depends_on]
+
+                all_step_ids = {s.get("step_id") for s in raw_refined if s.get("step_id")}
+                for step in raw_refined:
+                    if isinstance(step.get("depends_on"), list):
+                        step["depends_on"] = [did for did in step["depends_on"] if did in all_step_ids]
+                    else:
+                        step["depends_on"] = []
+
+                self.plan = raw_refined
+
                 response = "I have refined the execution plan:\n\n"
                 for i, step in enumerate(self.plan):
                     response += f"{i+1}. **{step.get('tool')}**: {step.get('reason')}\n"
@@ -637,6 +663,7 @@ Example output: slack_send_message, google_drive_find_file"""
                 return response
             except json.JSONDecodeError:
                 return "Error parsing refined plan from LLM."
+
 
     async def _handle_memory_confirmation(self, message: str) -> str:
         """
