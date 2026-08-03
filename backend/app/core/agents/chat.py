@@ -817,6 +817,8 @@ Example output: slack_send_message, google_drive_find_file"""
 
         # Run each tool step and collect raw results
         tool_results: List[Dict] = []
+        # Stores structured output per step_id for the Executor — avoids prose-parsing for IDs.
+        # Format: {node_id: {"tool": tool_name, "output": <parsed JSON or raw string>}}
         prior_results_map: Dict[str, Any] = {}
         total_steps = len(self.plan)
 
@@ -836,6 +838,14 @@ Example output: slack_send_message, google_drive_find_file"""
 
             yield {"text": f"Generating exact parameters for `{tool_name}`...\n", "node_id": node_id, "status": "running"}
 
+            # Serialize structured prior results as a JSON array for the Executor.
+            # Each entry includes the step_id, tool name, and parsed output so the
+            # Executor can extract real IDs directly from the JSON without parsing prose.
+            prior_results_for_executor = [
+                {"step_id": sid, "tool": v["tool"], "output": v["output"]}
+                for sid, v in prior_results_map.items()
+            ]
+
             # Generate arguments live using the deterministic Executor Agent
             import asyncio
             loop = asyncio.get_running_loop()
@@ -846,7 +856,7 @@ Example output: slack_send_message, google_drive_find_file"""
                     tool_schema=schema,
                     overall_plan=self.plan,
                     step_reason=step_reason,
-                    prior_results=prior_results_map,
+                    prior_results=json.dumps(prior_results_for_executor, indent=2, default=str),
                     entity_context=entity_context,
                     user_request=full_chat_history
                 )
@@ -877,12 +887,28 @@ Example output: slack_send_message, google_drive_find_file"""
                 )
                 result_str = str(result)
                 
-                # Send the entire output to the UI without truncation
-                display_str = result_str
-                yield {"text": f"Result for `{tool_name}`:\n{display_str}\n", "node_id": node_id, "status": "completed"}
+                # Send the result immediately as a dedicated step_result event so the frontend
+                # can render it as a styled card the moment it lands, rather than
+                # batching it into the streaming text bubble.
+                yield {
+                    "type": "step_result",
+                    "text": f"Result for `{tool_name}`:\n{display_str}\n",
+                    "node_id": node_id,
+                    "status": "completed",
+                    "tool": tool_name,
+                }
 
-                # Collect result for next steps and extraction
-                prior_results_map[node_id] = result
+                # Collect result for next steps.
+                # Attempt to parse the result as JSON so the Executor gets a
+                # structured object it can query directly (e.g. files[].id).
+                # Fall back to storing the raw string under a "raw" key if
+                # the result is not valid JSON (plain-text tool outputs).
+                try:
+                    parsed_output = json.loads(result_str)
+                except (json.JSONDecodeError, TypeError):
+                    parsed_output = {"raw": result_str}
+
+                prior_results_map[node_id] = {"tool": tool_name, "output": parsed_output}
                 tool_results.append({
                     "tool": tool_name,
                     "arguments": arguments,

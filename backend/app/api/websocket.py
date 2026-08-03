@@ -184,12 +184,24 @@ async def websocket_endpoint(
                         # Stream the execution progress token by token
                         async for progress in session.execute_plan():
                             if isinstance(progress, dict):
-                                await manager.send_json(connection_id, {
-                                    "type": "token",
-                                    "content": progress.get("text", ""),
-                                    "node_id": progress.get("node_id"),
-                                    "status": progress.get("status")
-                                })
+                                if progress.get("type") == "step_result":
+                                    # Dedicated step result card — send immediately with its own type
+                                    # so the frontend can render it as a distinct styled block.
+                                    await manager.send_json(connection_id, {
+                                        "type": "step_result",
+                                        "content": progress.get("text", ""),
+                                        "node_id": progress.get("node_id"),
+                                        "status": progress.get("status"),
+                                        "tool": progress.get("tool"),
+                                    })
+                                else:
+                                    # Progress/status update (running, failed, generating params…)
+                                    await manager.send_json(connection_id, {
+                                        "type": "token",
+                                        "content": progress.get("text", ""),
+                                        "node_id": progress.get("node_id"),
+                                        "status": progress.get("status")
+                                    })
                             else:
                                 await manager.send_json(connection_id, {
                                     "type": "token",

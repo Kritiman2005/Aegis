@@ -35,12 +35,13 @@ export type ConnectionStatus =
   | 'error';
 
 interface ServerPayload {
-  type: 'connected' | 'token' | 'done' | 'error' | 'pong' | 'history';
+  type: 'connected' | 'token' | 'done' | 'error' | 'pong' | 'history' | 'toast' | 'step_result';
   content?: string;
   connection_id?: string;
   history?: Array<{ role: string; content: string }>;
   node_id?: string;
   status?: string;
+  tool?: string;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -261,6 +262,29 @@ export function useSocket() {
                 rafPending.current = false;
               });
             }
+          }
+          break;
+
+        case 'step_result':
+          // A single tool has finished executing. Flush any current streaming
+          // content and immediately render the result as its own message so the
+          // user sees live progress without waiting for the full plan to complete.
+          if (streamingContentRef.current || bufferRef.current) {
+            finalizeRef.current();
+          }
+          if (payload.content) {
+            appendMessageRef.current({
+              id: generateId(),
+              role: 'assistant',
+              content: payload.content,
+              timestamp: new Date(),
+              isStreaming: false,
+            });
+          }
+          // Mark the node as completed in the WorkflowCanvas DAG
+          if (payload.node_id) {
+            setCompletedNodeIds(prev => new Set(prev).add(payload.node_id as string));
+            setActiveNodeId(null);
           }
           break;
 
