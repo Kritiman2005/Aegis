@@ -76,6 +76,75 @@ class LLMManager:
             
         return self.loaded_models[model_name]
         
+    def _estimate_ram_required_gb(self, config: "ModelConfig") -> float:
+        """
+        Estimate how much RAM (in GB) loading this model will require at runtime.
+
+        Breakdown:
+          - Weight footprint: actual GGUF file size on disk (Q4_K_M ≈ weight bytes).
+          - KV cache: 2 * n_ctx * n_layers * head_dim * 2 bytes (fp16).
+            We use a conservative proxy: 0.20 GB per 1024 tokens of context.
+          - OS + Electron + FastAPI overhead: 2.5 GB fixed margin.
+            (macOS + Chromium shell routinely hold 3–5 GB; we use 2.5 as the
+             floor so we don't reject machines that are actually fine.)
+        """
+        import os
+        GB = 1024 ** 3
+
+        # Weight footprint from disk
+        weight_gb = 0.0
+        if config.model_path:
+            try:
+                weight_gb = os.path.getsize(config.model_path) / GB
+            except OSError:
+                weight_gb = 2.0  # conservative fallback if file not found yet
+
+        # KV cache estimate: 0.20 GB per 1024 context tokens
+        n_ctx = (config.kwargs or {}).get("n_ctx", 4096)
+        kv_cache_gb = (n_ctx / 1024) * 0.20
+
+        # Fixed overhead for OS + Electron + backend processes
+        overhead_gb = 2.5
+
+        return weight_gb + kv_cache_gb + overhead_gb
+
+    def _check_available_ram(self, model_name: str, config: "ModelConfig") -> None:
+        """
+        Warn (do not hard-fail) if available system RAM is likely insufficient
+        to load the model without swapping.
+
+        Checks *available* memory (not total installed RAM) so it accounts for
+        what other apps the user already has open at load time.
+        """
+        try:
+            import psutil
+            available_gb = psutil.virtual_memory().available / (1024 ** 3)
+            required_gb  = self._estimate_ram_required_gb(config)
+
+            logger.info(
+                f"[RAM Check] Model '{model_name}': estimated need {required_gb:.1f} GB, "
+                f"available now {available_gb:.1f} GB"
+            )
+
+            if available_gb < required_gb:
+                logger.warning(
+                    f"[RAM Check] WARNING: available RAM ({available_gb:.1f} GB) is below the "
+                    f"estimated requirement for '{model_name}' ({required_gb:.1f} GB). "
+                    f"Loading will proceed but performance may degrade severely due to swapping. "
+                    f"Close other applications or choose a smaller/more-quantized model."
+                )
+            elif available_gb < required_gb + 1.0:
+                # Tight but might work — warn anyway
+                logger.warning(
+                    f"[RAM Check] TIGHT: available RAM ({available_gb:.1f} GB) is close to the "
+                    f"estimated requirement for '{model_name}' ({required_gb:.1f} GB). "
+                    f"Consider closing other applications before loading."
+                )
+        except ImportError:
+            logger.debug("[RAM Check] psutil not installed — skipping RAM check.")
+        except Exception as e:
+            logger.debug(f"[RAM Check] Could not read system memory: {e}")
+
     def _load_model(self, model_name: str):
         """Actually load the model into memory."""
         try:
@@ -84,6 +153,13 @@ class LLMManager:
             raise ImportError("llama-cpp-python is not installed.")
 
         config = self.available_models[model_name]
+
+        # Check available RAM before committing to load.
+        # This is a warn-only guard — we do not hard-fail, because some machines
+        # report conservative available figures while macOS compression offsets real
+        # pressure. The warning gives the user actionable information.
+        self._check_available_ram(model_name, config)
+
         logger.info(f"Loading model: {model_name}")
             
         kwargs = config.kwargs or {}
@@ -108,3 +184,4 @@ class LLMManager:
             
         self.loaded_models[model_name] = llm
         logger.info(f"Model {model_name} loaded successfully.")
+

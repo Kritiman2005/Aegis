@@ -37,6 +37,17 @@ DEFAULTS: Dict[str, Any] = {
     "extractor": {
         "max_tokens": 1024,
     },
+    "hardware": {
+        # Number of threads in the LLM executor.
+        # MUST remain 1 regardless of hardware backend (Metal/CUDA/CPU).
+        # Consumer-grade local inference cannot safely or performantly run
+        # two decode passes concurrently — serialization is required everywhere.
+        "llm_max_workers": 1,
+        # Number of threads in the DB executor.
+        # 2 is safe for SQLite in WAL mode (concurrent readers, serialized writers).
+        # Can be increased if a user is on fast NVMe with high I/O concurrency.
+        "db_max_workers": 2,
+    },
 }
 
 # ── Public API ────────────────────────────────────────────────────────────────

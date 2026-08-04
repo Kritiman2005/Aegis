@@ -20,11 +20,36 @@ logger = logging.getLogger(__name__)
 _llm_manager = None
 
 import concurrent.futures
-# Single-thread executor for all LLM calls to prevent Metal (Apple GPU) cross-thread segfaults
-llm_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-# Dedicated thread pool for SQLite DB operations to decouple I/O from the LLM GPU constraints
-db_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+# Read thread pool sizes from context_config. Falls back to safe hardcoded defaults
+# if the config file is missing (e.g. fresh install) or unreadable — ensuring the
+# app always starts even before any settings have been saved.
+try:
+    from app.core import context_config as _ctx_cfg_hw
+    _hw = _ctx_cfg_hw.get("hardware")
+except Exception:
+    _hw = {}
+
+# Single-thread executor for all LLM calls.
+# Consumer-grade local hardware (Metal, CUDA, CPU) cannot safely or
+# performantly run two concurrent decode passes regardless of backend:
+# Metal hard-crashes; CUDA degrades from VRAM/KV-cache contention;
+# CPU starves both calls of cores. Serialization is required everywhere.
+# DEFAULT: 1. This value should NOT be changed without explicit testing.
+_llm_workers = int(_hw.get("llm_max_workers", 1))
+if _llm_workers != 1:
+    logger.warning(
+        f"[ThreadPool] llm_max_workers={_llm_workers} — overriding to 1. "
+        "Multiple LLM workers are unsafe on consumer hardware."
+    )
+    _llm_workers = 1
+llm_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_llm_workers)
+
+# Dedicated thread pool for SQLite DB operations — decoupled from the LLM lane
+# so a slow disk write never blocks inference. 2 workers is safe for SQLite
+# in WAL mode (concurrent readers, serialized writers).
+_db_workers = int(_hw.get("db_max_workers", 2))
+db_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_db_workers)
 
 def get_llm_manager():
     global _llm_manager
