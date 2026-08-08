@@ -133,3 +133,29 @@ class ChatMessage(Base):
     role = Column(String, nullable=False)                         # 'user', 'assistant', 'system'
     content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class SystemSettings(Base):
+    """
+    Single-row table storing global configuration across Tiers A, B, and C.
+    """
+    __tablename__ = "system_settings"
+
+    id = Column(Integer, primary_key=True, default=1)
+    chat_json = Column(Text, nullable=False, default="{}")
+    planner_json = Column(Text, nullable=False, default="{}")
+    extractor_json = Column(Text, nullable=False, default="{}")
+    advanced_json = Column(Text, nullable=False, default="{}")
+    hardware_json = Column(Text, nullable=False, default="{}")
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class SettingsHistory(Base):
+    """
+    Telemetry log for tracking changes to load-bearing settings over time.
+    """
+    __tablename__ = "settings_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    setting_path = Column(String, index=True, nullable=False)  # e.g., 'advanced.rag_threshold'
+    old_value = Column(String, nullable=True)
+    new_value = Column(String, nullable=True)
+    changed_at = Column(DateTime, default=datetime.utcnow)

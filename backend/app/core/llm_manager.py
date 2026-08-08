@@ -145,6 +145,19 @@ class LLMManager:
         except Exception as e:
             logger.debug(f"[RAM Check] Could not read system memory: {e}")
 
+    def unload_model(self, model_name: str) -> bool:
+        """
+        Unload a model from memory and force garbage collection to free RAM immediately.
+        Returns True if unloaded, False if it wasn't loaded.
+        """
+        if model_name in self.loaded_models:
+            del self.loaded_models[model_name]
+            import gc
+            gc.collect()
+            logger.info(f"Model {model_name} unloaded successfully.")
+            return True
+        return False
+
     def _load_model(self, model_name: str):
         """Actually load the model into memory."""
         try:
@@ -163,6 +176,14 @@ class LLMManager:
         logger.info(f"Loading model: {model_name}")
             
         kwargs = config.kwargs or {}
+        
+        # Inject dynamic hardware config
+        from app.core import context_config
+        hw_cfg = context_config.get("hardware")
+        if "n_gpu_layers" in hw_cfg:
+            kwargs["n_gpu_layers"] = hw_cfg["n_gpu_layers"]
+        if "n_threads" in hw_cfg:
+            kwargs["n_threads"] = hw_cfg["n_threads"]
         
         if config.repo_id and config.filename:
             # Load from huggingface hub

@@ -403,3 +403,68 @@ def delete_chat_session(db: Session, conversation_id: str) -> int:
     db.commit()
     return deleted
 
+
+# ─── Configuration & Telemetry ───────────────────────────────────────────────
+
+def get_system_settings(db: Session):
+    from app.db.models import SystemSettings
+    settings = db.query(SystemSettings).filter(SystemSettings.id == 1).first()
+    if not settings:
+        settings = SystemSettings(
+            id=1,
+            chat_json="{}",
+            planner_json="{}",
+            extractor_json="{}",
+            advanced_json="{}",
+            hardware_json="{}"
+        )
+        db.add(settings)
+        db.commit()
+        db.refresh(settings)
+    return settings
+
+def update_system_settings(
+    db: Session,
+    chat_json: Optional[str] = None,
+    planner_json: Optional[str] = None,
+    extractor_json: Optional[str] = None,
+    advanced_json: Optional[str] = None,
+    hardware_json: Optional[str] = None
+):
+    settings = get_system_settings(db)
+    if chat_json is not None:
+        settings.chat_json = chat_json
+    if planner_json is not None:
+        settings.planner_json = planner_json
+    if extractor_json is not None:
+        settings.extractor_json = extractor_json
+    if advanced_json is not None:
+        settings.advanced_json = advanced_json
+    if hardware_json is not None:
+        settings.hardware_json = hardware_json
+    
+    db.commit()
+    db.refresh(settings)
+    return settings
+
+def log_setting_change(db: Session, setting_path: str, old_value: str, new_value: str):
+    from app.db.models import SettingsHistory
+    # Add new record
+    history_record = SettingsHistory(
+        setting_path=setting_path,
+        old_value=old_value,
+        new_value=new_value
+    )
+    db.add(history_record)
+    db.commit()
+    
+    # Enforce 1000-row cap with oldest-row eviction
+    count = db.query(SettingsHistory).count()
+    if count > 1000:
+        # Find IDs of oldest rows to delete
+        excess = count - 1000
+        oldest_ids = db.query(SettingsHistory.id).order_by(SettingsHistory.changed_at.asc()).limit(excess).all()
+        ids_to_delete = [r[0] for r in oldest_ids]
+        if ids_to_delete:
+            db.query(SettingsHistory).filter(SettingsHistory.id.in_(ids_to_delete)).delete(synchronize_session=False)
+            db.commit()
