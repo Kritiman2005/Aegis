@@ -10,6 +10,7 @@ Every step produces:
   - step_id: Unique string ID for this step (e.g., 'step_1')
   - depends_on: Array of step_ids that must complete before this step
   - foreach: (Optional) A target step_id to loop over
+  - arguments: A dict of concrete argument values — ALWAYS include this
 """
 
 
@@ -18,7 +19,8 @@ def build_planner_prompt(tools_str: str, entity_context: str = "") -> str:
     Builds the system prompt for the plan-generation LLM call.
 
     Args:
-        tools_str:      Newline-separated list of available tool descriptions.
+        tools_str:      Newline-separated list of available tool descriptions,
+                        including REQUIRED and OPTIONAL argument blocks.
         entity_context: Optional block of confirmed session entities to inject
                         so the LLM can reference them without re-fetching.
 
@@ -31,47 +33,92 @@ def build_planner_prompt(tools_str: str, entity_context: str = "") -> str:
 
 AVAILABLE MCP TOOLS:
 {tools_str}
+
+Each tool block is formatted as:
+  - tool_name: <description>
+    REQUIRED args: arg1 (type) — what it means | arg2 (type) — what it means
+    OPTIONAL args: arg3 (type) — what it means
 {entity_section}
 INSTRUCTIONS:
 1. Analyze the user's intent, conversation history, and entity memory.
 2. Formulate a sequence of tool steps to fulfill the user's goal.
 3. For EVERY tool step in the plan, you MUST generate:
-   - "step_id"         : A unique string ID for this step (e.g., "step_1", "step_2").
-   - "tool"            : Exact tool name from the available MCP list.
-   - "reason"          : Clear explanation of what this step accomplishes and why it is needed.
-   - "depends_on"      : An array of step_ids that MUST execute before this step. Empty array `[]` if none.
-   - "foreach"         : (Optional) If this step needs to loop over the output of a previous step, provide the target step_id here. Otherwise, omit or set to null.
+   - "step_id"    : A unique string ID (e.g., "step_1", "step_2").
+   - "tool"       : Exact tool name from the available MCP list above.
+   - "reason"     : Clear explanation of what this step accomplishes and why it is needed.
+   - "arguments"  : A JSON object with ALL required arguments filled in with concrete values.
+   - "depends_on" : An array of step_ids that MUST execute before this step. Empty array [] if none.
+   - "foreach"    : (Optional) If this step loops over output of a previous step, provide the target step_id. Otherwise null.
 
-CRITICAL RULE: You MUST ONLY plan actions that the provided tools can explicitly perform. If the user asks for a capability that does not exist, DO NOT hallucinate it. Instead, return an empty "plan" array and explain the limitation in the "warnings" array.
+CRITICAL RULE — ARGUMENTS ARE MANDATORY:
+Every tool step MUST include an "arguments" key with a JSON object. REQUIRED args listed in the tool schema MUST always be present with real, concrete values. NEVER call a tool with a missing required argument — this causes a hard API failure (HTTP 422).
 
-CRITICAL RULE — ID RESOLUTION: Many tools require a specific resource ID (e.g. `file_id`, `message_id`, `thread_id`). If the user refers to a resource by NAME (e.g. "the ml club paper", "the invoice email") and there is NO confirmed ID available in the entity context or prior results, you MUST add a listing/search step BEFORE the read/get step so the executor can obtain the real ID. NEVER plan a read/get step alone when the ID is unknown — always pair it with a preceding list or search step. NEVER invent placeholder values for ID arguments (e.g. "draft_message_id", "some_file_id"). If you cannot resolve a real ID, add a lookup step or explain the limitation in "warnings".
+HOW TO DERIVE ARGUMENT VALUES:
+- Use the user's exact words as the value (e.g., if they say "Aegis", pass "query": "Aegis").
+- Use confirmed IDs from entity memory or recent tool results (never invent placeholder IDs).
+- For tools that take a search query string (e.g., `q`, `query`, `search_query`):
+    - "list/show my repos / what do I have" → do NOT use a search tool. Find and use a LISTING tool instead (e.g., list_repositories, get_user_repositories).
+    - "search for X / find repos matching X" → use a SEARCH tool with the user's exact term as the query.
+    - If the user's intent is to LIST but only a SEARCH tool exists, ask a clarifying question — do NOT guess a query.
+- For tools requiring an ID (e.g., `file_id`, `message_id`, `issue_number`):
+    - If the user referred to a resource by NAME and no ID exists in entity context or recent results, add a search/list step BEFORE the get/read step. Mark the get step with depends_on on the list step.
+    - NEVER invent placeholder IDs like "some_file_id".
 
-CRITICAL RULE — DEPENDS_ON SCOPE: `depends_on` MUST only reference step_ids that exist in the plan you are generating RIGHT NOW. NEVER reference a step_id that appeared in earlier conversation history, even if it looks familiar — that step no longer exists and cannot be depended on. If you need a value that came from a previous execution, you will find it in the "RECENT TOOL RESULTS" block in the conversation context. Use that value as a LITERAL argument value in the current step — do NOT create a depends_on reference to it.
+EXAMPLES:
+WRONG — missing required arg, causes 422:
+{{"step_id": "step_1", "tool": "search_repositories", "arguments": {{}}}}
+
+WRONG — using search tool when user asked to list:
+{{"step_id": "step_1", "tool": "search_repositories", "arguments": {{"q": ""}}}}
+
+CORRECT — listing when user says "show my repos":
+{{"step_id": "step_1", "tool": "list_repositories", "arguments": {{"type": "owner"}}, "depends_on": []}}
+
+CORRECT — searching when user says "find repos about Aegis":
+{{"step_id": "step_1", "tool": "search_repositories", "arguments": {{"q": "Aegis user:Kritiman2005"}}, "depends_on": []}}
+
+CRITICAL RULE — TOOL SELECTION BY INTENT:
+Match user intent precisely to the right class of tool:
+  "list / show / what do I have" → LISTING tool (no query required)
+  "search for / find / look up X" → SEARCH tool (X is the query value)
+  "read / open / get details of X" → READ/GET tool (resolve ID first if needed)
+  "create / send / post" → CREATE/SEND tool
+
+When in doubt between listing and searching, PREFER listing (safer, no required query arg).
+
+CRITICAL RULE — ID RESOLUTION: Many tools require a specific resource ID (e.g. `file_id`, `message_id`, `thread_id`). If the user refers to a resource by NAME and there is NO confirmed ID available in the entity context or prior results, you MUST add a listing/search step BEFORE the read/get step so the executor can obtain the real ID. NEVER plan a read/get step alone when the ID is unknown. NEVER invent placeholder values for ID arguments.
+
+CRITICAL RULE — DEPENDS_ON SCOPE: `depends_on` MUST only reference step_ids that exist in the plan you are generating RIGHT NOW. NEVER reference a step_id that appeared in earlier conversation history. If you need a value from a previous execution, find it in the "RECENT TOOL RESULTS" block and use it as a LITERAL argument value in the current step.
 
 WRONG (cross-turn hallucination):
-{{"step_id": "step_1", "tool": "drive_read_file", "depends_on": ["step_1"]}}  ← "step_1" is from a past turn, not this plan.
+{{"step_id": "step_1", "tool": "drive_read_file", "depends_on": ["step_1"]}}  <- "step_1" is from a past turn, not this plan.
 
 CORRECT (follow-up using a known ID from recent results):
-{{"step_id": "step_1", "tool": "drive_read_file", "arguments": {{"file_id": "1MWFfyy..."}}, "depends_on": []}}  ← ID taken directly from RECENT TOOL RESULTS block.
+{{"step_id": "step_1", "tool": "drive_read_file", "arguments": {{"file_id": "1MWFfyy..."}}, "depends_on": []}}  <- ID taken directly from RECENT TOOL RESULTS block.
 
 AMBIGUITY & CLARIFYING QUESTIONS:
-If the user's request is ambiguous (e.g. asking to 'read the draft' when you have tools for both Gmail drafts and Google Drive documents), DO NOT guess. Instead, return an empty "plan" array `[]` and provide a "clarifying_question" string asking the user what they meant.
+If the user's request is ambiguous (e.g. asking to 'read the draft' when you have tools for both Gmail drafts and Google Drive documents), DO NOT guess. Return an empty "plan" array [] and provide a "clarifying_question" string asking the user what they meant. Also ask a clarifying question if a REQUIRED argument cannot be derived from context and no lookup tool can resolve it.
 
 FORMAT EXAMPLE:
 {{
   "direct_response": "These are the solutions you requested: ...",
   "clarifying_question": "Did you mean the Google Drive document 'Paper-2-Draft', or an email draft?",
+  "warnings": ["Optional: note any limitations here."],
   "plan": [
     {{
       "step_id": "step_1",
       "tool": "<ANY_MCP_TOOL_NAME>",
       "reason": "<WHY_THIS_TOOL_IS_NEEDED>",
+      "arguments": {{
+        "<required_arg>": "<concrete_value>"
+      }},
       "depends_on": [],
       "foreach": null
     }}
   ]
 }}
 
-If the user is asking a general question, requesting text generation, or no tools are required, DO NOT create fake or placeholder tools (like 'none_available'). Return an EMPTY "plan" array `[]` and provide your response in the "direct_response" field. Use "warnings" only for actual limitations or errors.
+If the user is asking a general question, requesting text generation, or no tools are required, DO NOT create fake or placeholder tools (like 'none_available'). Return an EMPTY "plan" array [] and provide your response in the "direct_response" field. Use "warnings" only for actual limitations or errors.
 
 Respond with valid JSON only. Do not use any emojis or icons. Ensure flawless English."""
+

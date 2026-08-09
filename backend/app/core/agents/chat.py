@@ -157,13 +157,50 @@ class ChatAgent(BaseAgent):
     # Helpers
     # ─────────────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _format_tool_for_planner(t: dict) -> str:
+        """
+        Serializes a single MCP tool dict into a rich, planner-readable block.
+
+        Format:
+            - tool_name: <description>
+              REQUIRED args: arg1 (type) — description | arg2 (type) — description
+              OPTIONAL args: arg3 (type) — description
+              USE WHEN: <natural-language trigger hints derived from description>
+        """
+        name = t.get("name", "")
+        description = t.get("description", "").strip()
+        schema = t.get("inputSchema") or t.get("input_schema") or {}
+        properties = schema.get("properties", {})
+        required_fields = set(schema.get("required", []))
+
+        required_parts = []
+        optional_parts = []
+        for param, meta in properties.items():
+            ptype = meta.get("type", "string")
+            pdesc = meta.get("description", "").strip().rstrip(".")
+            entry = f"{param} ({ptype})"
+            if pdesc:
+                entry += f" — {pdesc}"
+            if param in required_fields:
+                required_parts.append(entry)
+            else:
+                optional_parts.append(entry)
+
+        lines = [f"- {name}: {description}"]
+        if required_parts:
+            lines.append(f"  REQUIRED args: {' | '.join(required_parts)}")
+        if optional_parts:
+            lines.append(f"  OPTIONAL args: {' | '.join(optional_parts)}")
+
+        return "\n".join(lines)
+
     def get_available_tools(self) -> str:
         """Fetches all available tools from all connected MCP servers in the registry."""
         tools = mcp_registry.list_all_tools()
         if not tools:
             return "No active MCP servers connected. Please authenticate with Google or connect a server first."
-        tools_desc = [f"- {t['name']}: {t.get('description', '')}" for t in tools]
-        return "\n".join(tools_desc)
+        return "\n".join(self._format_tool_for_planner(t) for t in tools)
 
     def _rewrite_query_for_search(self, query: str) -> str:
         """Uses a fast LLM pass to expand the user's query with keywords likely to hit the FTS5 tool index."""
@@ -210,8 +247,7 @@ Example output: slack_send_message, google_drive_find_file"""
         tools = mcp_registry.search_tools(optimized_query, top_k=10)
         if not tools:
             return ""
-        tools_desc = [f"- {t['name']}: {t.get('description', '')}" for t in tools]
-        return "\n".join(tools_desc)
+        return "\n".join(self._format_tool_for_planner(t) for t in tools)
 
     def _get_entity_context(self) -> str:
         """Loads confirmed session entities from SQLite and returns the context block."""
