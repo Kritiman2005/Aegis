@@ -20,7 +20,7 @@ import webbrowser
 
 import anyio
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from app.auth.oauth_service import (
     OAUTH_CONFIGS,
@@ -30,6 +30,7 @@ from app.auth.oauth_service import (
     generate_pkce_pair,
     get_client_credentials,
     jira_fetch_cloud_id,
+    github_fetch_username,
 )
 from app.core.connection_manager import manager as ws_manager
 from app.mcp.registry import mcp_registry
@@ -93,7 +94,12 @@ def _success_html(display_name: str, n_tools: int) -> str:
             <div class="badge">{n_tools} tools activated</div>
             <p class="closing">This tab will close automatically…</p>
         </div>
-        <script>setTimeout(() => window.close(), 2500);</script>
+        <script>
+            if (window.opener) {{
+                window.opener.postMessage('auth_success', '*');
+            }}
+            setTimeout(() => window.close(), 2500);
+        </script>
     </body>
     </html>
     """
@@ -191,14 +197,9 @@ def service_oauth_login(service_name: str):
     _OAUTH_STATES[f"{service_name}:{state}"] = code_verifier  # None if no PKCE
 
     auth_url = build_auth_url(service_name, state, code_challenge)
-    logger.info("Opening OAuth for %s: %s", config["display_name"], auth_url)
-    webbrowser.open(auth_url)
-
-    return JSONResponse(content={
-        "message": f"Browser opened for {config['display_name']} authentication.",
-        "service": service_name,
-        "state":   state,
-    })
+    logger.info("Redirecting to OAuth for %s: %s", config["display_name"], auth_url)
+    
+    return RedirectResponse(url=auth_url)
 
 
 @router.get("/{service_name}/callback")
@@ -232,36 +233,52 @@ async def service_oauth_callback(service_name: str, request: Request):
     code_verifier = _OAUTH_STATES.pop(state_key)
 
     try:
-        def _exchange_and_connect():
-            """Blocking work: token exchange + MCP server startup — runs in thread pool."""
-            # 1. Exchange authorization code for access token
-            token_response = exchange_code_for_token(service_name, code, code_verifier)
+        def _exchange_tokens():
+            """Blocking work: token exchange + extraction — runs in thread pool."""
+            token_res = exchange_code_for_token(service_name, code, code_verifier)
+            vars = extract_env_vars(service_name, token_res)
+            return token_res, vars
 
-            # 2. Extract env vars from token response
-            env_vars = extract_env_vars(service_name, token_response)
+        token_response, env_vars = await anyio.to_thread.run_sync(_exchange_tokens)
 
-            # 3. Jira-specific: fetch cloud ID and inject into env
-            # (handled async below outside this sync block for Jira)
+        # Post-token hooks: run async AFTER exchange but BEFORE server start
+        # Collect account_context from post-token hooks
+        account_context: dict = {}
+        hook = config.get("post_token_hook")
+        if hook == "jira_fetch_cloud_id" and "JIRA_API_TOKEN" in env_vars:
+            cloud_id = await jira_fetch_cloud_id(env_vars["JIRA_API_TOKEN"])
+            if cloud_id:
+                env_vars["JIRA_CLOUD_ID"] = cloud_id
+                account_context["cloud_id"] = cloud_id
+        elif hook == "github_fetch_username" and "GITHUB_PERSONAL_ACCESS_TOKEN" in env_vars:
+            username = await github_fetch_username(env_vars["GITHUB_PERSONAL_ACCESS_TOKEN"])
+            if username:
+                env_vars["GITHUB_USERNAME"] = username
+                account_context["authenticated_username"] = username
+                logger.info("GitHub username fetched: %s", username)
 
-            # 4. Launch MCP server subprocess via registry
+        def _connect_server():
+            """Blocking work: launch MCP server subprocess — runs in thread pool."""
             from app.db.database import SessionLocal
+            from app.db.crud import sync_mcp_server_and_tools
             with SessionLocal() as db:
+                # Start the subprocess
                 tools = mcp_registry.connect_server(
                     server_name=service_name,
                     command=config["mcp_command"],
                     env=env_vars,
-                    db=db,
+                    db=None,  # we'll sync manually below with account_context
                 )
-            return tools, token_response, env_vars
+                # Persist tools + account_context together
+                sync_mcp_server_and_tools(
+                    db=db,
+                    server_name=service_name,
+                    tools=tools,
+                    account_context=account_context if account_context else None,
+                )
+                return tools
 
-        tools, token_response, env_vars = await anyio.to_thread.run_sync(_exchange_and_connect)
-
-        # Jira post-hook: fetch cloud_id (async)
-        if service_name == "jira" and "JIRA_API_TOKEN" in env_vars:
-            cloud_id = await jira_fetch_cloud_id(env_vars["JIRA_API_TOKEN"])
-            if cloud_id:
-                # Inject cloud_id into the running server's env reference (best-effort)
-                env_vars["JIRA_CLOUD_ID"] = cloud_id
+        tools = await anyio.to_thread.run_sync(_connect_server)
 
         n_tools = len(tools)
         tool_names = ", ".join(t.get("name", "?") for t in tools)

@@ -195,12 +195,36 @@ class ChatAgent(BaseAgent):
 
         return "\n".join(lines)
 
+    @staticmethod
+    def _build_metadata_context() -> str:
+        """
+        Reads per-server account_context_json from the DB for all connected servers.
+        Builds a human-readable block injected into the planner prompt so the LLM
+        uses real authenticated values (e.g. GitHub username) instead of placeholders.
+        Survives server restarts because the data lives in SQLite, not in memory.
+        """
+        try:
+            from app.db.crud import get_all_server_account_contexts
+            db = SessionLocal()
+            all_ctx = get_all_server_account_contexts(db)
+            db.close()
+        except Exception:
+            return ""
+        if not all_ctx:
+            return ""
+        lines = ["\nCONNECTED ACCOUNT CONTEXT (use these real values when constructing arguments):"]
+        for server, meta in all_ctx.items():
+            for key, value in meta.items():
+                lines.append(f"  {server} {key.replace('_', ' ')}: {value}")
+        return "\n".join(lines)
+
     def get_available_tools(self) -> str:
         """Fetches all available tools from all connected MCP servers in the registry."""
         tools = mcp_registry.list_all_tools()
         if not tools:
             return "No active MCP servers connected. Please authenticate with Google or connect a server first."
-        return "\n".join(self._format_tool_for_planner(t) for t in tools)
+        tools_str = "\n".join(self._format_tool_for_planner(t) for t in tools)
+        return tools_str + self._build_metadata_context()
 
     def _rewrite_query_for_search(self, query: str) -> str:
         """Uses a fast LLM pass to expand the user's query with keywords likely to hit the FTS5 tool index."""
@@ -247,7 +271,8 @@ Example output: slack_send_message, google_drive_find_file"""
         tools = mcp_registry.search_tools(optimized_query, top_k=10)
         if not tools:
             return ""
-        return "\n".join(self._format_tool_for_planner(t) for t in tools)
+        tools_str = "\n".join(self._format_tool_for_planner(t) for t in tools)
+        return tools_str + self._build_metadata_context()
 
     def _get_entity_context(self) -> str:
         """Loads confirmed session entities from SQLite and returns the context block."""
@@ -927,14 +952,20 @@ Example output: slack_send_message, google_drive_find_file"""
             yield {"text": f"Generating exact parameters for `{tool_name}`...\n", "node_id": node_id, "status": "running"}
 
             # Serialize structured prior results as a JSON array for the Executor.
-            # Each entry includes the step_id, tool name, and parsed output so the
-            # Executor can extract real IDs directly from the JSON without parsing prose.
+            # shape_for_executor has already produced compact, size-bounded dicts so
+            # the Executor LLM context window is never blown out by large API payloads.
             prior_results_for_executor = [
-                {"step_id": sid, "tool": v["tool"], "output": v["output"]}
+                {
+                    "step_id": sid,
+                    "tool": v["tool"],
+                    "output": v["output"],  # already shaped — compact dict
+                }
                 for sid, v in prior_results_map.items()
             ]
 
+
             # Generate arguments live using the deterministic Executor Agent
+            # to extract dynamic IDs from prior tool results or parse from the plan.
             import asyncio
             loop = asyncio.get_running_loop()
             arguments = await loop.run_in_executor(
@@ -973,34 +1004,36 @@ Example output: slack_send_message, google_drive_find_file"""
                 result = await anyio.to_thread.run_sync(
                     lambda t=tool_name, a=arguments: mcp_registry.call_tool(t, a)
                 )
-                result_str = str(result)
-                
-                # Send the result immediately as a dedicated step_result event so the frontend
-                # can render it as a styled card the moment it lands, rather than
-                # batching it into the streaming text bubble.
+
+                # ── Response Shaper Layer ─────────────────────────────────────
+                # Parse raw result so shapers receive a Python object, not a string.
+                from app.mcp.response_shapers import shape_for_executor, shape_for_display
+                try:
+                    raw_parsed = json.loads(str(result)) if isinstance(result, str) else result
+                except (json.JSONDecodeError, TypeError):
+                    raw_parsed = result
+
+                # Compact dict for Executor LLM — only essential fields/IDs.
+                shaped_for_exec = shape_for_executor(tool_name, raw_parsed)
+                # Human-readable markdown for the user.
+                shaped_for_display = shape_for_display(tool_name, raw_parsed)
+
+                # Send the formatted result as a dedicated step_result event so
+                # the frontend renders it as a styled card immediately.
                 yield {
                     "type": "step_result",
-                    "text": f"Result for `{tool_name}`:\n{result_str}\n",
+                    "text": shaped_for_display,
                     "node_id": node_id,
                     "status": "completed",
                     "tool": tool_name,
                 }
 
-                # Collect result for next steps.
-                # Attempt to parse the result as JSON so the Executor gets a
-                # structured object it can query directly (e.g. files[].id).
-                # Fall back to storing the raw string under a "raw" key if
-                # the result is not valid JSON (plain-text tool outputs).
-                try:
-                    parsed_output = json.loads(result_str)
-                except (json.JSONDecodeError, TypeError):
-                    parsed_output = {"raw": result_str}
-
-                prior_results_map[node_id] = {"tool": tool_name, "output": parsed_output}
+                # Store shaped executor output for subsequent steps and planner context.
+                prior_results_map[node_id] = {"tool": tool_name, "output": shaped_for_exec}
                 tool_results.append({
                     "tool": tool_name,
                     "arguments": arguments,
-                    "result": result_str
+                    "result": json.dumps(shaped_for_exec, ensure_ascii=False),
                 })
             except Exception as e:
                 logger.error(f"Tool execution failed at step {i+1}: {e}\n{traceback.format_exc()}")
@@ -1066,7 +1099,52 @@ Example output: slack_send_message, google_drive_find_file"""
         # Go back to IDLE
         self.state = AgentState.IDLE
         self.plan = None
-        yield "\n\nWhat would you like to do next?"
+
+        # ── LLM Synthesis Step ───────────────────────────────────────────────
+        # Synthesize a final conversational response summarizing the tool outputs
+        # and directly answering the user's original query.
+        if tool_results:
+            yield {"text": "\n\n*Synthesizing final answer...*\n\n", "node_id": None}
+            try:
+                full_history = await self._get_history()
+                # Build context for the synthesis LLM call
+                system_prompt = (
+                    "You are Aegis, a helpful AI assistant. You just executed a plan to help the user. "
+                    "Based ONLY on the Execution Results below (and prior chat history), answer the user's most recent request directly and concisely. "
+                    "If the tools didn't return exactly what was asked (e.g. only returned a partial list due to pagination), explain that clearly. "
+                    "Do NOT say 'What would you like to do next?' unless you genuinely need their input."
+                )
+                
+                messages = [{"role": "system", "content": system_prompt}]
+                
+                # Take the last few messages, including the execution results we just appended
+                capped_history = [
+                    {"role": m["role"], "content": m["content"][-3000:]} 
+                    for m in full_history[-6:]
+                ]
+                messages.extend(capped_history)
+                
+                synthesis = ""
+                def _token_cb(t):
+                    nonlocal synthesis
+                    synthesis += t
+                    if token_callback:
+                        token_callback(t)
+
+                import asyncio
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    llm_executor, 
+                    lambda: self._call_llm_text(messages, _token_cb)
+                )
+                
+                if synthesis:
+                    await self._append_history("assistant", synthesis)
+            except Exception as e:
+                logger.error(f"Synthesis failed: {e}")
+                yield {"text": "\n\nExecution finished. What would you like to do next?", "node_id": None}
+        else:
+            yield {"text": "\n\nWhat would you like to do next?", "node_id": None}
 
     # ─────────────────────────────────────────────────────────────────────────
     # Manual Memory Extraction

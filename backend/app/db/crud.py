@@ -96,9 +96,14 @@ def sync_mcp_server_and_tools(
     server_type: str = "stdio_mcp",
     display_name: Optional[str] = None,
     tools: Optional[List[dict]] = None,
-    user_email: str = "user@aegis.local"
+    user_email: str = "user@aegis.local",
+    account_context: Optional[dict] = None,
 ) -> MCPServer:
-    """Generic function to upsert any MCP server and its discovered tools into SQLite."""
+    """
+    Generic function to upsert any MCP server and its discovered tools into SQLite.
+    `account_context` stores authenticated account metadata (e.g. GitHub username)
+    visible to the planner agent via tools_str injection.
+    """
     user = db.query(User).filter(User.email == user_email).first()
     user_id = user.id if user else 1
 
@@ -113,7 +118,8 @@ def sync_mcp_server_and_tools(
             name=server_name,
             display_name=display_name or server_name,
             server_type=server_type,
-            status="connected"
+            status="connected",
+            account_context_json=json.dumps(account_context) if account_context else None,
         )
         db.add(server)
         db.commit()
@@ -122,6 +128,8 @@ def sync_mcp_server_and_tools(
         server.status = "connected"
         if display_name:
             server.display_name = display_name
+        if account_context is not None:
+            server.account_context_json = json.dumps(account_context)
         db.commit()
 
     if tools:
@@ -162,6 +170,29 @@ def set_mcp_server_status(db: Session, server_name: str, status: str = "disconne
         server.status = status
         db.commit()
         logger.info(f"Updated server '{server_name}' status to '{status}' in SQLite.")
+
+
+def get_all_server_account_contexts(db: Session) -> dict:
+    """
+    Returns a merged dict of all connected servers' account_context_json.
+    Used by the planner to inject authenticated account info (e.g. GitHub username)
+    directly into the tool listing prompt so the LLM never guesses identifiers.
+    
+    Returns: {server_name: {key: value, ...}, ...}  (only servers with non-null context)
+    """
+    servers = db.query(MCPServer).filter(
+        MCPServer.status == "connected",
+        MCPServer.account_context_json.isnot(None)
+    ).all()
+    result = {}
+    for s in servers:
+        try:
+            ctx = json.loads(s.account_context_json)
+            if ctx:
+                result[s.name] = ctx
+        except Exception:
+            pass
+    return result
 
 
 

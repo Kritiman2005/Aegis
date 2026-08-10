@@ -57,9 +57,9 @@ HOW TO DERIVE ARGUMENT VALUES:
 - Use the user's exact words as the value (e.g., if they say "Aegis", pass "query": "Aegis").
 - Use confirmed IDs from entity memory or recent tool results (never invent placeholder IDs).
 - For tools that take a search query string (e.g., `q`, `query`, `search_query`):
-    - "list/show my repos / what do I have" → do NOT use a search tool. Find and use a LISTING tool instead (e.g., list_repositories, get_user_repositories).
+    - "list/show my X / what do I have" → FIRST look for a LISTING tool (e.g., slack_list_channels, drive_list_files). 
+    - If a specific LISTING tool DOES NOT EXIST, you MUST fall back to using a SEARCH tool (e.g., search_repositories, search_files) with a broad query or user qualifier. NEVER invent a tool name that is not in your provided list.
     - "search for X / find repos matching X" → use a SEARCH tool with the user's exact term as the query.
-    - If the user's intent is to LIST but only a SEARCH tool exists, ask a clarifying question — do NOT guess a query.
 - For tools requiring an ID (e.g., `file_id`, `message_id`, `issue_number`):
     - If the user referred to a resource by NAME and no ID exists in entity context or recent results, add a search/list step BEFORE the get/read step. Mark the get step with depends_on on the list step.
     - NEVER invent placeholder IDs like "some_file_id".
@@ -71,11 +71,11 @@ WRONG — missing required arg, causes 422:
 WRONG — using search tool when user asked to list:
 {{"step_id": "step_1", "tool": "search_repositories", "arguments": {{"q": ""}}}}
 
-CORRECT — listing when user says "show my repos":
-{{"step_id": "step_1", "tool": "list_repositories", "arguments": {{"type": "owner"}}, "depends_on": []}}
+CORRECT — listing when user says "show my channels":
+{{"step_id": "step_1", "tool": "slack_list_channels", "arguments": {{}}, "depends_on": []}}
 
-CORRECT — searching when user says "find repos about Aegis":
-{{"step_id": "step_1", "tool": "search_repositories", "arguments": {{"q": "Aegis user:Kritiman2005"}}, "depends_on": []}}
+CORRECT — searching when user says "find repos about machine learning":
+{{"step_id": "step_1", "tool": "search_repositories", "arguments": {{"q": "machine learning"}}, "depends_on": []}}
 
 CRITICAL RULE — TOOL SELECTION BY INTENT:
 Match user intent precisely to the right class of tool:

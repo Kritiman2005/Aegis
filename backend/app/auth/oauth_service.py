@@ -76,7 +76,7 @@ OAUTH_CONFIGS: Dict[str, dict] = {
         "setup_hint": "Go to Notion Integrations → New integration → Public → copy Client ID & Secret. Redirect URL: http://localhost:8000/auth/notion/callback",
     },
 
-    # ── GitHub ─────────────────────────────────────────────────────────────────
+    # ── GitHub ───────────────────────────────────────────────────────────────────────
     "github": {
         "display_name": "GitHub",
         "auth_url": "https://github.com/login/oauth/authorize",
@@ -85,12 +85,14 @@ OAUTH_CONFIGS: Dict[str, dict] = {
         "client_id_env": "GITHUB_CLIENT_ID",
         "client_secret_env": "GITHUB_CLIENT_SECRET",
         "token_auth": "params",
-        "token_response_format": "form",  # GitHub returns x-www-form-urlencoded
+        "token_response_format": "json",  # Request JSON via Accept header
         "mcp_command": ["npx", "-y", "@modelcontextprotocol/server-github"],
         "env_extraction": {
             "GITHUB_PERSONAL_ACCESS_TOKEN": ["access_token"],
         },
-        "setup_url": "https://github.com/settings/apps",
+        # After token exchange, fetch the authenticated user's login name
+        "post_token_hook": "github_fetch_username",
+        "setup_url": "https://github.com/settings/applications/new",
         "setup_hint": "GitHub → Settings → Developer settings → OAuth Apps → New → Redirect: http://localhost:8000/auth/github/callback",
     },
 
@@ -302,10 +304,11 @@ def exchange_code_for_token(
                 headers={"Accept": "application/json"},
             )
 
-    # GitHub returns URL-encoded text instead of JSON
+    # GitHub returns URL-encoded text unless we request JSON explicitly
     if config.get("token_response_format") == "form":
         parsed = parse_qs(response.text)
-        return {k: v[0] for k, v in parsed.items()}
+        # parse_qs returns lists — unwrap first element of each
+        return {k: v[0] if isinstance(v, list) and v else v for k, v in parsed.items()}
 
     response.raise_for_status()
     return response.json()
@@ -356,4 +359,30 @@ async def jira_fetch_cloud_id(access_token: str) -> Optional[str]:
                 return cloud_id
     except Exception as e:
         logger.warning("Could not fetch Jira cloud ID: %s", e)
+    return None
+
+
+async def github_fetch_username(access_token: str) -> Optional[str]:
+    """
+    Post-token hook for GitHub: fetches the authenticated user's login name
+    via GET /user so it can be injected as GITHUB_USERNAME into the MCP env.
+    This lets the planner construct correct search queries like 'user:Kritiman2005'.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(
+                "https://api.github.com/user",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+            username = data.get("login")
+            logger.info("GitHub username fetched: %s", username)
+            return username
+    except Exception as e:
+        logger.warning("Could not fetch GitHub username: %s", e)
     return None

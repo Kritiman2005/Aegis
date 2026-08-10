@@ -59,6 +59,15 @@ def init_db():
         
         # Force a rebuild on initialization to index any existing tools
         conn.execute(text("INSERT INTO mcp_tools_fts(mcp_tools_fts) VALUES('rebuild');"))
+
+        # Safe migration: add account_context_json to mcp_servers if it doesn't exist yet
+        try:
+            conn.execute(text(
+                "ALTER TABLE mcp_servers ADD COLUMN account_context_json TEXT"
+            ))
+        except Exception:
+            pass  # Column already exists — no action needed
+
         conn.commit()
 
 def get_db():

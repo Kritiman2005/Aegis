@@ -27,6 +27,21 @@ class MCPServerRegistry:
         self._clients: Dict[str, StdioMCPClient] = {}
         # tool_name -> server_name mapping
         self._tool_to_server: Dict[str, str] = {}
+        # Per-server metadata (e.g. authenticated username, org, etc.)
+        self._server_metadata: Dict[str, Dict[str, str]] = {}
+
+    def set_server_metadata(self, server_name: str, metadata: Dict[str, str]) -> None:
+        """Stores arbitrary key/value metadata for a connected server."""
+        self._server_metadata[server_name] = metadata
+        logger.info("Set metadata for server '%s': %s", server_name, list(metadata.keys()))
+
+    def get_server_metadata(self, server_name: str) -> Dict[str, str]:
+        """Returns stored metadata for a server, empty dict if none."""
+        return self._server_metadata.get(server_name, {})
+
+    def get_all_metadata(self) -> Dict[str, Dict[str, str]]:
+        """Returns all server metadata, keyed by server name."""
+        return dict(self._server_metadata)
 
     def connect_server(
         self,

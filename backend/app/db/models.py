@@ -49,6 +49,8 @@ class MCPServer(Base):
     server_type = Column(String, default="google_api")  # 'google_api', 'stdio_mcp', 'sse_mcp'
     status = Column(String, default="connected")   # 'connected', 'disconnected', 'error'
     config_json = Column(Text, nullable=True)      # JSON configuration
+    account_context_json = Column(Text, nullable=True)  # JSON: authenticated account info shown to the planner
+                                                        # e.g. {"authenticated_username": "Kritiman2005"}
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
