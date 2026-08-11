@@ -376,7 +376,20 @@ export default function ChatView({
                                         )}
                                       </div>
                                       <div className="flex-1 min-w-0">
-                                        <div className="text-xs font-semibold text-gray-900 font-mono truncate">{step.tool}</div>
+                                        <div className="flex items-center gap-1.5 flex-wrap">
+                                          <span className="text-xs font-semibold text-gray-900 font-mono truncate">{step.tool}</span>
+                                          {step.fetch_scope && step.fetch_scope !== 'single' && (
+                                            <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full uppercase tracking-wide ${
+                                              step.fetch_scope === 'exhaustive'
+                                                ? 'bg-orange-100 text-orange-700'
+                                                : step.fetch_scope === 'sample'
+                                                ? 'bg-yellow-100 text-yellow-700'
+                                                : 'bg-gray-100 text-gray-500'
+                                            }`}>
+                                              {step.fetch_scope}
+                                            </span>
+                                          )}
+                                        </div>
                                         <div className="text-[11px] text-gray-500 line-clamp-2 mt-0.5 leading-relaxed">{step.reason}</div>
                                       </div>
                                     </div>

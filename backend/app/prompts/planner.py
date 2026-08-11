@@ -11,6 +11,7 @@ Every step produces:
   - depends_on: Array of step_ids that must complete before this step
   - foreach: (Optional) A target step_id to loop over
   - arguments: A dict of concrete argument values — ALWAYS include this
+  - fetch_scope: Pagination intent — "single" | "sample" | "exhaustive"
 """
 
 
@@ -43,12 +44,16 @@ INSTRUCTIONS:
 1. Analyze the user's intent, conversation history, and entity memory.
 2. Formulate a sequence of tool steps to fulfill the user's goal.
 3. For EVERY tool step in the plan, you MUST generate:
-   - "step_id"    : A unique string ID (e.g., "step_1", "step_2").
-   - "tool"       : Exact tool name from the available MCP list above.
-   - "reason"     : Clear explanation of what this step accomplishes and why it is needed.
-   - "arguments"  : A JSON object with ALL required arguments filled in with concrete values.
-   - "depends_on" : An array of step_ids that MUST execute before this step. Empty array [] if none.
-   - "foreach"    : (Optional) If this step loops over output of a previous step, provide the target step_id. Otherwise null.
+   - "step_id"     : A unique string ID (e.g., "step_1", "step_2").
+   - "tool"        : Exact tool name from the available MCP list above.
+   - "reason"      : Clear explanation of what this step accomplishes and why it is needed.
+   - "arguments"   : A JSON object with ALL required arguments filled in with concrete values.
+   - "depends_on"  : An array of step_ids that MUST execute before this step. Empty array [] if none.
+   - "foreach"     : (Optional) If this step loops over output of a previous step, provide the target step_id. Otherwise null.
+   - "fetch_scope" : Pagination intent. MUST be one of:
+       - "single"    — fetch exactly one page. Use for queries like "latest", "most recent", "last X".
+       - "sample"    — fetch up to 3 pages. Use for queries like "recent", "a few", "some examples".
+       - "exhaustive" — fetch ALL pages until the cursor is null. Use ONLY for queries like "all", "total", "count everything", "complete list".
 
 CRITICAL RULE — ARGUMENTS ARE MANDATORY:
 Every tool step MUST include an "arguments" key with a JSON object. REQUIRED args listed in the tool schema MUST always be present with real, concrete values. NEVER call a tool with a missing required argument — this causes a hard API failure (HTTP 422).
@@ -88,6 +93,8 @@ When in doubt between listing and searching, PREFER listing (safer, no required 
 
 CRITICAL RULE — ID RESOLUTION: Many tools require a specific resource ID (e.g. `file_id`, `message_id`, `thread_id`). If the user refers to a resource by NAME and there is NO confirmed ID available in the entity context or prior results, you MUST add a listing/search step BEFORE the read/get step so the executor can obtain the real ID. NEVER plan a read/get step alone when the ID is unknown. NEVER invent placeholder values for ID arguments.
 
+CRITICAL RULE — FETCH_SCOPE SAFETY: You MUST set `fetch_scope: "single"` for ANY tool that creates, modifies, sends, or deletes data (e.g. gmail_create_draft, drive_write_file, github_create_issue). Using "exhaustive" or "sample" on a mutating tool is a hard error. When in doubt, default to "single".
+
 CRITICAL RULE — DEPENDS_ON SCOPE: `depends_on` MUST only reference step_ids that exist in the plan you are generating RIGHT NOW. NEVER reference a step_id that appeared in earlier conversation history. If you need a value from a previous execution, find it in the "RECENT TOOL RESULTS" block and use it as a LITERAL argument value in the current step.
 
 WRONG (cross-turn hallucination):
@@ -113,7 +120,8 @@ FORMAT EXAMPLE:
         "<required_arg>": "<concrete_value>"
       }},
       "depends_on": [],
-      "foreach": null
+      "foreach": null,
+      "fetch_scope": "single"
     }}
   ]
 }}

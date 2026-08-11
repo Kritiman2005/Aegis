@@ -61,6 +61,7 @@ CRITICAL RULES:
 - CRITICAL — NAME DISAMBIGUATION: When selecting a specific item (file, email, etc.) by name, you MUST match the exact name that the user stated in the Chat History. Do NOT use the Current Step Goal or Planner warning text as the name source — the Planner may have guessed wrong. Always scan the prior results yourself and pick the item whose name most closely matches what the user explicitly said.
   Example: User said "Paper-2-Draft", prior results contain both "evaluation paper 2" and "Paper-2-Draft" → you MUST use "Paper-2-Draft"'s ID, even if the step_reason mentions a different file.
 - If a parameter is optional or can be inferred safely from the user's intent (e.g. a search query string), do so.
+- SPECIAL MODE — CURSOR EXTRACTION: You may occasionally receive a request where the `Current Step Goal` says "Extract the next pagination cursor from the prior result." In that case, output ONLY a JSON object: {{"next_cursor": "<cursor_value_or_null>"}}. Read the prior result's JSON and find the pagination token (look for keys like nextCursor, next_page_token, nextPageToken, cursor, next_page). If no cursor exists or pagination is exhausted, return {{"next_cursor": null}}.
 
 Respond with valid JSON only. Do not use any markdown formatting or backticks around the JSON."""
 

@@ -59,10 +59,11 @@ def get_llm_manager():
 
 
 class AgentState:
-    IDLE                       = "IDLE"
-    WAITING_CONFIRMATION       = "WAITING_CONFIRMATION"       # User reviews plan
-    EXECUTING                  = "EXECUTING"                  # Tools running
-    WAITING_MEMORY_CONFIRMATION = "WAITING_MEMORY_CONFIRMATION"  # User decides what to remember
+    IDLE                        = "IDLE"
+    WAITING_CONFIRMATION        = "WAITING_CONFIRMATION"        # User reviews plan
+    EXECUTING                   = "EXECUTING"                   # Tools running
+    WAITING_MEMORY_CONFIRMATION = "WAITING_MEMORY_CONFIRMATION" # User decides what to remember
+    WAITING_LOOP_CONTINUATION   = "WAITING_LOOP_CONTINUATION"   # Pagination cap hit — continue or stop?
 
 
 class ChatAgent(BaseAgent):
@@ -96,6 +97,13 @@ class ChatAgent(BaseAgent):
         # if the client's WebSocket dropped during LLM inference and reconnects.
         # Cleared when the plan is confirmed, cancelled, or a new plan is built.
         self._pending_response: Optional[str] = None
+
+        # Pagination continuation state — persists across WAITING_LOOP_CONTINUATION await.
+        # Cleared when the user says "stop" or when the cursor is exhausted.
+        # Shape: {"step_index": int, "node_id": str, "tool_name": str, "cursor": str,
+        #         "inject_arg": str, "accumulated": list, "prior_results_map": dict,
+        #         "tool_results": list, "token_callback": callable|None}
+        self._pagination_state: Dict[str, Any] = {}
         
         # Instantiate sub-agents
         self.planner = PlannerAgent(llm_mgr)
@@ -359,6 +367,9 @@ Example output: slack_send_message, google_drive_find_file"""
         elif self.state == AgentState.WAITING_MEMORY_CONFIRMATION:
             return await self._handle_memory_confirmation(message)
 
+        elif self.state == AgentState.WAITING_LOOP_CONTINUATION:
+            return await self._handle_loop_continuation(message)
+
         return "Unknown state."
 
     async def _handle_idle(self, message: str, mode: str = "chat", token_callback=None, status_callback=None) -> str:
@@ -612,11 +623,14 @@ Example output: slack_send_message, google_drive_find_file"""
         self.state = AgentState.WAITING_CONFIRMATION
 
         response = "**Proposed Execution Plan:**\n\n"
+        _SCOPE_BADGES = {"single": "🔹 single", "sample": "🟡 sample", "exhaustive": "🟠 exhaustive"}
         for i, step in enumerate(self.plan):
-            response += f"**Step {i+1}: `{step.get('tool')}`**\n"
+            scope = step.get("fetch_scope", "single")
+            scope_badge = _SCOPE_BADGES.get(scope, scope)
+            response += f"**Step {i+1}: `{step.get('tool')}`** `[scope: {scope_badge}]`\n"
             if step.get("reason"):
                 response += f"> {step.get('reason')}\n"
-            
+
             depends = step.get("depends_on")
             if depends:
                 response += f"- *Depends on:* {', '.join(depends)}\n"
@@ -896,6 +910,55 @@ Example output: slack_send_message, google_drive_find_file"""
         )
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Loop continuation (pagination cap-hit resume)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _handle_loop_continuation(self, message: str) -> str:
+        """WAITING_LOOP_CONTINUATION → user says keep going or stop."""
+        await self._append_history("user", message)
+
+        positive_keywords = ["yes", "continue", "keep going", "more", "go ahead", "proceed"]
+        is_continue = any(word in message.lower() for word in positive_keywords)
+
+        ps = self._pagination_state
+        if not ps:
+            self.state = AgentState.IDLE
+            return "No pagination state found. What would you like to do next?"
+
+        tool_results: list = ps.get("tool_results", [])
+        token_callback = ps.get("token_callback")
+
+        if not is_continue:
+            # User said stop — proceed with what we have
+            self._pagination_state = {}
+            self.state = AgentState.IDLE
+            response = (
+                "Got it — proceeding with the data collected so far.\n\n"
+                "*Synthesizing final answer...*"
+            )
+            await self._append_history("assistant", response)
+            # Synthesis is handled after this returns, by the execute_plan caller
+            # who checks tool_results. We trigger it by returning a special marker
+            # that websocket.py can detect and route to the synthesis streaming path.
+            return "__system_pagination_stopped__"
+
+        # User said continue — resume loop with fresh page counter
+        # The cap_hit steps need to continue from where they left off.
+        # For simplicity, we re-set executing state and let the generator
+        # resume via a new execute_plan call, but with the page state injected.
+        # Since execute_plan is a generator, the cleanest approach is to continue
+        # from the saved cursor in a dedicated resume pass.
+        cap_hit_steps = ps.get("cap_hit_steps", [])
+        prior_results_map = ps.get("prior_results_map", {})
+
+        # Re-enter EXECUTING to allow execute_plan_resume to run
+        self.state = AgentState.EXECUTING
+        cap_tool_list = ", ".join(f"`{r['tool']}`" for r in cap_hit_steps)
+        response = f"Continuing to fetch more pages for: {cap_tool_list}..."
+        await self._append_history("assistant", response)
+        return response
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Plan execution
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -927,6 +990,12 @@ Example output: slack_send_message, google_drive_find_file"""
         ]
         full_chat_history = json.dumps(trimmed_history, indent=2)
         entity_context = self._get_entity_context()
+
+        from app.mcp.pagination_registry import get_next_cursor, is_tool_safe_to_autoloop
+
+        # Pagination constants
+        _PAGE_CAP = 20         # max pages per step for exhaustive scope
+        _SAMPLE_CAP = 3        # max pages for sample scope
 
         # Run each tool step and collect raw results
         tool_results: List[Dict] = []
@@ -963,9 +1032,7 @@ Example output: slack_send_message, google_drive_find_file"""
                 for sid, v in prior_results_map.items()
             ]
 
-
             # Generate arguments live using the deterministic Executor Agent
-            # to extract dynamic IDs from prior tool results or parse from the plan.
             import asyncio
             loop = asyncio.get_running_loop()
             arguments = await loop.run_in_executor(
@@ -1001,39 +1068,106 @@ Example output: slack_send_message, google_drive_find_file"""
                 return
 
             try:
-                result = await anyio.to_thread.run_sync(
-                    lambda t=tool_name, a=arguments: mcp_registry.call_tool(t, a)
+                from app.mcp.response_shapers import shape_for_executor, shape_for_display
+
+                # ── Pagination-aware execution loop ────────────────────────────
+                fetch_scope = step.get("fetch_scope", "single")
+
+                # Determine page cap and safety based on scope
+                if fetch_scope == "exhaustive":
+                    page_cap = _PAGE_CAP
+                    safe_to_loop = is_tool_safe_to_autoloop(tool_name, schema)
+                elif fetch_scope == "sample":
+                    page_cap = _SAMPLE_CAP
+                    safe_to_loop = is_tool_safe_to_autoloop(tool_name, schema)
+                else:  # "single" or unrecognized
+                    page_cap = 1
+                    safe_to_loop = True  # single page — gate irrelevant
+
+                accumulated_items: List[Any] = []
+                current_arguments = dict(arguments)
+                prev_cursor_value = None
+                cap_hit = False
+                auto_paginated = False
+
+                for page_num in range(page_cap):
+                    if page_num == 0:
+                        yield {"text": f"Running `{tool_name}` (page 1)...\n", "node_id": node_id, "status": "running"}
+                    else:
+                        yield {"text": f"Auto-fetching page {page_num + 1} for `{tool_name}`...\n", "node_id": node_id, "status": "running"}
+                        auto_paginated = True
+
+                    result = await anyio.to_thread.run_sync(
+                        lambda t=tool_name, a=dict(current_arguments): mcp_registry.call_tool(t, a)
+                    )
+
+                    # Parse raw result
+                    try:
+                        raw_parsed = json.loads(str(result)) if isinstance(result, str) else result
+                    except (json.JSONDecodeError, TypeError):
+                        raw_parsed = result
+
+                    shaped_for_exec = shape_for_executor(tool_name, raw_parsed)
+                    shaped_for_display = shape_for_display(tool_name, raw_parsed)
+                    accumulated_items.append(shaped_for_exec)
+
+                    # Stream page result to UI immediately
+                    yield {
+                        "type": "step_result",
+                        "text": shaped_for_display,
+                        "node_id": node_id,
+                        "status": "completed",
+                        "tool": tool_name,
+                    }
+
+                    # Decide whether to fetch next page
+                    if page_cap == 1:
+                        break  # single scope — done
+
+                    if not safe_to_loop:
+                        logger.warning(
+                            f"[Pagination] Tool '{tool_name}' failed safety gate — "
+                            "stopping after page 1 (mutating or unreviewed tool)"
+                        )
+                        break
+
+                    # Deterministic cursor extraction
+                    cursor_info = get_next_cursor(
+                        tool_name, raw_parsed if isinstance(raw_parsed, dict) else {}
+                    )
+                    if cursor_info is None:
+                        break  # cursor exhausted — pagination complete
+
+                    new_cursor = cursor_info["cursor_value"]
+                    if new_cursor == prev_cursor_value:
+                        logger.warning(f"[Pagination] Stall detected for '{tool_name}' — cursor unchanged.")
+                        break
+
+                    prev_cursor_value = new_cursor
+                    current_arguments = dict(arguments)
+                    current_arguments[cursor_info["inject_arg"]] = new_cursor
+                else:
+                    cap_hit = True  # loop ran to completion without a break
+
+                # Merge accumulated pages into final result
+                final_exec_output = (
+                    accumulated_items[0] if len(accumulated_items) == 1
+                    else {
+                        "pages": accumulated_items,
+                        "total_pages_fetched": len(accumulated_items),
+                        "auto_paginated": auto_paginated,
+                        "cap_hit": cap_hit,
+                    }
                 )
 
-                # ── Response Shaper Layer ─────────────────────────────────────
-                # Parse raw result so shapers receive a Python object, not a string.
-                from app.mcp.response_shapers import shape_for_executor, shape_for_display
-                try:
-                    raw_parsed = json.loads(str(result)) if isinstance(result, str) else result
-                except (json.JSONDecodeError, TypeError):
-                    raw_parsed = result
-
-                # Compact dict for Executor LLM — only essential fields/IDs.
-                shaped_for_exec = shape_for_executor(tool_name, raw_parsed)
-                # Human-readable markdown for the user.
-                shaped_for_display = shape_for_display(tool_name, raw_parsed)
-
-                # Send the formatted result as a dedicated step_result event so
-                # the frontend renders it as a styled card immediately.
-                yield {
-                    "type": "step_result",
-                    "text": shaped_for_display,
-                    "node_id": node_id,
-                    "status": "completed",
-                    "tool": tool_name,
-                }
-
                 # Store shaped executor output for subsequent steps and planner context.
-                prior_results_map[node_id] = {"tool": tool_name, "output": shaped_for_exec}
+                prior_results_map[node_id] = {"tool": tool_name, "output": final_exec_output}
                 tool_results.append({
                     "tool": tool_name,
                     "arguments": arguments,
-                    "result": json.dumps(shaped_for_exec, ensure_ascii=False),
+                    "result": json.dumps(final_exec_output, ensure_ascii=False),
+                    "auto_paginated": auto_paginated,
+                    "cap_hit": cap_hit,
                 })
             except Exception as e:
                 logger.error(f"Tool execution failed at step {i+1}: {e}\n{traceback.format_exc()}")
@@ -1070,6 +1204,26 @@ Example output: slack_send_message, google_drive_find_file"""
                 self.state = AgentState.IDLE
                 self.plan = None
                 return
+
+        # Check if any step hit the pagination cap — if so, offer to continue
+        cap_hit_steps = [r for r in tool_results if r.get("cap_hit")]
+        if cap_hit_steps:
+            # Save state needed to resume from where we left off
+            self._pagination_state = {
+                "tool_results": tool_results,
+                "prior_results_map": prior_results_map,
+                "cap_hit_steps": cap_hit_steps,
+                "token_callback": token_callback,
+            }
+            self.state = AgentState.WAITING_LOOP_CONTINUATION
+            cap_tool_names = ", ".join(f"`{r['tool']}`" for r in cap_hit_steps)
+            prompt = (
+                f"\n\n⚠️ **Pagination cap reached** for {cap_tool_names}. "
+                "I've fetched as many pages as allowed but may not have the full picture yet.\n\n"
+                "**Continue fetching more pages?** Reply **'yes'** to fetch another batch or **'no'** to proceed with what I have."
+            )
+            yield {"text": prompt, "node_id": None, "status": "waiting"}
+            return
 
         yield {"text": "\nExecution complete!", "node_id": None}
 
