@@ -49,7 +49,8 @@ class MCPServerRegistry:
         command: List[str],
         env: Optional[Dict[str, str]] = None,
         db: Optional[Session] = None,
-        server_type: str = "stdio_mcp"
+        server_type: str = "stdio_mcp",
+        config_json: Optional[dict] = None
     ) -> List[dict]:
         """
         Spawns an MCP server subprocess, performs initialization, fetches available tools,
@@ -87,7 +88,8 @@ class MCPServerRegistry:
                 server_name=server_name,
                 server_type=server_type,
                 display_name=server_name.replace("_", " ").title(),
-                tools=tools
+                tools=tools,
+                config_json=config_json
             )
 
         return tools

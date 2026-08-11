@@ -119,108 +119,117 @@ async def websocket_endpoint(
             if msg_type == "message" and content.strip():
                 logger.info(f"[WS:{connection_id[:8]}] User: {content[:80]!r}")
 
-                try:
-                    streamed = False
-                    loop = asyncio.get_running_loop()
-                    token_queue = asyncio.Queue()
+                if getattr(session, 'is_processing', False):
+                    await manager.send_json(connection_id, {
+                        "type": "toast",
+                        "content": "Agent is currently busy processing another request."
+                    })
+                    continue
 
-                    def send_token_sync(token: str):
-                        nonlocal streamed
-                        streamed = True
-                        loop.call_soon_threadsafe(token_queue.put_nowait, token)
+                async def process_message_task(msg_content: str, msg_mode: str):
+                    session.is_processing = True
+                    try:
+                        streamed = False
+                        loop = asyncio.get_running_loop()
+                        token_queue = asyncio.Queue()
 
-                    async def token_sender_loop():
-                        while True:
-                            token = await token_queue.get()
-                            if token is None:
-                                break
-                            await manager.send_json(connection_id, {
-                                "type": "token",
-                                "content": token
-                            })
+                        def send_token_sync(token: str):
+                            nonlocal streamed
+                            streamed = True
+                            loop.call_soon_threadsafe(token_queue.put_nowait, token)
 
-                    sender_task = asyncio.create_task(token_sender_loop())
-
-                    async def send_status(msg: str):
-                        await manager.send_json(connection_id, {
-                            "type": "toast",
-                            "content": msg
-                        })
-
-                    # Process the message through the state machine
-                    await send_status("Analyzing request...")
-                    response_text = await session.handle_message(
-                        content, 
-                        mode, 
-                        token_callback=send_token_sync,
-                        status_callback=send_status
-                    )
-                    
-                    # Stop the token sender task
-                    loop.call_soon_threadsafe(token_queue.put_nowait, None)
-                    await sender_task
-
-                    if response_text.startswith("__system_toast__:"):
-                        toast_msg = response_text.split(":", 1)[1]
-                        await manager.send_json(connection_id, {
-                            "type": "toast",
-                            "content": toast_msg
-                        })
-                    else:
-                        # Send the response directly only if we didn't stream it token-by-token
-                        if not streamed:
-                            await manager.send_json(connection_id, {
-                                "type": "token",
-                                "content": response_text
-                            })
-
-                        # Signal end of stream
-                        await manager.send_json(connection_id, {
-                            "type": "done",
-                            "content": "",
-                        })
-                    
-                    if session.state == AgentState.EXECUTING:
-                        # Stream the execution progress token by token
-                        async for progress in session.execute_plan():
-                            if isinstance(progress, dict):
-                                if progress.get("type") == "step_result":
-                                    # Dedicated step result card — send immediately with its own type
-                                    # so the frontend can render it as a distinct styled block.
-                                    await manager.send_json(connection_id, {
-                                        "type": "step_result",
-                                        "content": progress.get("text", ""),
-                                        "node_id": progress.get("node_id"),
-                                        "status": progress.get("status"),
-                                        "tool": progress.get("tool"),
-                                    })
-                                else:
-                                    # Progress/status update (running, failed, generating params…)
-                                    await manager.send_json(connection_id, {
-                                        "type": "token",
-                                        "content": progress.get("text", ""),
-                                        "node_id": progress.get("node_id"),
-                                        "status": progress.get("status")
-                                    })
-                            else:
+                        async def token_sender_loop():
+                            while True:
+                                token = await token_queue.get()
+                                if token is None:
+                                    break
                                 await manager.send_json(connection_id, {
                                     "type": "token",
-                                    "content": progress
+                                    "content": token
                                 })
 
-                        # End stream when execution finishes
-                        # (state is now IDLE or WAITING_MEMORY_CONFIRMATION)
-                        await manager.send_json(connection_id, {
-                            "type": "done",
-                            "content": "",
-                        })
+                        sender_task = asyncio.create_task(token_sender_loop())
 
-                except Exception as exc:
-                    logger.error(f"[WS:{connection_id[:8]}] Workflow error: {exc}")
-                    await manager.send_json(connection_id, {
-                        "type": "error",
-                        "content": f"Workflow failed: {str(exc)}",
-                    })
+                        async def send_status(msg: str):
+                            await manager.send_json(connection_id, {
+                                "type": "toast",
+                                "content": msg
+                            })
+
+                        # Process the message through the state machine
+                        await send_status("Analyzing request...")
+                        response_text = await session.handle_message(
+                            msg_content, 
+                            msg_mode, 
+                            token_callback=send_token_sync,
+                            status_callback=send_status
+                        )
+                        
+                        # Stop the token sender task
+                        loop.call_soon_threadsafe(token_queue.put_nowait, None)
+                        await sender_task
+
+                        if response_text.startswith("__system_toast__:"):
+                            toast_msg = response_text.split(":", 1)[1]
+                            await manager.send_json(connection_id, {
+                                "type": "toast",
+                                "content": toast_msg
+                            })
+                        else:
+                            # Send the response directly only if we didn't stream it token-by-token
+                            if not streamed:
+                                await manager.send_json(connection_id, {
+                                    "type": "token",
+                                    "content": response_text
+                                })
+
+                            # Signal end of stream
+                            await manager.send_json(connection_id, {
+                                "type": "done",
+                                "content": "",
+                            })
+                        
+                        if session.state == AgentState.EXECUTING:
+                            # Stream the execution progress token by token
+                            async for progress in session.execute_plan():
+                                if isinstance(progress, dict):
+                                    if progress.get("type") == "step_result":
+                                        await manager.send_json(connection_id, {
+                                            "type": "step_result",
+                                            "content": progress.get("text", ""),
+                                            "node_id": progress.get("node_id"),
+                                            "status": progress.get("status"),
+                                            "tool": progress.get("tool"),
+                                        })
+                                    else:
+                                        await manager.send_json(connection_id, {
+                                            "type": "token",
+                                            "content": progress.get("text", ""),
+                                            "node_id": progress.get("node_id"),
+                                            "status": progress.get("status")
+                                        })
+                                else:
+                                    await manager.send_json(connection_id, {
+                                        "type": "token",
+                                        "content": progress
+                                    })
+
+                            # End stream when execution finishes
+                            await manager.send_json(connection_id, {
+                                "type": "done",
+                                "content": "",
+                            })
+
+                    except Exception as e:
+                        logger.error(f"Error processing message: {e}", exc_info=True)
+                        await manager.send_json(connection_id, {
+                            "type": "error",
+                            "content": "An internal error occurred while processing your request.",
+                        })
+                    finally:
+                        session.is_processing = False
+
+                asyncio.create_task(process_message_task(content, mode))
 
             # ── Handle Memory Saving Paths ─────────────────────────────────────
             elif msg_type == "save_whole_message" and content.strip():

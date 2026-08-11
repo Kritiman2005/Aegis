@@ -66,16 +66,16 @@ HOW TO DERIVE ARGUMENT VALUES:
 
 EXAMPLES:
 WRONG — missing required arg, causes 422:
-{{"step_id": "step_1", "tool": "search_repositories", "arguments": {{}}}}
+{{"step_id": "step_1", "tool": "example_search_tool", "arguments": {{}}}}
 
 WRONG — using search tool when user asked to list:
-{{"step_id": "step_1", "tool": "search_repositories", "arguments": {{"q": ""}}}}
+{{"step_id": "step_1", "tool": "example_search_tool", "arguments": {{"q": ""}}}}
 
 CORRECT — listing when user says "show my channels":
-{{"step_id": "step_1", "tool": "slack_list_channels", "arguments": {{}}, "depends_on": []}}
+{{"step_id": "step_1", "tool": "example_list_tool", "arguments": {{}}, "depends_on": []}}
 
-CORRECT — searching when user says "find repos about machine learning":
-{{"step_id": "step_1", "tool": "search_repositories", "arguments": {{"q": "machine learning"}}, "depends_on": []}}
+CORRECT — searching when user says "find records about machine learning":
+{{"step_id": "step_1", "tool": "example_search_tool", "arguments": {{"q": "machine learning"}}, "depends_on": []}}
 
 CRITICAL RULE — TOOL SELECTION BY INTENT:
 Match user intent precisely to the right class of tool:

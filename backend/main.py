@@ -113,6 +113,48 @@ async def on_startup():
                 _logger.error(f"Failed to auto-restore Google Workspace MCP server: {e}")
         else:
             _logger.info("No saved Google OAuth credentials found in SQLite.")
+            
+        # Auto-restore other connected MCP servers
+        from app.db.crud import get_all_connected_servers
+        from app.mcp.catalog import resolve_connector_command
+        import json
+        
+        connected_servers = get_all_connected_servers(db)
+        for server in connected_servers:
+            if server.name == "google_workspace":
+                continue  # already handled above
+                
+            if not server.config_json:
+                _logger.warning(f"Server '{server.name}' is marked connected but has no config_json. Cannot auto-restore.")
+                continue
+                
+            try:
+                config = json.loads(server.config_json)
+                config_type = config.get("type")
+                
+                if config_type == "catalog":
+                    command = resolve_connector_command(config["server_name"], config.get("input_params") or {})
+                    mcp_registry.connect_server(
+                        server_name=config["server_name"],
+                        command=command,
+                        env=config.get("env"),
+                        db=db,
+                        config_json=config
+                    )
+                    _logger.info(f"Auto-restored catalog MCP server '{server.name}' from SQLite!")
+                elif config_type == "custom":
+                    mcp_registry.connect_server(
+                        server_name=config["server_name"],
+                        command=config["command"],
+                        env=config.get("env"),
+                        db=db,
+                        config_json=config
+                    )
+                    _logger.info(f"Auto-restored custom MCP server '{server.name}' from SQLite!")
+                else:
+                    _logger.warning(f"Unknown config type '{config_type}' for server '{server.name}'")
+            except Exception as e:
+                _logger.error(f"Failed to auto-restore MCP server '{server.name}': {e}")
 
 @app.on_event("shutdown")
 def on_shutdown():

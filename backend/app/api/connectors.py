@@ -91,11 +91,18 @@ def connect_from_catalog(req: ConnectCatalogRequest, db: Session = Depends(get_d
 
     try:
         command = resolve_connector_command(req.server_name, req.input_params or {})
+        config_json = {
+            "type": "catalog",
+            "server_name": req.server_name,
+            "env": req.env,
+            "input_params": req.input_params
+        }
         tools = mcp_registry.connect_server(
             server_name=req.server_name,
             command=command,
             env=req.env,
-            db=db
+            db=db,
+            config_json=config_json
         )
         return {
             "message": f"Successfully connected catalog connector '{cat_item['display_name']}'",
@@ -115,11 +122,18 @@ def connect_custom(req: ConnectCustomServerRequest, db: Session = Depends(get_db
     Performs handshake, fetches tools dynamically, and persists to SQLite.
     """
     try:
+        config_json = {
+            "type": "custom",
+            "server_name": req.server_name,
+            "command": req.command,
+            "env": req.env
+        }
         tools = mcp_registry.connect_server(
             server_name=req.server_name,
             command=req.command,
             env=req.env,
-            db=db
+            db=db,
+            config_json=config_json
         )
         return {
             "message": f"Successfully connected custom MCP server '{req.server_name}'",

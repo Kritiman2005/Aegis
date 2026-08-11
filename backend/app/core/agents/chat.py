@@ -73,6 +73,7 @@ class ChatAgent(BaseAgent):
         self.connection_id = connection_id
         self._state = AgentState.IDLE
         self.state_entered_at = time.time()
+        self.is_processing = False
         self.plan: Optional[List[Dict]] = None
 
         # Entities proposed after execution — awaiting user confirmation
@@ -490,14 +491,6 @@ Example output: slack_send_message, google_drive_find_file"""
         else:
             raw_plan = plan_data.get("plan", [])
             
-        # Handle clarification escape hatch
-        if isinstance(plan_data, dict) and plan_data.get("clarifying_question"):
-            question = plan_data.get("clarifying_question")
-            self.state = AgentState.IDLE
-            await self._append_history("assistant", question)
-
-            return question
-        
         # Filter out placeholder tools that the LLM might hallucinate when no tools are needed
         valid_plan = []
         for step in raw_plan:
@@ -506,7 +499,14 @@ Example output: slack_send_message, google_drive_find_file"""
                 if tool_name not in ("none", "none_available", "null", "n/a", "unknown"):
                     valid_plan.append(step)
         raw_plan = valid_plan
-        
+
+        # Handle clarification escape hatch ONLY if no valid plan steps were generated
+        if not raw_plan and isinstance(plan_data, dict) and plan_data.get("clarifying_question"):
+            question = plan_data.get("clarifying_question")
+            self.state = AgentState.IDLE
+            await self._append_history("assistant", question)
+
+            return question
         # Basic validation
         validation_errors = []
         for step in raw_plan:
@@ -975,7 +975,7 @@ Example output: slack_send_message, google_drive_find_file"""
                     tool_schema=schema,
                     overall_plan=self.plan,
                     step_reason=step_reason,
-                    prior_results=json.dumps(prior_results_for_executor, indent=2, default=str),
+                    prior_results=prior_results_for_executor,
                     entity_context=entity_context,
                     user_request=full_chat_history
                 )

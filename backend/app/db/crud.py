@@ -98,6 +98,7 @@ def sync_mcp_server_and_tools(
     tools: Optional[List[dict]] = None,
     user_email: str = "user@aegis.local",
     account_context: Optional[dict] = None,
+    config_json: Optional[dict] = None,
 ) -> MCPServer:
     """
     Generic function to upsert any MCP server and its discovered tools into SQLite.
@@ -120,6 +121,7 @@ def sync_mcp_server_and_tools(
             server_type=server_type,
             status="connected",
             account_context_json=json.dumps(account_context) if account_context else None,
+            config_json=json.dumps(config_json) if config_json else None,
         )
         db.add(server)
         db.commit()
@@ -130,6 +132,8 @@ def sync_mcp_server_and_tools(
             server.display_name = display_name
         if account_context is not None:
             server.account_context_json = json.dumps(account_context)
+        if config_json is not None:
+            server.config_json = json.dumps(config_json)
         db.commit()
 
     if tools:
@@ -499,3 +503,7 @@ def log_setting_change(db: Session, setting_path: str, old_value: str, new_value
         if ids_to_delete:
             db.query(SettingsHistory).filter(SettingsHistory.id.in_(ids_to_delete)).delete(synchronize_session=False)
             db.commit()
+
+def get_all_connected_servers(db: Session) -> List[MCPServer]:
+    """Returns all servers marked as connected in the DB."""
+    return db.query(MCPServer).filter(MCPServer.status == "connected").all()
