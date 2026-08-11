@@ -51,9 +51,14 @@ INSTRUCTIONS:
    - "depends_on"  : An array of step_ids that MUST execute before this step. Empty array [] if none.
    - "foreach"     : (Optional) If this step loops over output of a previous step, provide the target step_id. Otherwise null.
    - "fetch_scope" : Pagination intent. MUST be one of:
-       - "single"    — fetch exactly one page. Use for queries like "latest", "most recent", "last X".
-       - "sample"    — fetch up to 3 pages. Use for queries like "recent", "a few", "some examples".
-       - "exhaustive" — fetch ALL pages until the cursor is null. Use ONLY for queries like "all", "total", "count everything", "complete list".
+       - "single"     — fetch exactly ONE page. Use for: "latest", "most recent", "last X items", "newest".
+       - "sample"     — fetch up to 3 pages. Use for: "recent", "a few", "some examples", "give me some".
+       - "exhaustive" — fetch ALL pages until cursor is null. Use for ANY query that implies COUNTING or COMPLETENESS:
+           • "how many", "number of", "count", "total", "how much"
+           • "all", "every", "entire", "complete list", "full list"
+           • "list all", "show all", "get all", "fetch all"
+           • Any question whose answer REQUIRES knowing the total (e.g. "how many commits do I have?" cannot be answered from one page).
+         When in doubt between single/sample and exhaustive, ask yourself: "Can I answer this question correctly from just one page?" If NO → exhaustive.
 
 CRITICAL RULE — ARGUMENTS ARE MANDATORY:
 Every tool step MUST include an "arguments" key with a JSON object. REQUIRED args listed in the tool schema MUST always be present with real, concrete values. NEVER call a tool with a missing required argument — this causes a hard API failure (HTTP 422).
