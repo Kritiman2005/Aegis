@@ -142,6 +142,17 @@ async def on_startup():
                         config_json=config
                     )
                     _logger.info(f"Auto-restored catalog MCP server '{server.name}' from SQLite!")
+                elif config_type == "oauth":
+                    # OAuth servers (GitHub, Slack, Notion, etc.) store their access token
+                    # inside env_vars at connect time. Re-launch using the saved command + env.
+                    mcp_registry.connect_server(
+                        server_name=config["service_name"],
+                        command=config["command"],
+                        env=config.get("env"),
+                        db=db,
+                        config_json=config
+                    )
+                    _logger.info(f"Auto-restored OAuth MCP server '{server.name}' from SQLite!")
                 elif config_type == "custom":
                     mcp_registry.connect_server(
                         server_name=config["server_name"],
