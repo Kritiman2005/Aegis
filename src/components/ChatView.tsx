@@ -178,28 +178,67 @@ export default function ChatView({
       {/* ── Chat Messages Thread (Matching Image 2) ─────────────────────────── */}
       <div className="flex-1 overflow-y-auto p-6 md:p-8 space-y-6" onScroll={handleScroll}>
         {messages.length === 0 && !streamingContent && !isStreaming ? (
-          /* Welcome Banner when starting new chat */
-          <div className="h-full flex flex-col items-center justify-center text-center max-w-md mx-auto my-auto py-12">
-            <div className="w-12 h-12 rounded-2xl bg-black flex items-center justify-center text-white text-xl mb-4 shadow-md">
-              <Zap className="w-6 h-6 fill-white text-black" />
-            </div>
-            <h3 className="text-lg font-bold text-gray-900">How can Aegis assist you today?</h3>
-            <p className="text-xs text-gray-500 mt-1.5 leading-relaxed">
-              Connected to local AI engine & active MCP tools. Ask me to search documents, draft emails, query databases, or post updates.
+          /* ── Landing Page (matching reference image 1) ──────────────────── */
+          <div className="h-full flex flex-col items-center justify-center text-center px-8">
+            <h2 className="text-2xl font-bold text-gray-900 mb-2">
+              Hey Kritiman! Where shall we begin with?
+            </h2>
+            <p className="text-sm text-gray-400 mb-10">
+              Aegis is ready to help — ask anything or pick a suggestion below.
             </p>
-            <div className="grid grid-cols-2 gap-2 mt-6 w-full text-left">
+
+            {/* Suggestion Cards */}
+            <div className="w-full max-w-lg space-y-3">
               {[
-                'Draft a follow-up email on Gmail',
-                'Check recent pull requests on GitHub',
-                'Find candidate resume in Google Drive',
-                'Post status update to Slack channel'
-              ].map((sample) => (
+                {
+                  label: 'Draft a mail',
+                  icon: (
+                    <svg viewBox="0 0 24 24" className="w-5 h-5" fill="none">
+                      <rect width="20" height="16" x="2" y="4" rx="2" fill="none" stroke="#EA4335" strokeWidth="1.5"/>
+                      <path d="M2 6l10 7 10-7" stroke="#EA4335" strokeWidth="1.5" strokeLinecap="round"/>
+                    </svg>
+                  ),
+                  prompt: 'Draft a professional email for me',
+                },
+                {
+                  label: 'Check the items in the drive',
+                  icon: (
+                    <svg viewBox="0 0 24 24" className="w-5 h-5" fill="none">
+                      <path d="M12 2L2 19h7l3-5.2L15 19h7L12 2z" fill="#4285F4" opacity="0.9"/>
+                      <path d="M12 2l3 5.2H9L12 2z" fill="#0066DA"/>
+                      <path d="M9 7.2L2 19h7l3-5.2-3-6.6z" fill="#00AC47" opacity="0.9"/>
+                      <path d="M15 7.2L12 13.8l3 5.2h7L15 7.2z" fill="#FFBA00" opacity="0.9"/>
+                    </svg>
+                  ),
+                  prompt: 'Check the items in my Google Drive',
+                },
+                {
+                  label: 'Show my recent commits on GitHub',
+                  icon: (
+                    <svg viewBox="0 0 24 24" className="w-5 h-5" fill="#24292e">
+                      <path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/>
+                    </svg>
+                  ),
+                  prompt: 'Show my recent commits on GitHub',
+                },
+                {
+                  label: 'Search my Notion workspace',
+                  icon: (
+                    <svg viewBox="0 0 24 24" className="w-5 h-5" fill="none">
+                      <rect width="18" height="20" x="3" y="2" rx="3" fill="#191919"/>
+                      <path d="M6 7h12M6 11h8M6 15h10" stroke="white" strokeWidth="1.5" strokeLinecap="round"/>
+                    </svg>
+                  ),
+                  prompt: 'Search my Notion workspace',
+                },
+              ].map(({ label, icon, prompt }) => (
                 <button
-                  key={sample}
-                  onClick={() => onSendMessage(sample, 'message', chatMode)}
-                  className="p-3 rounded-xl bg-white border border-gray-200 text-xs text-gray-700 hover:border-gray-400 hover:shadow-sm transition-all"
+                  key={label}
+                  onClick={() => onSendMessage(prompt, 'message', chatMode)}
+                  className="w-full flex items-center gap-4 px-5 py-3.5 bg-white border border-gray-200 rounded-2xl text-sm text-gray-700 hover:border-[#5B50F0]/40 hover:shadow-sm transition-all text-left group"
                 >
-                  {sample}
+                  <span className="flex-shrink-0">{icon}</span>
+                  <span className="font-medium group-hover:text-gray-900 transition-colors">{label}</span>
                 </button>
               ))}
             </div>
@@ -316,7 +355,7 @@ export default function ChatView({
                             <ReactMarkdown 
                               remarkPlugins={[remarkGfm]}
                               components={{
-                                code({node, inline, className, children, ...props}) {
+                                code({node, className, children, ...props}) {
                                   // Hide JSON plan blocks from text rendering, as they are handled by Canvas
                                   if (msg.content.includes('Proposed Execution Plan') && className === 'language-json') {
                                     return null;
@@ -651,7 +690,7 @@ export default function ChatView({
                     <ReactMarkdown 
                       remarkPlugins={[remarkGfm]}
                       components={{
-                        code({node, inline, className, children, ...props}) {
+                        code({node, className, children, ...props}) {
                           if (streamingContent.includes('Proposed Execution Plan') && className === 'language-json') {
                             return null;
                           }
@@ -749,20 +788,20 @@ export default function ChatView({
               </button>
             </div>
 
-            {/* Right Buttons: Sparkles + Dark Send Button */}
+            {/* Right Buttons: Models toggle + Send Button */}
             <div className="flex items-center gap-2 pointer-events-auto">
-              <button className="p-1.5 text-purple-600 hover:text-purple-800 transition-colors">
-                <Sparkles className="w-4 h-4" />
+              {/* Mode/Models dropdown pill */}
+              <button
+                onClick={() => setChatMode(chatMode === 'chat' ? 'agent' : 'chat')}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-gray-100 hover:bg-gray-200 text-gray-700 transition-colors"
+              >
+                {chatMode === 'agent' ? <><Sparkles className="w-3.5 h-3.5 text-[#5B50F0]" /> Agent</> : <>Models <CornerDownLeft className="w-3 h-3" /></>}
               </button>
 
               <button
                 onClick={handleSend}
                 disabled={!inputVal.trim() || isStreaming || status !== 'connected'}
-                className={`w-8 h-8 rounded-xl text-white flex items-center justify-center transition-all shadow-sm disabled:opacity-30 ${
-                  chatMode === 'agent' 
-                    ? 'bg-indigo-600 hover:bg-indigo-700 disabled:hover:bg-indigo-600' 
-                    : 'bg-black hover:bg-neutral-800 disabled:hover:bg-black'
-                }`}
+                className="w-8 h-8 rounded-full bg-[#5B50F0] hover:bg-[#4A40E0] text-white flex items-center justify-center transition-all shadow-sm disabled:opacity-30"
               >
                 <Send className="w-3.5 h-3.5" />
               </button>

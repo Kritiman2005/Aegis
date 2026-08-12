@@ -7,23 +7,21 @@
 /* ─── Design Tokens (Aegis Clean Light System matching stitch mockup) ──── */
 
 :root {
-  --bg-app:          #F8F9FA;
-  --bg-sidebar:      #FAFAFA;
+  --bg-app:          #F4F5F7;
+  --bg-sidebar:      #FFFFFF;
   --bg-card:         #FFFFFF;
-  --border-subtle:   #E5E7EB;
+  --border-subtle:   #E8EAED;
   --border-strong:   #D1D5DB;
   --text-main:       #111827;
   --text-muted:      #6B7280;
   --text-sub:        #9CA3AF;
+  --primary:         #5B50F0;
+  --primary-hover:   #4A40E0;
   --primary-black:   #09090B;
-  --primary-accent:  #4F46E5;
-  --accent-purple:   #6366F1;
   --badge-green:     #10B981;
   --badge-green-bg:  #ECFDF5;
-  --badge-purple:    #8B5CF6;
-  --badge-purple-bg: #F5F3FF;
-  --badge-teal:      #14B8A6;
-  --badge-teal-bg:   #CCFBF1;
+  --badge-blue:      #3B82F6;
+  --badge-blue-bg:   #EFF6FF;
 }
 
 *,

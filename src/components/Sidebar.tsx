@@ -1,148 +1,112 @@
 'use client';
 
+import { useState } from 'react';
 import { 
-  PlusCircle, 
-  History, 
-  Blocks, 
-  Settings, 
-  User, 
-  HelpCircle, 
-  Shield,
-  SlidersHorizontal
+  Link2,
+  Cpu,
+  Compass,
+  MessageSquarePlus,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 
-export type TabType = 'chat' | 'connectors' | 'settings' | 'history' | 'sync_detail' | 'model_hub' | 'context';
+export type TabType = 'chat' | 'connectors' | 'llms' | 'discover' | 'history' | 'sync_detail' | 'model_hub' | 'context';
 
 interface SidebarProps {
   activeTab: TabType;
   setActiveTab: (tab: TabType) => void;
   onNewChat: () => void;
+  recentChats?: { id: string; preview: string }[];
 }
 
-export default function Sidebar({ activeTab, setActiveTab, onNewChat }: SidebarProps) {
+const NAV_ITEMS = [
+  { id: 'connectors' as TabType, label: 'Connectors', icon: Link2 },
+  { id: 'llms'       as TabType, label: 'LLMs',        icon: Cpu },
+  { id: 'discover'   as TabType, label: 'Discover',    icon: Compass },
+];
+
+export default function Sidebar({ activeTab, setActiveTab, onNewChat, recentChats = [] }: SidebarProps) {
+  const [recentsOpen, setRecentsOpen] = useState(true);
+
   return (
-    <aside className="w-60 flex-shrink-0 flex flex-col h-full bg-[#FAFAFA] border-r border-gray-200">
-      {/* ── Brand Logo Header ────────────────────────────────────────────── */}
-      <div className="p-6 pb-4">
-        <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-xl bg-black flex items-center justify-center text-white shadow-md">
-            <Shield className="w-5 h-5 fill-white text-black" />
+    <aside className="w-48 flex-shrink-0 flex flex-col h-full bg-white border-r border-[#E8EAED]">
+      
+      {/* ── Nav Items ──────────────────────────────────────────────────── */}
+      <nav className="flex-1 pt-3 px-2 space-y-0.5">
+        {NAV_ITEMS.map(({ id, label, icon: Icon }) => {
+          const isActive = activeTab === id;
+          return (
+            <button
+              key={id}
+              onClick={() => setActiveTab(id)}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-[13px] font-medium transition-colors ${
+                isActive
+                  ? 'bg-[#5B50F0] text-white'
+                  : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
+              }`}
+            >
+              <Icon className="w-4 h-4 flex-shrink-0" />
+              {label}
+            </button>
+          );
+        })}
+
+        {/* New Chat */}
+        <button
+          onClick={() => { onNewChat(); setActiveTab('chat'); }}
+          className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-[13px] font-medium transition-colors ${
+            activeTab === 'chat'
+              ? 'bg-[#5B50F0] text-white'
+              : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
+          }`}
+        >
+          <MessageSquarePlus className="w-4 h-4 flex-shrink-0" />
+          New Chat
+        </button>
+
+        {/* ── Recents Section ─────────────────────────────────────────── */}
+        <div className="pt-2">
+          <button
+            onClick={() => setRecentsOpen(v => !v)}
+            className="w-full flex items-center justify-between px-3 py-2 text-[12px] font-semibold text-gray-500 hover:text-gray-700 transition-colors"
+          >
+            <span>Recents</span>
+            {recentsOpen
+              ? <ChevronUp className="w-3.5 h-3.5" />
+              : <ChevronDown className="w-3.5 h-3.5" />
+            }
+          </button>
+
+          {recentsOpen && (
+            <div className="mt-0.5 space-y-0.5">
+              {recentChats.length > 0 ? (
+                recentChats.slice(0, 6).map(chat => (
+                  <button
+                    key={chat.id}
+                    className="w-full flex items-center px-3 py-2 rounded-lg text-[12px] text-gray-500 hover:bg-gray-100 hover:text-gray-800 transition-colors truncate text-left"
+                  >
+                    <span className="truncate">{chat.preview}</span>
+                  </button>
+                ))
+              ) : (
+                <p className="px-3 py-2 text-[12px] text-gray-400">No recent chats</p>
+              )}
+            </div>
+          )}
+        </div>
+      </nav>
+
+      {/* ── User Footer ─────────────────────────────────────────────────── */}
+      <div className="p-3 border-t border-[#E8EAED]">
+        <div className="flex items-center gap-2.5 px-2 py-2 rounded-lg hover:bg-gray-100 cursor-pointer transition-colors">
+          <div className="w-7 h-7 rounded-full bg-blue-500 flex items-center justify-center text-white text-xs font-bold flex-shrink-0">
+            K
           </div>
-          <div>
-            <h1 className="text-sm font-bold text-gray-900 tracking-tight leading-tight">
-              Aegis
-            </h1>
-            <p className="text-[11px] text-gray-500 font-medium">Personal AI Assistant</p>
+          <div className="min-w-0">
+            <p className="text-[12px] font-semibold text-gray-800 leading-tight">Kritiman</p>
+            <p className="text-[11px] text-gray-400 leading-tight">Free plan</p>
           </div>
         </div>
-
-        {/* Primary Action: + New Chat Button (Large Black Pill) */}
-        <button
-          onClick={() => {
-            onNewChat();
-            setActiveTab('chat');
-          }}
-          className="w-full mt-6 flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl bg-black text-white text-xs font-semibold hover:bg-neutral-800 active:scale-95 transition-all shadow-sm"
-        >
-          <PlusCircle className="w-4 h-4" />
-          New Chat
-        </button>
-      </div>
-
-      {/* ── Main Navigation Items ───────────────────────────────────────── */}
-      <div className="flex-1 px-3 py-2 space-y-1">
-        {/* Secondary New Chat */}
-        <button
-          onClick={() => {
-            onNewChat();
-            setActiveTab('chat');
-          }}
-          className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-medium transition-all ${
-            activeTab === 'chat'
-              ? 'bg-gray-200/60 text-gray-900 font-semibold'
-              : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
-          }`}
-        >
-          <PlusCircle className="w-4 h-4 text-gray-500" />
-          New Chat
-        </button>
-
-        {/* History */}
-        <button
-          onClick={() => setActiveTab('history')}
-          className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-medium transition-all ${
-            activeTab === 'history'
-              ? 'bg-gray-200/60 text-gray-900 font-semibold'
-              : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
-          }`}
-        >
-          <History className="w-4 h-4 text-gray-500" />
-          History
-        </button>
-        
-        {/* Model Hub */}
-        <button
-          onClick={() => setActiveTab('model_hub')}
-          className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-medium transition-all ${
-            activeTab === 'model_hub'
-              ? 'bg-gray-200/60 text-gray-900 font-semibold'
-              : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
-          }`}
-        >
-          <Blocks className="w-4 h-4 text-gray-500" />
-          Model Hub
-        </button>
-
-        {/* Connectors */}
-        <button
-          onClick={() => setActiveTab('connectors')}
-          className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-medium transition-all ${
-            activeTab === 'connectors' || activeTab === 'sync_detail'
-              ? 'bg-gray-200/80 text-gray-900 font-semibold shadow-sm'
-              : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
-          }`}
-        >
-          <Blocks className="w-4 h-4 text-gray-700" />
-          Connectors
-        </button>
-
-        {/* Context Management */}
-        <button
-          onClick={() => setActiveTab('context')}
-          className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-medium transition-all ${
-            activeTab === 'context'
-              ? 'bg-indigo-50 text-indigo-700 font-semibold border border-indigo-100'
-              : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
-          }`}
-        >
-          <SlidersHorizontal className={`w-4 h-4 ${activeTab === 'context' ? 'text-indigo-500' : 'text-gray-500'}`} />
-          Context
-        </button>
-
-        {/* Settings */}
-        <button
-          onClick={() => setActiveTab('settings')}
-          className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-medium transition-all ${
-            activeTab === 'settings'
-              ? 'bg-gray-200/60 text-gray-900 font-semibold'
-              : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
-          }`}
-        >
-          <Settings className="w-4 h-4 text-gray-500" />
-          Settings
-        </button>
-      </div>
-
-      {/* ── Footer Navigation ───────────────────────────────────────────── */}
-      <div className="p-3 border-t border-gray-200 space-y-1">
-        <button className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-medium text-gray-600 hover:bg-gray-100 hover:text-gray-900 transition-all">
-          <User className="w-4 h-4 text-gray-500" />
-          Account
-        </button>
-        <button className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-medium text-gray-600 hover:bg-gray-100 hover:text-gray-900 transition-all">
-          <HelpCircle className="w-4 h-4 text-gray-500" />
-          Help
-        </button>
       </div>
     </aside>
   );

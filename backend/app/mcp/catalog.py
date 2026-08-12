@@ -66,6 +66,28 @@ CONNECTORS_CATALOG: Dict[str, dict] = {
         "official": True,
     },
 
+    "figma": {
+        "name": "figma",
+        "display_name": "Figma",
+        "category": "Design",
+        "description": "Read designs, inspect component properties, and search your Figma workspace.",
+        "icon": "figma",
+        "auth_type": "api_key",
+        "command": ["npx", "-y", "figma-developer-mcp", "--figma-api-key={FIGMA_ACCESS_TOKEN}"],
+        "env_schema": [
+            {
+                "name": "FIGMA_ACCESS_TOKEN",
+                "label": "Figma Personal Access Token",
+                "type": "password",
+                "placeholder": "figd_xxxxxxxxxxxxxxxxxxxxxxx",
+                "help": "Get from figma.com → Settings → Security → Personal access tokens",
+            }
+        ],
+        "input_schema": [],
+        "target_audience": ["design", "marketing", "operations", "all"],
+        "official": False,
+    },
+
     # ═══════════════════════════════════════════════════════════════════════════
     # 👥  CRM & SALES
     # ═══════════════════════════════════════════════════════════════════════════
