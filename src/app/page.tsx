@@ -6,6 +6,8 @@ import ChatView from '@/components/ChatView';
 import ConnectorsView from '@/components/ConnectorsView';
 import ModelHub from '@/components/ModelHub';
 import { useSocket } from '@/hooks/useSocket';
+import { useAppSelector } from '@/hooks/useStore';
+import { selectSessionId } from '@/store/sessionSlice';
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState<TabType>('connectors');
@@ -19,26 +21,61 @@ export default function Home() {
     failedNodeIds,
     sendMessage,
     clearMessages,
-    switchSession
+    switchSession,
   } = useSocket();
+
+  const currentSessionId = useAppSelector(selectSessionId);
 
   const [sessions, setSessions] = useState<any[]>([]);
 
+  const fetchSessions = useCallback(async () => {
+    try {
+      const res = await fetch('http://localhost:8000/api/chat/sessions');
+      const data = await res.json();
+      setSessions(Array.isArray(data) ? data : []);
+    } catch {}
+  }, []);
+
+  // Refresh sessions list on mount and whenever a message is sent
+  useEffect(() => { fetchSessions(); }, [fetchSessions]);
   useEffect(() => {
-    fetch('http://localhost:8000/api/chat/sessions')
-      .then(res => res.json())
-      .then(data => setSessions(data))
-      .catch(() => {});
-  }, [messages.length]); // refresh when new messages come in
+    if (messages.length > 0) fetchSessions();
+  }, [messages.length, fetchSessions]);
 
   const handleNewChat = useCallback(() => {
     switchSession();
     setActiveTab('chat');
   }, [switchSession]);
 
-  const recentChats = sessions.slice(0, 6).map(s => ({
+  const handleSelectSession = useCallback((sessionId: string) => {
+    switchSession(sessionId);
+    setActiveTab('chat');
+  }, [switchSession]);
+
+  const handleDeleteSession = useCallback(async (sessionId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!confirm('Delete this chat? This cannot be undone.')) return;
+    try {
+      const res = await fetch(
+        `http://localhost:8000/api/chat/sessions/${encodeURIComponent(sessionId)}`,
+        { method: 'DELETE' }
+      );
+      if (res.ok) {
+        setSessions(prev => prev.filter(s => s.id !== sessionId));
+        // If we deleted the currently open session, start a new chat
+        if (currentSessionId === sessionId) {
+          switchSession();
+          setActiveTab('chat');
+        }
+      }
+    } catch (err) {
+      console.error('Failed to delete session:', err);
+    }
+  }, [currentSessionId, switchSession]);
+
+  const recentChats = sessions.map(s => ({
     id: s.id,
-    preview: s.preview || 'Chat session',
+    preview: s.preview || 'Untitled chat',
   }));
 
   return (
@@ -49,6 +86,9 @@ export default function Home() {
         setActiveTab={setActiveTab}
         onNewChat={handleNewChat}
         recentChats={recentChats}
+        onSelectSession={handleSelectSession}
+        onDeleteSession={handleDeleteSession}
+        activeSessionId={currentSessionId ?? undefined}
       />
 
       {/* Main content */}
@@ -84,4 +124,3 @@ export default function Home() {
     </div>
   );
 }
-

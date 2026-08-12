@@ -8,6 +8,7 @@ import {
   MessageSquarePlus,
   ChevronDown,
   ChevronUp,
+  Trash2,
 } from 'lucide-react';
 
 export type TabType = 'chat' | 'connectors' | 'llms' | 'discover' | 'history' | 'sync_detail' | 'model_hub' | 'context';
@@ -17,6 +18,9 @@ interface SidebarProps {
   setActiveTab: (tab: TabType) => void;
   onNewChat: () => void;
   recentChats?: { id: string; preview: string }[];
+  onSelectSession?: (id: string) => void;
+  onDeleteSession?: (id: string, e: React.MouseEvent) => void;
+  activeSessionId?: string;
 }
 
 const NAV_ITEMS = [
@@ -25,14 +29,22 @@ const NAV_ITEMS = [
   { id: 'discover'   as TabType, label: 'Discover',    icon: Compass },
 ];
 
-export default function Sidebar({ activeTab, setActiveTab, onNewChat, recentChats = [] }: SidebarProps) {
+export default function Sidebar({
+  activeTab,
+  setActiveTab,
+  onNewChat,
+  recentChats = [],
+  onSelectSession,
+  onDeleteSession,
+  activeSessionId,
+}: SidebarProps) {
   const [recentsOpen, setRecentsOpen] = useState(true);
 
   return (
     <aside className="w-48 flex-shrink-0 flex flex-col h-full bg-white border-r border-[#E8EAED]">
       
       {/* ── Nav Items ──────────────────────────────────────────────────── */}
-      <nav className="flex-1 pt-3 px-2 space-y-0.5">
+      <nav className="flex-1 pt-3 px-2 space-y-0.5 overflow-y-auto">
         {NAV_ITEMS.map(({ id, label, icon: Icon }) => {
           const isActive = activeTab === id;
           return (
@@ -55,7 +67,7 @@ export default function Sidebar({ activeTab, setActiveTab, onNewChat, recentChat
         <button
           onClick={() => { onNewChat(); setActiveTab('chat'); }}
           className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-[13px] font-medium transition-colors ${
-            activeTab === 'chat'
+            activeTab === 'chat' && !activeSessionId
               ? 'bg-[#5B50F0] text-white'
               : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
           }`}
@@ -80,14 +92,46 @@ export default function Sidebar({ activeTab, setActiveTab, onNewChat, recentChat
           {recentsOpen && (
             <div className="mt-0.5 space-y-0.5">
               {recentChats.length > 0 ? (
-                recentChats.slice(0, 6).map(chat => (
-                  <button
-                    key={chat.id}
-                    className="w-full flex items-center px-3 py-2 rounded-lg text-[12px] text-gray-500 hover:bg-gray-100 hover:text-gray-800 transition-colors truncate text-left"
-                  >
-                    <span className="truncate">{chat.preview}</span>
-                  </button>
-                ))
+                recentChats.slice(0, 8).map(chat => {
+                  const isActiveChat = activeSessionId === chat.id && activeTab === 'chat';
+                  return (
+                    <div
+                      key={chat.id}
+                      className={`group relative flex items-center rounded-lg transition-colors ${
+                        isActiveChat
+                          ? 'bg-indigo-50'
+                          : 'hover:bg-gray-100'
+                      }`}
+                    >
+                      {/* Session title — click to open */}
+                      <button
+                        onClick={() => {
+                          onSelectSession?.(chat.id);
+                          setActiveTab('chat');
+                        }}
+                        className={`flex-1 min-w-0 text-left px-3 py-2 text-[12px] truncate transition-colors ${
+                          isActiveChat
+                            ? 'text-[#5B50F0] font-semibold'
+                            : 'text-gray-500 hover:text-gray-800'
+                        }`}
+                        title={chat.preview}
+                      >
+                        {chat.preview}
+                      </button>
+
+                      {/* Delete button — visible on hover */}
+                      {onDeleteSession && (
+                        <button
+                          onClick={(e) => onDeleteSession(chat.id, e)}
+                          className="opacity-0 group-hover:opacity-100 flex-shrink-0 p-1.5 mr-1 rounded-md text-gray-400 hover:text-red-500 hover:bg-red-50 transition-all"
+                          title="Delete this chat"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      )}
+                    </div>
+                  );
+                })
               ) : (
                 <p className="px-3 py-2 text-[12px] text-gray-400">No recent chats</p>
               )}
