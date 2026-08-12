@@ -186,7 +186,15 @@ def get_hardware_status():
     import psutil
     manager = get_llm_manager()
     loaded_models = list(manager.loaded_models.keys())
-    active_model = loaded_models[0] if loaded_models else "None"
+    
+    if loaded_models:
+        active_model = loaded_models[0]
+    else:
+        from app.db.database import SessionLocal
+        from app.db.models import LocalModel
+        with SessionLocal() as db:
+            first_model = db.query(LocalModel).filter(LocalModel.status == "downloaded").first()
+            active_model = first_model.repo_id if first_model else "None"
     
     mem = psutil.virtual_memory()
     total_gb = mem.total / (1024**3)

@@ -837,7 +837,7 @@ export default function ChatView({
                 onClick={() => setChatMode(chatMode === 'chat' ? 'agent' : 'chat')}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-gray-100 hover:bg-gray-200 text-gray-700 transition-colors"
               >
-                {chatMode === 'agent' ? <><Sparkles className="w-3.5 h-3.5 text-[#5B50F0]" /> Agent</> : <>Models <CornerDownLeft className="w-3 h-3" /></>}
+                {chatMode === 'agent' ? <><Sparkles className="w-3.5 h-3.5 text-[#5B50F0]" /> {hardwareStatus?.active_model || 'Agent'}</> : <>{hardwareStatus?.active_model || 'Models'} <CornerDownLeft className="w-3 h-3" /></>}
               </button>
 
               <button
