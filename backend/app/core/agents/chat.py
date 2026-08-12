@@ -235,15 +235,15 @@ class ChatAgent(BaseAgent):
         tools_str = "\n".join(self._format_tool_for_planner(t) for t in tools)
         return tools_str + self._build_metadata_context()
 
-    def _rewrite_query_for_search(self, query: str) -> str:
-        """Uses a fast LLM pass to expand the user's query with keywords likely to hit the FTS5 tool index."""
+    def _rewrite_query_for_search(self, query: str) -> tuple[str, bool]:
+        """Uses a fast LLM pass to expand the user's query with keywords likely to hit the FTS5 tool index. Also flags if query is counting."""
         llm = self.get_llm()
         if not llm:
-            return query
+            return query, False
             
         all_tools = mcp_registry.list_all_tools()
         if not all_tools:
-            return query
+            return query, False
             
         tool_names = ", ".join([t["name"] for t in all_tools])
         
@@ -252,36 +252,51 @@ The user's query is: "{query}"
 
 Available tools in the registry: [{tool_names}]
 
-If the user is asking a general question about what tools are available (e.g., "what tools do I have?", "show tools", "what can you do?"), output EXACTLY the word: ALL_TOOLS
+Analyze the user's query and output a JSON object with two keys:
+- "tools": either the exact string "ALL_TOOLS" (if they ask a general question about what tools are available), OR a list of the 1 to 5 most relevant tool names from the registry.
+- "is_counting": boolean true if the user query implies needing a total, count, or completeness (e.g. "how many", "count of", "all of", "list all"). Otherwise false.
 
-Otherwise, select the 1 to 5 most relevant tools from the list above that the agent might need to fulfill the request. Output ONLY a comma-separated list of the exact tool names (no quotes, no extra text, no markdown). Do NOT invent new tool names.
-Example output: slack_send_message, google_drive_find_file"""
+Do NOT invent new tool names. Output valid JSON only.
+Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counting": false}}"""
 
         try:
             response = llm.create_chat_completion(
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                max_tokens=30
+                max_tokens=60,
+                response_format={"type": "json_object"}
             )
-            expanded_keywords = response["choices"][0]["message"]["content"].strip()
-            logger.info(f"Query rewritten for tool search: '{query}' -> '{expanded_keywords}'")
-            return expanded_keywords
+            content = response["choices"][0]["message"]["content"].strip()
+            import json
+            data = json.loads(content)
+            tools_val = data.get("tools", [])
+            is_counting = bool(data.get("is_counting", False))
+            
+            if tools_val == "ALL_TOOLS" or (isinstance(tools_val, list) and "ALL_TOOLS" in tools_val):
+                expanded_keywords = "ALL_TOOLS"
+            elif isinstance(tools_val, list):
+                expanded_keywords = ", ".join(tools_val)
+            else:
+                expanded_keywords = str(tools_val)
+                
+            logger.info(f"Query rewritten for tool search: '{query}' -> '{expanded_keywords}' (counting: {is_counting})")
+            return expanded_keywords, is_counting
         except Exception as e:
             logger.error(f"Query rewrite failed: {e}")
-            return query
+            return query, False
 
-    def get_searched_tools(self, query: str) -> str:
+    def get_searched_tools(self, query: str) -> tuple[str, bool]:
         """Fetches top-k relevant tools from registry using keyword expansion and SQLite FTS5."""
-        optimized_query = self._rewrite_query_for_search(query)
+        optimized_query, is_counting = self._rewrite_query_for_search(query)
         
         if "ALL_TOOLS" in optimized_query:
-            return self.get_available_tools()
+            return self.get_available_tools(), is_counting
             
         tools = mcp_registry.search_tools(optimized_query, top_k=10)
         if not tools:
-            return ""
+            return "", False
         tools_str = "\n".join(self._format_tool_for_planner(t) for t in tools)
-        return tools_str + self._build_metadata_context()
+        return tools_str + self._build_metadata_context(), is_counting
 
     def _get_entity_context(self) -> str:
         """Loads confirmed session entities from SQLite and returns the context block."""
@@ -472,7 +487,7 @@ Example output: slack_send_message, google_drive_find_file"""
         # If mode == "agent", we skip the Chat LLM and go straight to Plan Generation
         import asyncio
         loop = asyncio.get_running_loop()
-        tools_str = await loop.run_in_executor(llm_executor, self.get_searched_tools, message)
+        tools_str, is_counting = await loop.run_in_executor(llm_executor, self.get_searched_tools, message)
         if not tools_str:
             return "I couldn't find any connected tools relevant to your request. Are you sure you have the right MCP servers connected?"
 
@@ -489,7 +504,7 @@ Example output: slack_send_message, google_drive_find_file"""
         loop = asyncio.get_running_loop()
         plan_json_str = await loop.run_in_executor(
             llm_executor,
-            lambda: self.planner.generate_plan(message, tools_str, entity_context, history_for_planner, None)
+            lambda: self.planner.generate_plan(message, tools_str, entity_context, history_for_planner, token_callback=None, is_counting=is_counting)
         )
 
         try:
@@ -708,7 +723,7 @@ Example output: slack_send_message, google_drive_find_file"""
                 return final_response
 
             # Otherwise, treat as an edit request and route to Planner
-            tools_str = self.get_searched_tools(message)
+            tools_str, is_counting = self.get_searched_tools(message)
             if not tools_str:
                 return "I couldn't find any tools relevant to that edit request. Please clarify what you want to do."
                 
@@ -720,7 +735,7 @@ Example output: slack_send_message, google_drive_find_file"""
                 llm_executor,
                 lambda: self.planner.generate_plan(
                     "Please refine the plan based on my previous feedback.",
-                    tools_str, entity_context, full_history, token_callback
+                    tools_str, entity_context, full_history, token_callback, is_counting
                 )
             )
             try:
@@ -1056,6 +1071,12 @@ Example output: slack_send_message, google_drive_find_file"""
                 self.state = AgentState.IDLE
                 self.plan = None
                 return
+
+            # Clean up known LLM hallucinations before validation
+            if isinstance(arguments, dict):
+                # Small models often bleed the 'fetch_scope' step parameter into the arguments dict
+                if "fetch_scope" in arguments and "fetch_scope" not in schema.get("properties", {}):
+                    del arguments["fetch_scope"]
 
             # Single strict check to catch catastrophic failure
             try:
