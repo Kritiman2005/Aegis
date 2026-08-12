@@ -52,6 +52,22 @@ export default function ChatView({
   const [savingMsgId, setSavingMsgId] = useState<string | null>(null);
   const [savedMsgId, setSavedMsgId] = useState<string | null>(null);
   const [chatMode, setChatMode] = useState<'chat' | 'agent'>('chat');
+  const [hardwareStatus, setHardwareStatus] = useState<{active_model: string, ram_percent: number} | null>(null);
+
+  useEffect(() => {
+    const fetchHardware = async () => {
+      try {
+        const res = await fetch('http://localhost:8000/api/hardware/status');
+        const data = await res.json();
+        setHardwareStatus(data);
+      } catch (e) {
+        console.error("Failed to fetch hardware status", e);
+      }
+    };
+    fetchHardware();
+    const interval = setInterval(fetchHardware, 10000);
+    return () => clearInterval(interval);
+  }, []);
   
   // Schedule state
   const [schedulingPlanId, setSchedulingPlanId] = useState<string | null>(null);
@@ -273,8 +289,21 @@ export default function ChatView({
                 {/* Message Bubble Container */}
                 <div className={`space-y-2 max-w-2xl ${isUser ? 'items-end' : 'items-start'}`}>
                   {/* Sender Header */}
-                  <div className={`flex items-center gap-2 text-[11px] text-gray-400 ${isUser ? 'justify-end' : 'justify-start'}`}>
-                    <span className="font-semibold text-gray-700">{isUser ? 'You' : 'Aegis'}</span>
+                  <div className={`flex items-center gap-2 text-[11px] text-gray-400 ${isUser ? 'justify-end' : 'justify-start'} mb-1.5`}>
+                    <span className="font-semibold text-gray-700 flex items-center gap-2">
+                      {isUser ? 'You' : (hardwareStatus ? (
+                        <>
+                          {hardwareStatus.active_model}
+                          <span className={`text-[9px] px-1.5 py-0.5 rounded-sm font-medium ${
+                            hardwareStatus.ram_percent > 90 ? 'bg-red-100 text-red-600' :
+                            hardwareStatus.ram_percent > 75 ? 'bg-orange-100 text-orange-600' :
+                            'bg-green-100 text-green-600'
+                          }`}>
+                            RAM: {hardwareStatus.ram_percent.toFixed(0)}%
+                          </span>
+                        </>
+                      ) : 'Aegis')}
+                    </span>
                     <span>•</span>
                     <span>
                       {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
@@ -679,10 +708,23 @@ export default function ChatView({
               <Zap className="w-4 h-4 fill-white text-black" />
             </div>
             <div className="space-y-2 max-w-2xl items-start w-full">
-              <div className="flex items-center gap-2 text-[11px] text-gray-400 justify-start">
-                <span className="font-semibold text-gray-700">Aegis</span>
+              <div className="flex items-center gap-2 text-[11px] text-gray-400 justify-start mb-1">
+                <span className="font-semibold text-gray-700 flex items-center gap-2">
+                  {hardwareStatus ? (
+                    <>
+                      {hardwareStatus.active_model}
+                      <span className={`text-[9px] px-1.5 py-0.5 rounded-sm font-medium ${
+                        hardwareStatus.ram_percent > 90 ? 'bg-red-100 text-red-600' :
+                        hardwareStatus.ram_percent > 75 ? 'bg-orange-100 text-orange-600' :
+                        'bg-green-100 text-green-600'
+                      }`}>
+                        RAM: {hardwareStatus.ram_percent.toFixed(0)}%
+                      </span>
+                    </>
+                  ) : 'Aegis'}
+                </span>
                 <span>•</span>
-                <span className="italic text-gray-500">Generating...</span>
+                <span className="italic">Generating...</span>
               </div>
               <div className="bg-white border border-gray-200 rounded-2xl p-5 text-xs text-gray-800 leading-relaxed shadow-sm space-y-4">
                 <div className="font-sans w-full overflow-hidden">

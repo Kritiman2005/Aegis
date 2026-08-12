@@ -179,3 +179,23 @@ def unload_model():
         
     return {"success": True, "message": f"Unloaded {len(loaded)} model(s)."}
 
+@router.get("/api/hardware/status")
+def get_hardware_status():
+    """Return active model and system RAM usage for the frontend UI."""
+    from app.core.agents.chat import get_llm_manager
+    import psutil
+    manager = get_llm_manager()
+    loaded_models = list(manager.loaded_models.keys())
+    active_model = loaded_models[0] if loaded_models else "None"
+    
+    mem = psutil.virtual_memory()
+    total_gb = mem.total / (1024**3)
+    used_gb = mem.used / (1024**3)
+    
+    return {
+        "active_model": active_model,
+        "ram_total_gb": round(total_gb, 1),
+        "ram_used_gb": round(used_gb, 1),
+        "ram_percent": mem.percent
+    }
+
