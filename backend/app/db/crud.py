@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 def save_google_user_and_credentials(
     db: Session,
     credentials: Credentials,
+    service_name: str,
     user_email: str = "user@aegis.local",
     full_name: Optional[str] = None,
     available_tools: Optional[List[dict]] = None
@@ -41,17 +42,18 @@ def save_google_user_and_credentials(
     db.commit()
     db.refresh(user)
 
-    # Sync MCPServer record for Google Workspace
+    # Sync MCPServer record for Google Workspace (or Mail/Drive)
     server = db.query(MCPServer).filter(
         MCPServer.user_id == user.id,
-        MCPServer.name == "google_workspace"
+        MCPServer.name == service_name
     ).first()
 
     if not server:
+        display = "Google Mail" if service_name == "google_mail" else "Google Drive"
         server = MCPServer(
             user_id=user.id,
-            name="google_workspace",
-            display_name="Google Drive & Gmail Tools",
+            name=service_name,
+            display_name=display,
             server_type="google_api",
             status="connected"
         )
@@ -200,13 +202,17 @@ def get_all_server_account_contexts(db: Session) -> dict:
 
 
 
-def get_active_google_credentials(db: Session) -> Optional[Credentials]:
-    """
-    Retrieves saved Google OAuth credentials from SQLite.
-    If the access token is expired and a refresh token exists, it auto-refreshes
-    with Google and updates SQLite transparently!
-    """
-    user = db.query(User).filter(User.oauth_credentials_json.isnot(None)).order_by(User.updated_at.desc()).first()
+def get_active_google_credentials(db: Session, service_name: str) -> Optional[Credentials]:
+    """Retrieves and reconstructs Google OAuth credentials if the service is connected."""
+    server = db.query(MCPServer).filter(
+        MCPServer.name == service_name,
+        MCPServer.status == "connected"
+    ).first()
+    
+    if not server:
+        return None
+        
+    user = db.query(User).filter(User.id == server.user_id).first()
     if not user or not user.oauth_credentials_json:
         return None
 

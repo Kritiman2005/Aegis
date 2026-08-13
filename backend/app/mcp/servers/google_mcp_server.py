@@ -17,6 +17,7 @@ import json
 import os
 import logging
 import base64
+import argparse
 from email.mime.text import MIMEText
 
 # ── All output except MCP messages goes to stderr ────────────────────────────
@@ -381,5 +382,15 @@ class GoogleMCPServer:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Google Workspace MCP Server")
+    parser.add_argument("--service", type=str, default="all", help="Which service tools to expose (google_mail, google_drive, or all)")
+    args = parser.parse_args()
+
+    # Filter tools based on the requested service
+    if args.service == "google_mail":
+        TOOLS = [t for t in TOOLS if t["name"].startswith("gmail_")]
+    elif args.service == "google_drive":
+        TOOLS = [t for t in TOOLS if t["name"].startswith("drive_")]
+
     server = GoogleMCPServer()
     server.run()

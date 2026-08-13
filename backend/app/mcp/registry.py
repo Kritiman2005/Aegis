@@ -94,16 +94,17 @@ class MCPServerRegistry:
 
         return tools
 
-    def connect_google_workspace(self, credentials_json_str: str, db: Optional[Session] = None) -> List[dict]:
+    def connect_google_service(self, service_name: str, credentials_json_str: str, db: Optional[Session] = None) -> List[dict]:
         """
-        Convenience wrapper to launch the Google Workspace MCP Python server.
+        Convenience wrapper to launch the Google Workspace MCP Python server
+        configured for a specific service (google_mail or google_drive).
         """
         google_script = Path(__file__).resolve().parent / "servers" / "google_mcp_server.py"
-        command = [sys.executable, str(google_script)]
+        command = [sys.executable, str(google_script), "--service", service_name]
         env = {"GOOGLE_CREDENTIALS_JSON": credentials_json_str}
 
         return self.connect_server(
-            server_name="google_workspace",
+            server_name=service_name,
             command=command,
             env=env,
             db=db,

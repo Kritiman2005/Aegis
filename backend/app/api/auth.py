@@ -14,11 +14,13 @@ logger = logging.getLogger(__name__)
 AUTH_STATES = {}
 
 @router.get("/google/login")
-def google_login():
+def google_login(service: str = "google_workspace"):
     """Triggered by the frontend to start the Google OAuth flow."""
     try:
-        auth_url, state, flow = initiate_oauth_flow()
-        AUTH_STATES[state] = flow
+        from app.auth.google_oauth import initiate_oauth_flow
+        auth_url, state, flow = initiate_oauth_flow(service_name=service)
+        # Store both flow and service name
+        AUTH_STATES[state] = {"flow": flow, "service": service}
         return RedirectResponse(url=auth_url)
     except Exception as e:
         logger.error(f"Error initiating OAuth flow: {e}")
@@ -36,7 +38,9 @@ async def google_callback(request: Request):
         return JSONResponse(status_code=400, content={"error": "Missing authorization code"})
         
     # Get the original flow object (which contains the PKCE code_verifier)
-    flow = AUTH_STATES[state]
+    state_data = AUTH_STATES[state]
+    flow = state_data["flow"]
+    service_name = state_data["service"]
     
     # Clean up state
     del AUTH_STATES[state]
@@ -58,9 +62,11 @@ async def google_callback(request: Request):
             with SessionLocal() as db:
                 save_google_user_and_credentials(
                     db=db,
-                    credentials=credentials
+                    credentials=credentials,
+                    service_name=service_name
                 )
-                tools = mcp_registry.connect_google_workspace(
+                tools = mcp_registry.connect_google_service(
+                    service_name=service_name,
                     credentials_json_str=credentials.to_json(),
                     db=db
                 )

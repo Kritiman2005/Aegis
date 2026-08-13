@@ -76,6 +76,24 @@ OAUTH_CONFIGS: Dict[str, dict] = {
         "setup_hint": "Go to Notion Integrations → New integration → Public → copy Client ID & Secret. Redirect URL: http://localhost:8000/auth/notion/callback",
     },
 
+    # ── Figma ──────────────────────────────────────────────────────────────────
+    "figma": {
+        "display_name": "Figma",
+        "auth_url": "https://www.figma.com/oauth",
+        "token_url": "https://api.figma.com/v1/oauth/token",
+        "scopes": "file_read",
+        "client_id_env": "FIGMA_CLIENT_ID",
+        "client_secret_env": "FIGMA_CLIENT_SECRET",
+        "token_auth": "basic",
+        "token_response_format": "json",
+        "mcp_command": ["npx", "-y", "figma-developer-mcp", "--figma-api-key={FIGMA_ACCESS_TOKEN}"],
+        "env_extraction": {
+            "FIGMA_ACCESS_TOKEN": ["access_token"],
+        },
+        "setup_url": "https://www.figma.com/developers/apps",
+        "setup_hint": "Create an OAuth App in Figma with callback: http://localhost:8000/auth/figma/callback",
+    },
+
     # ── GitHub ───────────────────────────────────────────────────────────────────────
     "github": {
         "display_name": "GitHub",

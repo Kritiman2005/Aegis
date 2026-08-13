@@ -101,18 +101,18 @@ async def on_startup():
         seed_default_model(db, model_path)
 
         # Auto-restore saved Google OAuth credentials from SQLite
-        credentials = get_active_google_credentials(db)
-        if credentials:
-            try:
-                mcp_registry.connect_google_workspace(
-                    credentials_json_str=credentials.to_json(),
-                    db=db
-                )
-                _logger.info("Auto-restored active Google Workspace MCP server from SQLite!")
-            except Exception as e:
-                _logger.error(f"Failed to auto-restore Google Workspace MCP server: {e}")
-        else:
-            _logger.info("No saved Google OAuth credentials found in SQLite.")
+        for service_name in ["google_mail", "google_drive"]:
+            credentials = get_active_google_credentials(db, service_name)
+            if credentials:
+                try:
+                    mcp_registry.connect_google_service(
+                        service_name=service_name,
+                        credentials_json_str=credentials.to_json(),
+                        db=db
+                    )
+                    _logger.info(f"Auto-restored active {service_name} MCP server from SQLite!")
+                except Exception as e:
+                    _logger.error(f"Failed to auto-restore {service_name} MCP server: {e}")
             
         # Auto-restore other connected MCP servers
         from app.db.crud import get_all_connected_servers
@@ -121,8 +121,8 @@ async def on_startup():
         
         connected_servers = get_all_connected_servers(db)
         for server in connected_servers:
-            if server.name == "google_workspace":
-                continue  # already handled above
+            if server.name in ["google_mail", "google_drive", "google_workspace"]:
+                continue  # already handled above or deprecated
                 
             if not server.config_json:
                 _logger.warning(f"Server '{server.name}' is marked connected but has no config_json. Cannot auto-restore.")

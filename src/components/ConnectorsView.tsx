@@ -8,12 +8,12 @@ import ConfigModal, { CatalogConnector } from './ConfigModal';
 
 const CONNECTOR_DEFS = [
   {
-    name: 'google_workspace',
+    name: 'google_drive',
     displayName: 'Google Drive',
     description: 'Search, read, and upload files instantly across your Drive.',
-    oauthService: 'google_workspace',
+    oauthService: 'google_drive',
     authType: 'oauth',
-    loginUrl: 'http://localhost:8000/auth/google/login',
+    loginUrl: 'http://localhost:8000/auth/google/login?service=google_drive',
     icon: (
       <svg viewBox="0 0 24 24" className="w-6 h-6" fill="none">
         <path d="M12 2L2 19h7l3-5.2L15 19h7L12 2z" fill="#4285F4" opacity="0.9"/>
@@ -26,12 +26,12 @@ const CONNECTOR_DEFS = [
     rank: 1,
   },
   {
-    name: 'gmail',
+    name: 'google_mail',
     displayName: 'Gmail',
     description: 'Draft replies, summarize threads, & search your inbox.',
-    oauthService: 'google_workspace',
+    oauthService: 'google_mail',
     authType: 'oauth',
-    loginUrl: 'http://localhost:8000/auth/google/login',
+    loginUrl: 'http://localhost:8000/auth/google/login?service=google_mail',
     icon: (
       <svg viewBox="0 0 24 24" className="w-6 h-6" fill="none">
         <rect width="20" height="16" x="2" y="4" rx="2" fill="#EA4335" opacity="0.15"/>
@@ -47,9 +47,9 @@ const CONNECTOR_DEFS = [
     name: 'figma',
     displayName: 'Figma',
     description: 'Read designs, inspect components, and search your Figma workspace.',
-    oauthService: null,
-    authType: 'api_key',
-    loginUrl: null,
+    oauthService: 'figma',
+    authType: 'oauth',
+    loginUrl: 'http://localhost:8000/auth/figma/login',
     icon: (
       <svg viewBox="0 0 24 24" className="w-6 h-6" fill="none">
         <rect x="8" y="2" width="8" height="8" rx="3" fill="#F24E1E"/>

@@ -152,16 +152,14 @@ def reload_connector(server_name: str, db: Session = Depends(get_db)):
     This enables rapid iteration on MCP server schemas without restarting the Uvicorn backend.
     """
     try:
-        # Currently, Google Workspace is hardcoded, but this can be genericized 
-        # by pulling the stored command from the `mcp_servers` table.
-        if server_name == "google_workspace":
+        if server_name in ["google_mail", "google_drive"]:
             from app.db.crud import get_active_google_credentials
-            credentials = get_active_google_credentials(db)
+            credentials = get_active_google_credentials(db, service_name=server_name)
             if not credentials:
-                raise HTTPException(status_code=400, detail="No Google credentials found to reload.")
+                raise HTTPException(status_code=400, detail=f"No Google credentials found to reload for {server_name}.")
             
-            # connect_google_workspace natively drops the old server and spawns a new one
-            tools = mcp_registry.connect_google_workspace(credentials.to_json(), db=db)
+            # connect_google_service natively drops the old server and spawns a new one
+            tools = mcp_registry.connect_google_service(server_name, credentials.to_json(), db=db)
             return {
                 "message": f"Successfully hot-reloaded MCP server '{server_name}'",
                 "tools_count": len(tools)

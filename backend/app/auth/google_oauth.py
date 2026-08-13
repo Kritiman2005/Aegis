@@ -2,20 +2,25 @@ import os
 import webbrowser
 from google_auth_oauthlib.flow import Flow
 
-# Allow HTTP callback for local development
+# Allow HTTP callback for local development and relax scope checks
 os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 
-# Required scopes for Gmail and Google Drive (includes drafting and creating files)
-SCOPES = [
+# Scopes for Gmail
+GMAIL_SCOPES = [
     'https://www.googleapis.com/auth/gmail.readonly',
-    'https://www.googleapis.com/auth/gmail.compose',
+    'https://www.googleapis.com/auth/gmail.compose'
+]
+
+# Scopes for Google Drive
+DRIVE_SCOPES = [
     'https://www.googleapis.com/auth/drive.readonly',
     'https://www.googleapis.com/auth/drive.file'
 ]
 
 REDIRECT_URI = "http://localhost:8000/auth/google/callback"
 
-def get_google_flow() -> Flow:
+def get_google_flow(service_name: str) -> Flow:
     """Initialize the Google OAuth Flow using environment variables."""
     client_id = os.environ.get("GOOGLE_CLIENT_ID")
     client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
@@ -33,16 +38,23 @@ def get_google_flow() -> Flow:
         }
     }
     
+    if service_name == "google_mail":
+        scopes = GMAIL_SCOPES
+    elif service_name == "google_drive":
+        scopes = DRIVE_SCOPES
+    else:
+        scopes = GMAIL_SCOPES + DRIVE_SCOPES
+    
     flow = Flow.from_client_config(
         client_config,
-        scopes=SCOPES,
+        scopes=scopes,
         redirect_uri=REDIRECT_URI
     )
     return flow
 
-def initiate_oauth_flow():
+def initiate_oauth_flow(service_name: str):
     """Generates the OAuth URL for the user to visit."""
-    flow = get_google_flow()
+    flow = get_google_flow(service_name)
     
     # Generate the authorization URL (this internally creates a code_verifier for PKCE)
     auth_url, state = flow.authorization_url(

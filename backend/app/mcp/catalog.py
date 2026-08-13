@@ -22,11 +22,25 @@ CONNECTORS_CATALOG: Dict[str, dict] = {
     # 📧  EMAIL & COMMUNICATION
     # ═══════════════════════════════════════════════════════════════════════════
 
-    "google_workspace": {
-        "name": "google_workspace",
-        "display_name": "Google Workspace",
+    "google_mail": {
+        "name": "google_mail",
+        "display_name": "Google Mail",
         "category": "Email & Communication",
-        "description": "Read Gmail, create email drafts, and access Google Drive documents — all in one place.",
+        "description": "Read Gmail, search threads, and create email drafts.",
+        "icon": "google",
+        "auth_type": "oauth",
+        "command": None,          # Handled natively via Aegis Google OAuth flow
+        "env_schema": [],
+        "input_schema": [],
+        "target_audience": ["hr", "marketing", "sales", "operations", "all"],
+        "official": True,
+    },
+
+    "google_drive": {
+        "name": "google_drive",
+        "display_name": "Google Drive",
+        "category": "Files & Documents",
+        "description": "Search, list, and read documents from Google Drive.",
         "icon": "google",
         "auth_type": "oauth",
         "command": None,          # Handled natively via Aegis Google OAuth flow
@@ -72,17 +86,10 @@ CONNECTORS_CATALOG: Dict[str, dict] = {
         "category": "Design",
         "description": "Read designs, inspect component properties, and search your Figma workspace.",
         "icon": "figma",
-        "auth_type": "api_key",
+        "auth_type": "oauth",
+        "oauth_service": "figma",
         "command": ["npx", "-y", "figma-developer-mcp", "--figma-api-key={FIGMA_ACCESS_TOKEN}"],
-        "env_schema": [
-            {
-                "name": "FIGMA_ACCESS_TOKEN",
-                "label": "Figma Personal Access Token",
-                "type": "password",
-                "placeholder": "figd_xxxxxxxxxxxxxxxxxxxxxxx",
-                "help": "Get from figma.com → Settings → Security → Personal access tokens",
-            }
-        ],
+        "env_schema": [],
         "input_schema": [],
         "target_audience": ["design", "marketing", "operations", "all"],
         "official": False,
