@@ -29,14 +29,14 @@ class ChatConfig(BaseModel):
     max_history_messages: int = Field(..., ge=1, le=100, description="Max chat turns passed to Chat LLM")
     max_msg_chars: int = Field(..., ge=100, le=20000, description="Character cap per message in history")
     max_rag_chunks: int = Field(..., ge=0, le=20, description="Number of RAG document chunks to inject")
+    max_output_tokens: int = Field(..., ge=64, le=128000, description="Max tokens the LLM may generate")
+    max_result_snippet: int = Field(2000, ge=100, le=10000, description="Character cap for recent tool result snippets")
 
-class PlannerConfig(BaseModel):
+class AgentConfig(BaseModel):
     max_history_messages: int = Field(..., ge=1, le=20, description="Max chat turns passed to Planner LLM")
     max_msg_chars: int = Field(..., ge=100, le=10000, description="Character cap per message in history")
     max_result_snippet: int = Field(..., ge=100, le=10000, description="Character cap for recent tool result snippets")
-
-class ExtractorConfig(BaseModel):
-    max_tokens: int = Field(..., ge=64, le=4096, description="Max tokens the Extractor LLM may generate")
+    max_output_tokens: int = Field(5120, ge=64, le=128000, description="Max tokens the LLM may generate")
 
 class AdvancedConfig(BaseModel):
     # Tier B placeholders
@@ -49,8 +49,7 @@ class HardwareConfig(BaseModel):
 
 class ContextConfigPayload(BaseModel):
     chat: Optional[ChatConfig] = None
-    planner: Optional[PlannerConfig] = None
-    extractor: Optional[ExtractorConfig] = None
+    agent: Optional[AgentConfig] = None
     advanced: Optional[AdvancedConfig] = None
     hardware: Optional[HardwareConfig] = None
 
@@ -135,10 +134,8 @@ def update_context_config(payload: ContextConfigPayload, bg_tasks: BackgroundTas
     # Apply updates
     if payload.chat is not None:
         current["chat"].update(payload.chat.model_dump(exclude_unset=True))
-    if payload.planner is not None:
-        current["planner"].update(payload.planner.model_dump(exclude_unset=True))
-    if payload.extractor is not None:
-        current["extractor"].update(payload.extractor.model_dump(exclude_unset=True))
+    if payload.agent is not None:
+        current["planner"].update(payload.agent.model_dump(exclude_unset=True))
     if payload.advanced is not None:
         current["advanced"].update(payload.advanced.model_dump(exclude_unset=True))
     if payload.hardware is not None:
@@ -179,22 +176,66 @@ def unload_model():
         
     return {"success": True, "message": f"Unloaded {len(loaded)} model(s)."}
 
+class LoadModelRequest(BaseModel):
+    model_id: int
+
+@router.post("/api/hardware/load")
+def load_active_model(req: LoadModelRequest):
+    if is_llm_busy():
+        raise HTTPException(
+            status_code=409, 
+            detail="Cannot switch model while a generation is in progress."
+        )
+    
+    from app.db.database import SessionLocal
+    from app.db.models import ModelRegistry
+    from app.core.agents.chat import get_llm_manager
+    
+    with SessionLocal() as db:
+        model = db.query(ModelRegistry).filter(ModelRegistry.id == req.model_id).first()
+        if not model or model.status != "downloaded":
+            raise HTTPException(status_code=404, detail="Model not found or not downloaded.")
+            
+        db.query(ModelRegistry).update({ModelRegistry.is_active: False})
+        model.is_active = True
+        db.commit()
+        
+    manager = get_llm_manager()
+    loaded = list(manager.loaded_models.keys())
+    for name in loaded:
+        manager.unload_model(name)
+        
+    return {"success": True, "message": f"Set active model successfully."}
+
 @router.get("/api/hardware/status")
 def get_hardware_status():
-    """Return active model and system RAM usage for the frontend UI."""
+    """Return active model, system RAM usage, and model capabilities for the frontend UI."""
     from app.core.agents.chat import get_llm_manager
     import psutil
     manager = get_llm_manager()
     loaded_models = list(manager.loaded_models.keys())
     
-    if loaded_models:
-        active_model = loaded_models[0]
-    else:
-        from app.db.database import SessionLocal
-        from app.db.models import LocalModel
-        with SessionLocal() as db:
-            first_model = db.query(LocalModel).filter(LocalModel.status == "downloaded").first()
-            active_model = first_model.repo_id if first_model else "None"
+    active_model = "None"
+    max_context = 4096
+    
+    from app.db.database import SessionLocal
+    from app.db.models import ModelRegistry
+    with SessionLocal() as db:
+        if loaded_models:
+            active_model = loaded_models[0]
+            # Try to fetch capabilities for the loaded model
+            model_info = db.query(ModelRegistry).filter(ModelRegistry.name == active_model).first()
+            if not model_info:
+                model_info = db.query(ModelRegistry).filter(ModelRegistry.repo_id == active_model).first()
+            if model_info and model_info.context_length:
+                max_context = model_info.context_length
+        else:
+            active = db.query(ModelRegistry).filter(ModelRegistry.is_active == True).first()
+            if not active:
+                active = db.query(ModelRegistry).filter(ModelRegistry.status == "downloaded").first()
+            if active:
+                active_model = active.repo_id or active.name
+                max_context = active.context_length or 4096
     
     mem = psutil.virtual_memory()
     total_gb = mem.total / (1024**3)
@@ -202,6 +243,7 @@ def get_hardware_status():
     
     return {
         "active_model": active_model,
+        "max_context": max_context,
         "ram_total_gb": round(total_gb, 1),
         "ram_used_gb": round(used_gb, 1),
         "ram_percent": mem.percent

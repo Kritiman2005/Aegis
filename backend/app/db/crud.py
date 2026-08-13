@@ -449,7 +449,6 @@ def get_system_settings(db: Session):
             id=1,
             chat_json="{}",
             planner_json="{}",
-            extractor_json="{}",
             advanced_json="{}",
             hardware_json="{}"
         )
@@ -462,7 +461,6 @@ def update_system_settings(
     db: Session,
     chat_json: Optional[str] = None,
     planner_json: Optional[str] = None,
-    extractor_json: Optional[str] = None,
     advanced_json: Optional[str] = None,
     hardware_json: Optional[str] = None
 ):
@@ -471,8 +469,6 @@ def update_system_settings(
         settings.chat_json = chat_json
     if planner_json is not None:
         settings.planner_json = planner_json
-    if extractor_json is not None:
-        settings.extractor_json = extractor_json
     if advanced_json is not None:
         settings.advanced_json = advanced_json
     if hardware_json is not None:

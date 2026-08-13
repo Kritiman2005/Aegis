@@ -145,7 +145,6 @@ class SystemSettings(Base):
     id = Column(Integer, primary_key=True, default=1)
     chat_json = Column(Text, nullable=False, default="{}")
     planner_json = Column(Text, nullable=False, default="{}")
-    extractor_json = Column(Text, nullable=False, default="{}")
     advanced_json = Column(Text, nullable=False, default="{}")
     hardware_json = Column(Text, nullable=False, default="{}")
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

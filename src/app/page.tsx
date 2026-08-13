@@ -3,6 +3,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import Sidebar, { TabType } from '@/components/Sidebar';
 import ChatView from '@/components/ChatView';
+import ContextMemoryHub from '@/components/ContextMemoryHub';
 import ConnectorsView from '@/components/ConnectorsView';
 import ModelHub from '@/components/ModelHub';
 import { useSocket } from '@/hooks/useSocket';
@@ -112,13 +113,8 @@ export default function Home() {
         {(activeTab === 'llms' || activeTab === 'model_hub') && (
           <ModelHub />
         )}
-        {activeTab === 'discover' && (
-          <div className="flex-1 flex items-center justify-center bg-[#F4F5F7]">
-            <div className="text-center">
-              <p className="text-2xl font-bold text-gray-900 mb-2">Discover</p>
-              <p className="text-sm text-gray-400">Coming soon — explore community workflows and agent templates.</p>
-            </div>
-          </div>
+        {activeTab === 'context' && (
+          <ContextMemoryHub />
         )}
       </div>
     </div>

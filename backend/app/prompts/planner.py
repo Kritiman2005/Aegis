@@ -111,6 +111,10 @@ CORRECT (follow-up using a known ID from recent results):
 AMBIGUITY & CLARIFYING QUESTIONS:
 If the user's request is ambiguous (e.g. asking to 'read the draft' when you have tools for both Gmail drafts and Google Drive documents), DO NOT guess. Return an empty "plan" array [] and provide a "clarifying_question" string asking the user what they meant. Also ask a clarifying question if a REQUIRED argument cannot be derived from context and no lookup tool can resolve it.
 
+CRITICAL RULE — AVOID UNNECESSARY CLARIFYING QUESTIONS:
+1. If the user asks you to draft, create, or send an email/message, and you have enough information for the required tool arguments, DO NOT ask a clarifying question to show them a text draft for approval first. Generate the plan to execute the tool immediately. (The user will review your plan in the UI before it executes anyway.)
+2. If the user explicitly confirms a previous question (e.g., "yes", "send it", "looks good"), you MUST generate a plan with the appropriate tool. NEVER repeat the clarifying question or output an empty plan when the user has confirmed.
+
 FORMAT EXAMPLE:
 {{
   "direct_response": "These are the solutions you requested: ...",

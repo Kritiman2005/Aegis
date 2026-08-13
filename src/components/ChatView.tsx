@@ -74,10 +74,7 @@ export default function ChatView({
   const [schedulingPlanId, setSchedulingPlanId] = useState<string | null>(null);
   const [scheduleCron, setScheduleCron] = useState<string>('every_1_hour');
   
-  // Memory Extraction UI State
-  const [activeBookmarkIndex, setActiveBookmarkIndex] = useState<number | null>(null);
-  const [extractionPrompt, setExtractionPrompt] = useState('');
-  const [selectedChips, setSelectedChips] = useState<Set<number>>(new Set());
+
   
   // Plan Editing State
   const [editingPlanId, setEditingPlanId] = useState<string | null>(null);
@@ -119,40 +116,7 @@ export default function ChatView({
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const handleSaveWholeMessage = (index: number, msgId: string) => {
-    setSavingMsgId(msgId);
-    setActiveBookmarkIndex(null);
-    const content = messages[index].content;
-    onSendMessage(content, 'save_whole_message', chatMode);
-    
-    setTimeout(() => {
-      setSavingMsgId(null);
-      setSavedMsgId(msgId);
-      setTimeout(() => setSavedMsgId(null), 2000);
-    }, 1000);
-  };
 
-  const handleExtractSpecificFacts = (index: number, msgId: string) => {
-    if (!extractionPrompt.trim()) return;
-    setSavingMsgId(msgId);
-    setActiveBookmarkIndex(null);
-    
-    // Gather context
-    const startIndex = Math.max(0, index - 2);
-    const contextWindow = messages
-      .slice(startIndex, index + 1)
-      .map(m => `[${m.role}] ${m.content}`)
-      .join('\n\n');
-      
-    onSendMessage(contextWindow, 'extract_specific_facts', chatMode, extractionPrompt);
-    setExtractionPrompt('');
-    
-    setTimeout(() => {
-      setSavingMsgId(null);
-      setSavedMsgId(msgId);
-      setTimeout(() => setSavedMsgId(null), 2000);
-    }, 1000);
-  };
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -292,75 +256,12 @@ export default function ChatView({
                   {/* Sender Header */}
                   <div className={`flex items-center gap-2 text-[11px] text-gray-400 ${isUser ? 'justify-end' : 'justify-start'} mb-1.5`}>
                     <span className="font-semibold text-gray-700 flex items-center gap-2">
-                      {isUser ? 'You' : (hardwareStatus ? (
-                        <>
-                          {hardwareStatus.active_model}
-                          <span className={`text-[9px] px-1.5 py-0.5 rounded-sm font-medium ${
-                            hardwareStatus.ram_percent > 90 ? 'bg-red-100 text-red-600' :
-                            hardwareStatus.ram_percent > 75 ? 'bg-orange-100 text-orange-600' :
-                            'bg-green-100 text-green-600'
-                          }`}>
-                            RAM: {hardwareStatus.ram_percent.toFixed(0)}%
-                          </span>
-                        </>
-                      ) : 'Aegis')}
+                      {isUser ? 'You' : 'Aegis'}
                     </span>
                     <span>•</span>
                     <span>
                       {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                     </span>
-                    {!msg.isStreaming && (
-                      <div className="relative">
-                        <button
-                          onClick={() => setActiveBookmarkIndex(activeBookmarkIndex === index ? null : index)}
-                          disabled={savingMsgId === msg.id}
-                          className={`ml-2 p-1 rounded transition-colors ${
-                            savedMsgId === msg.id ? 'text-teal-500' : 'hover:text-gray-900 hover:bg-gray-100'
-                          }`}
-                          title="Save context to memory"
-                        >
-                          {savingMsgId === msg.id ? (
-                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                          ) : savedMsgId === msg.id ? (
-                            <Check className="w-3.5 h-3.5" />
-                          ) : (
-                            <Bookmark className="w-3.5 h-3.5" />
-                          )}
-                        </button>
-                        
-                        {activeBookmarkIndex === index && (
-                          <div className="absolute top-full mt-1 right-0 w-64 bg-white rounded-xl shadow-lg border border-gray-100 p-2 z-10 flex flex-col gap-1 text-left">
-                            <button
-                              onClick={() => handleSaveWholeMessage(index, msg.id)}
-                              className="text-left px-3 py-2 text-xs font-medium text-gray-700 hover:bg-gray-50 rounded-lg w-full"
-                            >
-                              Save Entire Message
-                            </button>
-                            <div className="px-3 py-2 text-xs border-t border-gray-50 mt-1">
-                              <span className="font-semibold text-gray-500 mb-1 block">Extract Specific Fact</span>
-                              <div className="flex gap-1">
-                                <input
-                                  type="text"
-                                  value={extractionPrompt}
-                                  onChange={(e) => setExtractionPrompt(e.target.value)}
-                                  placeholder="e.g. Priya's email"
-                                  className="flex-1 bg-gray-50 border border-gray-200 rounded px-2 py-1 outline-none focus:border-indigo-400"
-                                  onKeyDown={(e) => {
-                                    if (e.key === 'Enter') handleExtractSpecificFacts(index, msg.id);
-                                  }}
-                                />
-                                <button
-                                  onClick={() => handleExtractSpecificFacts(index, msg.id)}
-                                  className="bg-indigo-600 text-white rounded px-2 hover:bg-indigo-700 transition-colors"
-                                >
-                                  Save
-                                </button>
-                              </div>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    )}
                   </div>
 
                   {/* Message Body */}
@@ -595,137 +496,7 @@ export default function ChatView({
                         </div>
                       );
                       })()}
-                      {/* Interactive Memory Extraction Card */}
-                      {msg.content.includes('Proposed Memory Extraction:') && (
-                        <div className="p-4 rounded-xl bg-indigo-50 border border-indigo-100 space-y-3">
-                          <div className="flex items-center justify-between border-b border-indigo-200 pb-2">
-                            <span className="text-xs font-bold text-indigo-900 flex items-center gap-1.5">
-                              <Save className="w-4 h-4 text-indigo-600" />
-                              Memory Extraction Proposed
-                            </span>
-                            <span className="text-[10px] text-indigo-400">Review Required</span>
-                          </div>
 
-                          <div className="flex flex-col gap-2 pt-1">
-                            {editingPlanId === msg.id ? (
-                              <div className="space-y-2">
-                                <textarea
-                                  value={planEditContent}
-                                  onChange={(e) => setPlanEditContent(e.target.value)}
-                                  className="w-full text-xs font-mono bg-white border border-indigo-200 rounded-lg p-3 h-48 outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
-                                />
-                                <div className="flex gap-2">
-                                  <button
-                                    onClick={() => {
-                                      onSendMessage(`Please use exactly this updated memory:\n\n${planEditContent}`, 'message', chatMode);
-                                      setEditingPlanId(null);
-                                    }}
-                                    className="px-4 py-2 rounded-xl bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700 transition-all shadow-sm"
-                                  >
-                                    Submit Memory Edit
-                                  </button>
-                                  <button
-                                    onClick={() => setEditingPlanId(null)}
-                                    className="px-4 py-2 rounded-xl bg-indigo-200 text-indigo-800 text-xs font-medium hover:bg-indigo-300 transition-all"
-                                  >
-                                    Cancel Edit
-                                  </button>
-                                </div>
-                              </div>
-                            ) : (() => {
-                              let parsedChips = null;
-                              try {
-                                const rawJsonStr = msg.content.split('└ *Preview:*\\n> ')[1]?.replace(/\\n> /g, '\\n') || '';
-                                if (!rawJsonStr) {
-                                  // fallback if formatting differs
-                                  const jsonMatch = msg.content.match(/```json\n([\s\S]*?)\n```/);
-                                  if (jsonMatch) parsedChips = JSON.parse(jsonMatch[1]);
-                                  else {
-                                    // Try to parse the blockquote preview
-                                    const previewParts = msg.content.split('Preview:*');
-                                    if(previewParts.length > 1) {
-                                      const text = previewParts[1].replace(/> /g, '').trim();
-                                      parsedChips = JSON.parse(text);
-                                    }
-                                  }
-                                } else {
-                                  parsedChips = JSON.parse(rawJsonStr);
-                                }
-                              } catch(e) {}
-
-                              return (
-                                <div>
-                                  {parsedChips && Array.isArray(parsedChips) && (
-                                    <div className="flex flex-wrap gap-2 mb-4">
-                                      {parsedChips.map((chip, idx) => (
-                                        <button
-                                          key={idx}
-                                          onClick={() => {
-                                            const next = new Set(selectedChips);
-                                            if (next.has(idx)) next.delete(idx);
-                                            else next.add(idx);
-                                            setSelectedChips(next);
-                                          }}
-                                          className={`px-3 py-2 rounded-lg text-xs font-medium border text-left flex flex-col gap-1 transition-all ${
-                                            selectedChips.has(idx) 
-                                              ? 'bg-indigo-600 border-indigo-600 text-white shadow-md' 
-                                              : 'bg-white border-indigo-200 text-indigo-900 hover:bg-indigo-50'
-                                          }`}
-                                        >
-                                          <strong>{chip.label}</strong>
-                                          <span className={`text-[10px] ${selectedChips.has(idx) ? 'text-indigo-200' : 'text-indigo-500'}`}>
-                                            Type: {chip.type}
-                                          </span>
-                                        </button>
-                                      ))}
-                                    </div>
-                                  )}
-                                  
-                                  <div className="flex flex-wrap gap-2">
-                                    <button
-                                      onClick={() => {
-                                        if (parsedChips && Array.isArray(parsedChips) && selectedChips.size > 0) {
-                                          const selected = Array.from(selectedChips).map(idx => (idx + 1).toString()).join(' ');
-                                          onSendMessage(selected, 'message', chatMode);
-                                        } else {
-                                          onSendMessage('yes', 'message', chatMode);
-                                        }
-                                        setSelectedChips(new Set());
-                                      }}
-                                      className="px-4 py-2 rounded-xl bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700 transition-all shadow-sm"
-                                    >
-                                      {selectedChips.size > 0 ? `Save Selected (${selectedChips.size})` : 'Save All'}
-                                    </button>
-                                    <button
-                                      onClick={() => {
-                                        setEditingPlanId(msg.id);
-                                        let rawJsonStr = '';
-                                        const previewParts = msg.content.split('Preview:*');
-                                        if(previewParts.length > 1) {
-                                          rawJsonStr = previewParts[1].replace(/> /g, '').trim();
-                                        }
-                                        setPlanEditContent(rawJsonStr);
-                                      }}
-                                      className="px-4 py-2 rounded-xl bg-indigo-100 text-indigo-700 text-xs font-medium hover:bg-indigo-200 transition-all"
-                                    >
-                                      Edit Details
-                                    </button>
-                                    <button
-                                      onClick={() => {
-                                        onSendMessage('no', 'message', chatMode);
-                                        setSelectedChips(new Set());
-                                      }}
-                                      className="px-4 py-2 rounded-xl border border-indigo-200 text-red-600 bg-white text-xs font-medium hover:bg-red-50 transition-all"
-                                    >
-                                      Cancel Save
-                                    </button>
-                                  </div>
-                                </div>
-                              );
-                            })()}
-                          </div>
-                        </div>
-                      )}
                       </div>
                       )}
                     </div>
@@ -752,18 +523,7 @@ export default function ChatView({
             <div className="space-y-2 max-w-2xl items-start w-full">
               <div className="flex items-center gap-2 text-[11px] text-gray-400 justify-start mb-1">
                 <span className="font-semibold text-gray-700 flex items-center gap-2">
-                  {hardwareStatus ? (
-                    <>
-                      {hardwareStatus.active_model}
-                      <span className={`text-[9px] px-1.5 py-0.5 rounded-sm font-medium ${
-                        hardwareStatus.ram_percent > 90 ? 'bg-red-100 text-red-600' :
-                        hardwareStatus.ram_percent > 75 ? 'bg-orange-100 text-orange-600' :
-                        'bg-green-100 text-green-600'
-                      }`}>
-                        RAM: {hardwareStatus.ram_percent.toFixed(0)}%
-                      </span>
-                    </>
-                  ) : 'Aegis'}
+                  Aegis
                 </span>
                 <span>•</span>
                 <span className="italic">Generating...</span>
@@ -879,7 +639,20 @@ export default function ChatView({
                 onClick={() => setChatMode(chatMode === 'chat' ? 'agent' : 'chat')}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-gray-100 hover:bg-gray-200 text-gray-700 transition-colors"
               >
-                {chatMode === 'agent' ? <><Sparkles className="w-3.5 h-3.5 text-[#5B50F0]" /> {hardwareStatus?.active_model || 'Agent'}</> : <>{hardwareStatus?.active_model || 'Models'} <CornerDownLeft className="w-3 h-3" /></>}
+                {chatMode === 'agent' ? (
+                  <><Sparkles className="w-3.5 h-3.5 text-[#5B50F0]" /> {hardwareStatus?.active_model || 'Agent'}</>
+                ) : (
+                  <>{hardwareStatus?.active_model || 'Models'} <CornerDownLeft className="w-3 h-3" /></>
+                )}
+                {hardwareStatus && (
+                  <span className={`text-[9px] px-1.5 py-0.5 rounded-sm font-medium ml-1 ${
+                    hardwareStatus.ram_percent > 90 ? 'bg-red-100 text-red-600' :
+                    hardwareStatus.ram_percent > 75 ? 'bg-orange-100 text-orange-600' :
+                    'bg-green-100 text-green-600'
+                  }`}>
+                    RAM: {hardwareStatus.ram_percent.toFixed(0)}%
+                  </span>
+                )}
               </button>
 
               <button

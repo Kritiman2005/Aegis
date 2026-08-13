@@ -4,7 +4,7 @@ import { useState } from 'react';
 import { 
   Link2,
   Cpu,
-  Compass,
+  Database,
   MessageSquarePlus,
   ChevronDown,
   ChevronUp,
@@ -26,7 +26,7 @@ interface SidebarProps {
 const NAV_ITEMS = [
   { id: 'connectors' as TabType, label: 'Connectors', icon: Link2 },
   { id: 'llms'       as TabType, label: 'LLMs',        icon: Cpu },
-  { id: 'discover'   as TabType, label: 'Discover',    icon: Compass },
+  { id: 'context'    as TabType, label: 'Context & Memory', icon: Database },
 ];
 
 export default function Sidebar({

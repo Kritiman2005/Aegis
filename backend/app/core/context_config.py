@@ -19,19 +19,19 @@ DEFAULTS: Dict[str, Any] = {
         "max_history_messages": 20,
         "max_msg_chars": 4000,
         "max_rag_chunks": 5,
+        "max_output_tokens": 5120,
+        "max_result_snippet": 2000,
     },
     "planner": {
         "max_history_messages": 6,
         "max_msg_chars": 2000,
         "max_result_snippet": 2000,
+        "max_output_tokens": 5120,
     },
     "executor": {
         # Executor is intentionally stateless — no history, schema-only.
         # This block is informational only; no tunable parameters.
         "description": "Executor is isolated by design. It receives only the tool schema for the current step and no chat history, ensuring deterministic JSON argument generation."
-    },
-    "extractor": {
-        "max_tokens": 1024,
     },
     "hardware": {
         # Number of threads in the LLM executor.
@@ -58,7 +58,6 @@ def load() -> Dict[str, Any]:
             stored = {
                 "chat": json.loads(settings.chat_json),
                 "planner": json.loads(settings.planner_json),
-                "extractor": json.loads(settings.extractor_json),
                 "advanced": json.loads(settings.advanced_json),
                 "hardware": json.loads(settings.hardware_json)
             }
@@ -83,7 +82,6 @@ def save(config: Dict[str, Any]) -> None:
                 db,
                 chat_json=json.dumps(config.get("chat", {})),
                 planner_json=json.dumps(config.get("planner", {})),
-                extractor_json=json.dumps(config.get("extractor", {})),
                 advanced_json=json.dumps(config.get("advanced", {})),
                 hardware_json=json.dumps(config.get("hardware", {}))
             )

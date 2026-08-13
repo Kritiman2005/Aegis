@@ -10,11 +10,8 @@ Usage:
 
 from app.prompts.planner import build_planner_prompt
 from app.prompts.executor import build_executor_prompt
-from app.prompts.entity_extractor import ENTITY_EXTRACTOR_SYSTEM, build_entity_extractor_user_msg
 
 __all__ = [
     "build_planner_prompt",
     "build_executor_prompt",
-    "ENTITY_EXTRACTOR_SYSTEM",
-    "build_entity_extractor_user_msg",
 ]
