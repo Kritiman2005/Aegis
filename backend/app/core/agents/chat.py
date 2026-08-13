@@ -1107,15 +1107,20 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
 
                 accumulated_items: List[Any] = []
                 current_arguments = dict(arguments)
+                # Inject page=1 for paginated tools if not already present
+                if "page" not in current_arguments and fetch_scope in ("exhaustive", "sample"):
+                    current_arguments["page"] = 1
                 prev_cursor_value = None
                 cap_hit = False
                 auto_paginated = False
+                loop_stop_reason = "single"  # single | last_page | safety | stall | cap
 
                 for page_num in range(page_cap):
                     if page_num == 0:
-                        yield {"text": f"Running `{tool_name}` (page 1)...\n", "node_id": node_id, "status": "running"}
+                        verb = "Fetching" if page_cap == 1 else "Fetching all pages of"
+                        yield {"text": f"{verb} `{tool_name}`…\n", "node_id": node_id, "status": "running"}
                     else:
-                        yield {"text": f"Auto-fetching page {page_num + 1} for `{tool_name}`...\n", "node_id": node_id, "status": "running"}
+                        yield {"text": f"  ↳ Page {page_num + 1}…\n", "node_id": node_id, "status": "running"}
                         auto_paginated = True
 
                     result = await anyio.to_thread.run_sync(
@@ -1129,48 +1134,103 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
                         raw_parsed = result
 
                     shaped_for_exec = shape_for_executor(tool_name, raw_parsed)
-                    shaped_for_display = shape_for_display(tool_name, raw_parsed)
                     accumulated_items.append(shaped_for_exec)
+                    # ↑ Do NOT yield a step_result here. Hold everything until all
+                    #   pages are done, then emit one smart summary card below.
 
-                    # Stream page result to UI immediately
-                    yield {
-                        "type": "step_result",
-                        "text": shaped_for_display,
-                        "node_id": node_id,
-                        "status": "completed",
-                        "tool": tool_name,
-                    }
-
-                    # Decide whether to fetch next page
+                    # ── Decide next action ─────────────────────────────────────
                     if page_cap == 1:
-                        break  # single scope — done
-
-                    if not safe_to_loop:
-                        logger.warning(
-                            f"[Pagination] Tool '{tool_name}' failed safety gate — "
-                            "stopping after page 1 (mutating or unreviewed tool)"
-                        )
+                        loop_stop_reason = "single"
                         break
 
-                    # Deterministic cursor extraction
+                    if not safe_to_loop:
+                        loop_stop_reason = "safety"
+                        break
+
+                    # GitHub-style: plain list → infer more pages from count
+                    if isinstance(raw_parsed, list):
+                        per_page_default = int(current_arguments.get("per_page", 30))
+                        if len(raw_parsed) >= per_page_default:
+                            current_arguments["page"] = current_arguments.get("page", 1) + 1
+                            logger.info(
+                                f"[Pagination] Full page ({len(raw_parsed)} items) — fetching page {current_arguments['page']}"
+                            )
+                            continue
+                        else:
+                            loop_stop_reason = "last_page"
+                            logger.info(
+                                f"[Pagination] Partial page ({len(raw_parsed)}/{per_page_default}) — done"
+                            )
+                            break
+
+                    # Cursor-based tools (Gmail, Notion, Drive, Slack, …)
                     cursor_info = get_next_cursor(
                         tool_name, raw_parsed if isinstance(raw_parsed, dict) else {}
                     )
                     if cursor_info is None:
-                        break  # cursor exhausted — pagination complete
+                        loop_stop_reason = "last_page"
+                        break
 
                     new_cursor = cursor_info["cursor_value"]
                     if new_cursor == prev_cursor_value:
-                        logger.warning(f"[Pagination] Stall detected for '{tool_name}' — cursor unchanged.")
+                        loop_stop_reason = "stall"
+                        logger.warning(f"[Pagination] Cursor stall for '{tool_name}'")
                         break
 
                     prev_cursor_value = new_cursor
                     current_arguments = dict(arguments)
                     current_arguments[cursor_info["inject_arg"]] = new_cursor
                 else:
-                    cap_hit = True  # loop ran to completion without a break
+                    cap_hit = True
+                    loop_stop_reason = "cap"
 
-                # Merge accumulated pages into final result
+                # ── Emit ONE final result card ─────────────────────────────────
+                from app.mcp.response_shapers import shape_accumulated_response
+                final_display = shape_accumulated_response(
+                    tool_name, accumulated_items, len(accumulated_items)
+                )
+                yield {
+                    "type": "step_result",
+                    "text": final_display,
+                    "node_id": node_id,
+                    "status": "completed",
+                    "tool": tool_name,
+                }
+
+                # ── Warn user for non-goal-reaching stops ─────────────────────
+                if loop_stop_reason == "safety":
+                    yield {
+                        "text": (
+                            f"\n> ⚠️ **Note:** `{tool_name}` is a write-capable or unreviewed tool "
+                            "and cannot be auto-paginated for safety. Only the first page was fetched. "
+                            "Ask me to fetch the next page explicitly if you need more.\n"
+                        ),
+                        "node_id": node_id,
+                        "status": "completed",
+                    }
+                elif loop_stop_reason == "stall":
+                    # Cursor didn't advance — treat like a cap hit and ask user
+                    self._pagination_state = {
+                        "tool_results": tool_results,
+                        "prior_results_map": prior_results_map,
+                        "cap_hit_steps": [{"tool": tool_name, "result": json.dumps(accumulated_items)}],
+                        "token_callback": token_callback,
+                    }
+                    self.state = AgentState.WAITING_LOOP_CONTINUATION
+                    yield {
+                        "text": (
+                            f"\n\n**Pagination Stalled** for `{tool_name}`\n\n"
+                            f"The cursor stopped advancing after {len(accumulated_items)} page(s). "
+                            "This may mean the API returned the same page twice, or all results have been collected.\n\n"
+                            "__PAGINATION_CAP__\n\n"
+                            "**Would you like to stop here or retry?** Reply **'yes'** to retry from the next page or **'no'** to proceed with what was collected."
+                        ),
+                        "node_id": None,
+                        "status": "waiting",
+                    }
+                    return
+
+                # Build the merged exec output for subsequent plan steps and history
                 final_exec_output = (
                     accumulated_items[0] if len(accumulated_items) == 1
                     else {
@@ -1275,51 +1335,9 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
         self.state = AgentState.IDLE
         self.plan = None
 
-        # ── LLM Synthesis Step ───────────────────────────────────────────────
-        # Synthesize a final conversational response summarizing the tool outputs
-        # and directly answering the user's original query.
-        if tool_results:
-            yield {"text": "\n\n*Synthesizing final answer...*\n\n", "node_id": None}
-            try:
-                full_history = await self._get_history()
-                # Build context for the synthesis LLM call
-                system_prompt = (
-                    "You are Aegis, a helpful AI assistant. You just executed a plan to help the user. "
-                    "Based ONLY on the Execution Results below (and prior chat history), answer the user's most recent request directly and concisely. "
-                    "If the tools didn't return exactly what was asked (e.g. only returned a partial list due to pagination), explain that clearly. "
-                    "Do NOT say 'What would you like to do next?' unless you genuinely need their input."
-                )
-                
-                messages = [{"role": "system", "content": system_prompt}]
-                
-                # Take the last few messages, including the execution results we just appended
-                capped_history = [
-                    {"role": m["role"], "content": m["content"][-3000:]} 
-                    for m in full_history[-6:]
-                ]
-                messages.extend(capped_history)
-                
-                synthesis = ""
-                def _token_cb(t):
-                    nonlocal synthesis
-                    synthesis += t
-                    if token_callback:
-                        token_callback(t)
-
-                import asyncio
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    llm_executor, 
-                    lambda: self._call_llm_text(messages, _token_cb)
-                )
-                
-                if synthesis:
-                    await self._append_history("assistant", synthesis)
-            except Exception as e:
-                logger.error(f"Synthesis failed: {e}")
-                yield {"text": "\n\nExecution finished. What would you like to do next?", "node_id": None}
-        else:
-            yield {"text": "\n\nWhat would you like to do next?", "node_id": None}
+        # No LLM synthesis step — the step_result cards above already display the
+        # tool output in a rich structured card. Skipping synthesis saves one full
+        # local LLM round-trip and removes the latency spike after every agent plan.
 
     # ─────────────────────────────────────────────────────────────────────────
     # Manual Memory Extraction

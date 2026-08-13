@@ -735,3 +735,120 @@ def shape_for_display(tool_name: str, raw: Any) -> str:
     if len(raw_str) > 2000:
         raw_str = raw_str[:2000] + "\n… [TRUNCATED]"
     return f"```json\n{raw_str}\n```"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Accumulated (multi-page) response shaper
+# Called ONCE after all pagination pages are fetched.
+# Returns a single concise markdown summary that directly answers the user's
+# question — e.g. "You have 87 total commits" not a dump of 87 commit objects.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _merge_list_field(accumulated: list, field: str) -> list:
+    """Flatten a repeated list field from multiple shaped exec pages."""
+    out = []
+    for page in accumulated:
+        if isinstance(page, dict):
+            out.extend(page.get(field, []))
+    return out
+
+
+def shape_accumulated_response(
+    tool_name: str,
+    accumulated_items: list,
+    pages_fetched: int,
+) -> str:
+    """
+    Produce a single user-facing markdown card after all pages of an exhaustive
+    fetch are done.  Answers the question directly (count, summary) rather than
+    dumping every item.
+
+    Args:
+        tool_name:        The MCP tool that was called.
+        accumulated_items: List of shape_for_executor outputs, one per page.
+        pages_fetched:    How many pages were fetched (for the footer note).
+    """
+    if not accumulated_items:
+        return "_No results returned._"
+
+    page_note = f" · {pages_fetched} pages fetched" if pages_fetched > 1 else ""
+
+    # ── GitHub: list_commits ──────────────────────────────────────────────────
+    if tool_name == "list_commits":
+        commits = _merge_list_field(accumulated_items, "commits")
+        total = len(commits)
+        lines = [
+            f"### 📊  Total commits: **{_num(total)}**{page_note}",
+            "",
+        ]
+        if commits:
+            lines.append("**Most recent:**")
+            for c in commits[:12]:
+                sha = c.get("sha", "")
+                msg = _trunc(c.get("message", ""), 72)
+                author = c.get("author", "")
+                date = c.get("date", "")
+                lines.append(f"- `{sha}` {msg} — *{author}* · {date}")
+            if total > 12:
+                lines.append(f"\n*…and {total - 12} more*")
+        return "\n".join(lines)
+
+    # ── GitHub: list_issues ───────────────────────────────────────────────────
+    if tool_name == "list_issues":
+        issues = _merge_list_field(accumulated_items, "issues")
+        total = len(issues)
+        lines = [f"### 🐛  Total issues: **{_num(total)}**{page_note}", ""]
+        for iss in issues[:12]:
+            num = iss.get("number", "")
+            title = _trunc(iss.get("title", ""), 72)
+            state = iss.get("state", "")
+            lines.append(f"- **#{num}** {title} `{state}`")
+        if total > 12:
+            lines.append(f"\n*…and {total - 12} more*")
+        return "\n".join(lines)
+
+    # ── Gmail: list_messages / search_messages ────────────────────────────────
+    if tool_name in ("list_messages", "search_messages"):
+        messages = _merge_list_field(accumulated_items, "messages")
+        total = len(messages)
+        lines = [f"### 📧  Total emails: **{_num(total)}**{page_note}", ""]
+        for m in messages[:10]:
+            subj = _trunc(m.get("subject", "(no subject)"), 60)
+            sender = m.get("from", "")
+            date = m.get("date", "")
+            lines.append(f"- **{subj}** — *{sender}* · {date}")
+        if total > 10:
+            lines.append(f"\n*…and {total - 10} more*")
+        return "\n".join(lines)
+
+    # ── Google Drive: list_files / search_files ───────────────────────────────
+    if tool_name in ("list_files", "search_files"):
+        files = _merge_list_field(accumulated_items, "files")
+        total = len(files)
+        lines = [f"### 📁  Total files: **{_num(total)}**{page_note}", ""]
+        for f in files[:12]:
+            name = _trunc(f.get("name", ""), 60)
+            mime = f.get("mimeType", "")
+            modified = f.get("modifiedTime", "")
+            lines.append(f"- 📄 **{name}** — `{mime}` · {modified}")
+        if total > 12:
+            lines.append(f"\n*…and {total - 12} more*")
+        return "\n".join(lines)
+
+    # ── Generic single-page fallback ──────────────────────────────────────────
+    if len(accumulated_items) == 1:
+        return shape_for_display(tool_name, accumulated_items[0])
+
+    # ── Generic multi-page fallback: just count items ─────────────────────────
+    # Try to find the first list field and count across pages
+    total_items = 0
+    for page in accumulated_items:
+        if isinstance(page, dict):
+            for v in page.values():
+                if isinstance(v, list):
+                    total_items += len(v)
+                    break
+    if total_items:
+        return f"**{_num(total_items)} total items** fetched across {pages_fetched} pages."
+    return f"**{pages_fetched} pages** of results fetched successfully."
+
