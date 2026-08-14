@@ -81,7 +81,7 @@ OAUTH_CONFIGS: Dict[str, dict] = {
         "display_name": "Figma",
         "auth_url": "https://www.figma.com/oauth",
         "token_url": "https://api.figma.com/v1/oauth/token",
-        "scopes": "file_read",
+        "scopes": "",  # Scopes are set per-app in the Figma Developer Portal — leave empty to use the app defaults
         "client_id_env": "FIGMA_CLIENT_ID",
         "client_secret_env": "FIGMA_CLIENT_SECRET",
         "token_auth": "basic",

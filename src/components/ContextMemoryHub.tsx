@@ -157,21 +157,32 @@ export default function ContextMemoryHub() {
     }
   };
 
-  // Rough estimation logic matching the requested UI visually
-  const activeMaxTokens = mode === 'chat' ? chatConfig.max_output_tokens : agentConfig.max_output_tokens;
-  const extraKvGb = (activeMaxTokens - 2048) * 0.00015;
-  const otherAppsGb = hardware ? (hardware.ram_used_gb > 2 ? hardware.ram_used_gb - 2 : hardware.ram_used_gb) : 14.4;
-  const modelEstimatedGb = (hardware && hardware.active_model !== 'None' ? 6.8 : 0) + extraKvGb; 
-  const availableGb = hardware ? Math.max(0, hardware.ram_total_gb - hardware.ram_used_gb - extraKvGb) : 1.6 - extraKvGb;
+  // === Dynamic RAM & Latency Estimation ===
+  const modelMaxContext = hardware?.max_context || 4096;
+  const activeTokens = mode === 'chat' ? chatConfig.max_output_tokens : agentConfig.max_output_tokens;
+
+  // KV cache: each token costs ~0.5 MB for a typical 3B model (2 layers * 2 (K+V) * hidden_dim * bytes)
+  // Scale it by ratio of requested context vs model max context
+  const contextRatio = activeTokens / modelMaxContext;
+  const baseKvGb = modelMaxContext * 0.000125;  // approx at model max
+  const extraKvGb = baseKvGb * contextRatio;     // scales proportionally
+
+  const otherAppsGb = hardware ? (hardware.ram_used_gb > 2 ? hardware.ram_used_gb - 2 : hardware.ram_used_gb) : 0;
+  const modelBaseGb = (hardware && hardware.active_model !== 'None') ? 2.0 : 0; // approx weights only
+  const modelEstimatedGb = modelBaseGb + extraKvGb;
+  const availableGb = hardware ? Math.max(0, hardware.ram_total_gb - hardware.ram_used_gb - extraKvGb) : 0;
   const isLowMemory = availableGb < 2;
+
+  // Latency tier based on context ratio
+  const latencyLabel = contextRatio > 0.75 ? 'High' : contextRatio > 0.4 ? 'Medium' : 'Low';
+  const latencyColor = contextRatio > 0.75 ? 'text-red-500' : contextRatio > 0.4 ? 'text-amber-500' : 'text-green-600';
 
   // Chart circle geometry
   const radius = 60;
   const stroke = 12;
   const normalizedRadius = radius - stroke * 2;
   const circumference = normalizedRadius * 2 * Math.PI;
-  // Let's just make a static looking visual for the donut that shows portions
-  const strokeDashoffset = circumference - ((availableGb > 0 ? (availableGb / (hardware?.ram_total_gb || 16)) : 0.1) * circumference);
+  const strokeDashoffset = circumference - ((availableGb > 0 ? (availableGb / (hardware?.ram_total_gb || 16)) : 0.05) * circumference);
 
   return (
     <div className="flex-1 overflow-y-auto bg-[#F4F5F7] p-8 font-sans">
@@ -256,8 +267,8 @@ export default function ContextMemoryHub() {
                 </div>
                 <div className="bg-gray-50 p-3 rounded-xl">
                   <div className="text-[9px] font-bold text-gray-400 tracking-wider uppercase mb-0.5">Latency Est.</div>
-                  <div className={`text-sm font-bold ${isLowMemory ? 'text-red-500' : 'text-indigo-600'}`}>
-                    {isLowMemory ? 'High' : 'Normal'}
+                  <div className={`text-sm font-bold ${latencyColor}`}>
+                    {latencyLabel}
                   </div>
                 </div>
               </div>
@@ -311,19 +322,20 @@ export default function ContextMemoryHub() {
                     <span className="text-[10px] text-gray-400">tokens</span>
                   </div>
                   <div className="flex items-center gap-2">
+                    <span className="px-1.5 py-0.5 bg-amber-50 text-amber-600 rounded text-[9px] font-bold tracking-wide">Latency {latencyLabel}</span>
                     <span className="px-1.5 py-0.5 bg-indigo-50 text-indigo-500 rounded text-[9px] font-bold tracking-wide">RAM ↑</span>
                     <span className="text-sm font-bold text-indigo-600">{chatConfig.max_output_tokens.toLocaleString()}</span>
                   </div>
                 </div>
                 <input 
-                  type="range" min={2048} max={hardware?.max_context || 8192} step={1024}
+                  type="range" min={2048} max={hardware?.max_context || 4096} step={512}
                   value={chatConfig.max_output_tokens}
                   onChange={(e) => handleChatChange('max_output_tokens', parseInt(e.target.value))}
                   className="w-full h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-indigo-600 focus:outline-none"
                 />
                 <div className="flex justify-between text-[10px] font-medium text-gray-400 mt-2">
                   <span>2,048</span>
-                  <span>{(hardware?.max_context || 8192).toLocaleString()}</span>
+                  <span className="text-indigo-500 font-bold">Model max: {(hardware?.max_context || 4096).toLocaleString()}</span>
                 </div>
               </div>
 
@@ -407,19 +419,20 @@ export default function ContextMemoryHub() {
                     <span className="text-[10px] text-gray-400">tokens</span>
                   </div>
                   <div className="flex items-center gap-2">
+                    <span className="px-1.5 py-0.5 bg-amber-50 text-amber-600 rounded text-[9px] font-bold tracking-wide">Latency {latencyLabel}</span>
                     <span className="px-1.5 py-0.5 bg-indigo-50 text-indigo-500 rounded text-[9px] font-bold tracking-wide">RAM ↑</span>
                     <span className="text-sm font-bold text-indigo-600">{agentConfig.max_output_tokens.toLocaleString()}</span>
                   </div>
                 </div>
                 <input 
-                  type="range" min={2048} max={hardware?.max_context || 8192} step={1024}
+                  type="range" min={2048} max={hardware?.max_context || 4096} step={512}
                   value={agentConfig.max_output_tokens}
                   onChange={(e) => handleAgentChange('max_output_tokens', parseInt(e.target.value))}
                   className="w-full h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-indigo-600 focus:outline-none"
                 />
                 <div className="flex justify-between text-[10px] font-medium text-gray-400 mt-2">
                   <span>2,048</span>
-                  <span>{(hardware?.max_context || 8192).toLocaleString()}</span>
+                  <span className="text-indigo-500 font-bold">Model max: {(hardware?.max_context || 4096).toLocaleString()}</span>
                 </div>
               </div>
 
