@@ -508,7 +508,9 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
         try:
             plan_data = json.loads(plan_json_str, strict=False)
         except json.JSONDecodeError:
-            return "Error: Planner output invalid JSON."
+            self.state = AgentState.IDLE
+            self.plan = None
+            return "❌ Planner generated invalid JSON. Please try your request again."
         
         if isinstance(plan_data, list):
             raw_plan = plan_data
@@ -936,6 +938,56 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
                 self.state = AgentState.IDLE
                 self.plan = None
                 return
+
+            # Semantic Grounding Check: Catch schema-valid but hallucinated IDs
+            # Only validate ID-shaped arguments for steps that explicitly depend on previous outputs.
+            depends_on = step.get("depends_on")
+            if depends_on:
+                dep_results = {dep_id: prior_results_map.get(dep_id) for dep_id in depends_on}
+                
+                # 1. Exact-match recursive search (prevents JSON-serialization false pos/neg)
+                def _value_exists(needle, obj):
+                    if isinstance(obj, dict):
+                        return any(_value_exists(needle, v) for v in obj.values())
+                    if isinstance(obj, list):
+                        return any(_value_exists(needle, v) for v in obj)
+                    return str(obj) == str(needle)
+
+                # 2. Case-insensitive key matching (handles camelCase e.g., 'messageId', 'recordIDs')
+                def _is_id_key(key: str) -> bool:
+                    key_lower = key.lower()
+                    if key_lower.endswith('ids'):
+                        key_lower = key_lower[:-1]
+                        key = key[:-1]
+                    return key_lower == 'id' or key_lower.endswith('_id') or key.endswith('Id') or key.endswith('ID')
+
+                grounding_errors = []
+                
+                for arg_k, arg_v in arguments.items():
+                    if _is_id_key(arg_k):
+                        # 3. Handle both single string IDs and arrays of IDs
+                        items_to_check = arg_v if isinstance(arg_v, list) else [arg_v]
+                        for item in items_to_check:
+                            if isinstance(item, (str, int)) and len(str(item)) > 2:
+                                # We accept the false-positive risk for mixed-source IDs rather than 
+                                # reopening the substring/cross-turn vulnerability.
+                                if not _value_exists(item, dep_results):
+                                    grounding_errors.append(f"'{arg_k}'='{item}'")
+                
+                if grounding_errors:
+                    err_msg = ", ".join(grounding_errors)
+                    logger.error(f"Executor failed semantic grounding check for {tool_name}: {err_msg}")
+                    
+                    # 4. Partial progress reporting
+                    success_msg = f"Successfully completed {i} prior steps. " if i > 0 else ""
+                    yield {
+                        "text": f"❌ Plan aborted: {success_msg}Executor hallucinated fabricated IDs that don't exist in dependency outputs: {err_msg}\n", 
+                        "node_id": node_id, 
+                        "status": "failed"
+                    }
+                    self.state = AgentState.IDLE
+                    self.plan = None
+                    return
 
             try:
                 from app.mcp.response_shapers import shape_for_executor, shape_for_display
