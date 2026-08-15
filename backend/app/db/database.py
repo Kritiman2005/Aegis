@@ -3,9 +3,15 @@ from pathlib import Path
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-# SQLite database file path (stored in backend directory)
+# Data directory for persistent storage
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
-DB_PATH = BASE_DIR / "aegis.db"
+data_dir = os.environ.get("AEGIS_DATA_DIR")
+if data_dir:
+    DB_DIR = Path(data_dir)
+else:
+    DB_DIR = BASE_DIR
+    
+DB_PATH = DB_DIR / "aegis.db"
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 
 # Create SQLite Engine

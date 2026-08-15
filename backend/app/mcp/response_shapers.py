@@ -649,8 +649,59 @@ def _drive_read_file_disp(raw: Any) -> str:
     return f"📄 **File contents:**\n\n```\n{content}\n```"
 
 
+
+# ── Google Sheets & Docs ──────────────────────────────────────────────────
+
+def _sheets_read_range_exec(raw: Any) -> Dict:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+    if isinstance(raw, list):
+        # raw is already the 2D array
+        return {"rows": len(raw), "cols": len(raw[0]) if raw else 0, "preview": raw[:5]}
+    return {"content": str(raw)}
+
+def _sheets_read_range_disp(raw: Any) -> str:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw
+    
+    if not isinstance(raw, list) or not raw:
+        return "*No data found or empty range*"
+    
+    # Try to make a markdown table
+    try:
+        md = "| " + " | ".join(str(c).replace('|', '\|') for c in raw[0]) + " |\n"
+        md += "|" + "|".join(["---" for _ in raw[0]]) + "|\n"
+        for row in raw[1:]:
+            md += "| " + " | ".join(str(c).replace('|', '\|') for c in row) + " |\n"
+        return md
+    except Exception:
+        return "```json\n" + json.dumps(raw, indent=2) + "\n```"
+
+def _sheets_update_range_exec(raw: Any) -> Dict:
+    return {"result": str(raw)}
+
+def _sheets_update_range_disp(raw: Any) -> str:
+    return f"✅ **Spreadsheet updated:** {str(raw)}"
+
+def _docs_read_document_exec(raw: Any) -> Dict:
+    if isinstance(raw, str):
+        return {"content": _trunc(raw, 3000)}
+    return {"content": _trunc(str(raw), 3000)}
+
+def _docs_read_document_disp(raw: Any) -> str:
+    s = _docs_read_document_exec(raw)
+    content = s.get("content") or "_Empty document_"
+    return f"📄 **Document contents:**\n\n```\n{content}\n```"
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Shaper registry
+
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _ShapeEntry = Tuple[Callable[[Any], Dict], Callable[[Any], str]]
@@ -685,6 +736,11 @@ _SHAPERS: Dict[str, _ShapeEntry] = {
     "upload_file":            (_drive_create_file_exec,       _drive_create_file_disp),
     "drive_read_file":        (_drive_read_file_exec,         _drive_read_file_disp),
     "google_drive_read_file": (_drive_read_file_exec,         _drive_read_file_disp),
+    
+    # ── Google Sheets & Docs ─────────────────────────────────────────────────
+    "sheets_read_range":      (_sheets_read_range_exec,       _sheets_read_range_disp),
+    "sheets_update_range":    (_sheets_update_range_exec,     _sheets_update_range_disp),
+    "docs_read_document":     (_docs_read_document_exec,      _docs_read_document_disp),
 }
 
 

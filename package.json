@@ -11,7 +11,8 @@
     "dev": "concurrently -n \"NEXT,BACKEND\" -c \"cyan,green\" \"npm run dev:next\" \"npm run dev:backend\"",
     "build:next": "next build",
     "build:electron": "tsc -p electron/tsconfig.json",
-    "build": "next build && tsc -p electron/tsconfig.json && electron-builder",
+    "build:python": "cd backend && pyinstaller main.spec",
+    "build": "next build && tsc -p electron/tsconfig.json && npm run build:python && electron-builder",
     "package:mac": "npm run build && electron-builder --mac",
     "package:win": "npm run build && electron-builder --win",
     "package:linux": "npm run build && electron-builder --linux",
@@ -31,13 +32,8 @@
     ],
     "extraResources": [
       {
-        "from": "backend",
-        "to": "backend",
-        "filter": [
-          "**/*",
-          "!__pycache__",
-          "!*.pyc"
-        ]
+        "from": "backend/dist/main",
+        "to": "backend"
       }
     ],
     "mac": {

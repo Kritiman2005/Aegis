@@ -19,7 +19,11 @@ logger = logging.getLogger(__name__)
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
-QDRANT_DB_DIR = BASE_DIR / "qdrant_db"
+data_dir = os.environ.get("AEGIS_DATA_DIR")
+if data_dir:
+    QDRANT_DB_DIR = Path(data_dir) / "qdrant_db"
+else:
+    QDRANT_DB_DIR = BASE_DIR / "qdrant_db"
 
 COLLECTION_NAME = "aegis_documents"
 

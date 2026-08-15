@@ -18,6 +18,16 @@ DRIVE_SCOPES = [
     'https://www.googleapis.com/auth/drive.file'
 ]
 
+# Scopes for Google Sheets
+SHEETS_SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets'
+]
+
+# Scopes for Google Docs
+DOCS_SCOPES = [
+    'https://www.googleapis.com/auth/documents.readonly'
+]
+
 REDIRECT_URI = "http://localhost:8000/auth/google/callback"
 
 def get_google_flow(service_name: str) -> Flow:
@@ -42,8 +52,12 @@ def get_google_flow(service_name: str) -> Flow:
         scopes = GMAIL_SCOPES
     elif service_name == "google_drive":
         scopes = DRIVE_SCOPES
+    elif service_name == "google_sheets":
+        scopes = SHEETS_SCOPES
+    elif service_name == "google_docs":
+        scopes = DOCS_SCOPES
     else:
-        scopes = GMAIL_SCOPES + DRIVE_SCOPES
+        scopes = GMAIL_SCOPES + DRIVE_SCOPES + SHEETS_SCOPES + DOCS_SCOPES
     
     flow = Flow.from_client_config(
         client_config,

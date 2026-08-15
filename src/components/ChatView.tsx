@@ -385,21 +385,25 @@ export default function ChatView({
                                         )}
                                       </div>
                                       <div className="flex-1 min-w-0">
-                                        <div className="flex items-center gap-1.5 flex-wrap">
-                                          <span className="text-xs font-semibold text-gray-900 font-mono truncate">{step.tool}</span>
-                                          {step.fetch_scope && step.fetch_scope !== 'single' && (
-                                            <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full uppercase tracking-wide ${
-                                              step.fetch_scope === 'exhaustive'
-                                                ? 'bg-orange-100 text-orange-700'
-                                                : step.fetch_scope === 'sample'
-                                                ? 'bg-yellow-100 text-yellow-700'
-                                                : 'bg-gray-100 text-gray-500'
-                                            }`}>
-                                              {step.fetch_scope}
-                                            </span>
+                                        <div className="flex flex-col gap-0.5">
+                                          <div className="flex items-center gap-1.5 flex-wrap">
+                                            <span className="text-xs font-semibold text-gray-900 font-mono truncate">{step.tool}</span>
+                                            {step.fetch_scope && step.fetch_scope !== 'single' && (
+                                              <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full uppercase tracking-wide ${
+                                                step.fetch_scope === 'exhaustive'
+                                                  ? 'bg-orange-100 text-orange-700'
+                                                  : step.fetch_scope === 'sample'
+                                                  ? 'bg-yellow-100 text-yellow-700'
+                                                  : 'bg-gray-100 text-gray-500'
+                                              }`}>
+                                                {step.fetch_scope}
+                                              </span>
+                                            )}
+                                          </div>
+                                          {step.reason && (
+                                            <p className="text-[11px] text-gray-500 leading-snug">{step.reason}</p>
                                           )}
                                         </div>
-                                        <div className="text-[11px] text-gray-500 line-clamp-2 mt-0.5 leading-relaxed">{step.reason}</div>
                                       </div>
                                     </div>
                                   );
@@ -555,7 +559,7 @@ export default function ChatView({
         <div ref={messagesEndRef} />
       </div>
 
-      {/* ── Bottom Input Bar (Matching Image 2) ─────────────────────────────── */}
+      {/* ── Bottom Input Bar ─────────────────────────────── */}
       <div className="p-6 pt-2 bg-[#F8F9FA] max-w-4xl w-full mx-auto space-y-3">
         {/* Mode Toggle */}
         <div className="flex justify-center">
@@ -565,7 +569,12 @@ export default function ChatView({
                 if (chatMode === 'agent') onSendMessage('__system_mode_switch__', 'system');
                 setChatMode('chat');
               }}
+              disabled={isStreaming || !!activeNodeId}
               className={`px-4 py-1.5 rounded-md text-xs font-semibold transition-all ${
+                isStreaming || !!activeNodeId
+                  ? 'opacity-50 cursor-not-allowed'
+                  : ''
+              } ${
                 chatMode === 'chat' 
                   ? 'bg-white text-gray-900 shadow-sm' 
                   : 'text-gray-500 hover:text-gray-700'
@@ -578,7 +587,12 @@ export default function ChatView({
                 if (chatMode === 'chat') onSendMessage('__system_mode_switch__', 'system');
                 setChatMode('agent');
               }}
+              disabled={isStreaming || !!activeNodeId}
               className={`px-4 py-1.5 rounded-md text-xs font-semibold transition-all flex items-center gap-1.5 ${
+                isStreaming || !!activeNodeId
+                  ? 'opacity-50 cursor-not-allowed'
+                  : ''
+              } ${
                 chatMode === 'agent' 
                   ? 'bg-white text-indigo-600 shadow-sm' 
                   : 'text-gray-500 hover:text-gray-700'

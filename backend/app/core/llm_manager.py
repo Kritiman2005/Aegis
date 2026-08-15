@@ -30,7 +30,11 @@ class LLMManager:
         
     def _register_default_models(self):
         """Register the models we know about from disk and SQLite."""
-        _models_dir = Path(__file__).resolve().parent.parent.parent / "models"
+        data_dir = os.environ.get("AEGIS_DATA_DIR")
+        if data_dir:
+            _models_dir = Path(data_dir) / "models"
+        else:
+            _models_dir = Path(__file__).resolve().parent.parent.parent / "models"
         local_gemma_config = ModelConfig(
             name="gemma-local",
             model_path=str(_models_dir / "qwen2.5-3b-instruct-q4_k_m.gguf"),

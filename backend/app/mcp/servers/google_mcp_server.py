@@ -117,6 +117,46 @@ TOOLS = [
                 }
             }
         }
+    },
+    {
+        "name": "sheets_read_range",
+        "description": "Read values from a specific Google Sheets range.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spreadsheet_id": {"type": "string", "description": "The ID of the spreadsheet"},
+                "range": {"type": "string", "description": "The A1 notation of the range to read (e.g. 'Sheet1!A1:D10')"}
+            },
+            "required": ["spreadsheet_id", "range"]
+        }
+    },
+    {
+        "name": "sheets_update_range",
+        "description": "Update values in a specific Google Sheets range.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spreadsheet_id": {"type": "string", "description": "The ID of the spreadsheet"},
+                "range": {"type": "string", "description": "The A1 notation of the range to update"},
+                "values": {
+                    "type": "array",
+                    "items": {"type": "array", "items": {"type": "string"}},
+                    "description": "2D array of values to write. E.g. [['A1', 'B1'], ['A2', 'B2']]"
+                }
+            },
+            "required": ["spreadsheet_id", "range", "values"]
+        }
+    },
+    {
+        "name": "docs_read_document",
+        "description": "Read the text content of a Google Doc.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "document_id": {"type": "string", "description": "The ID of the Google Document"}
+            },
+            "required": ["document_id"]
+        }
     }
 ]
 
@@ -124,7 +164,7 @@ TOOLS = [
 # ── Google API helpers ────────────────────────────────────────────────────────
 
 def _build_services(creds_json_str: str):
-    """Build and return (drive_service, gmail_service) from credentials JSON."""
+    """Build and return (drive, gmail, sheets, docs) from credentials JSON."""
     try:
         from google.oauth2.credentials import Credentials
         from google.auth.transport.requests import Request
@@ -139,11 +179,13 @@ def _build_services(creds_json_str: str):
 
         drive_service = build("drive", "v3", credentials=credentials)
         gmail_service = build("gmail", "v1", credentials=credentials)
+        sheets_service = build("sheets", "v4", credentials=credentials)
+        docs_service = build("docs", "v1", credentials=credentials)
         logger.info("Google API services initialized successfully.")
-        return drive_service, gmail_service
+        return drive_service, gmail_service, sheets_service, docs_service
     except Exception as e:
         logger.error(f"Failed to initialize Google services: {e}")
-        return None, None
+        return None, None, None, None
 
 
 def _drive_list_files(drive_service, query: str = "", order_by: str = "", max_results: int = 10) -> str:
@@ -239,6 +281,35 @@ def _gmail_create_draft(gmail_service, to: str = "", subject: str = "", body: st
 
 # ── MCP Server ────────────────────────────────────────────────────────────────
 
+
+def _sheets_read_range(sheets_service, spreadsheet_id: str, range_name: str) -> str:
+    result = sheets_service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id, range=range_name).execute()
+    values = result.get('values', [])
+    if not values:
+        return "No data found."
+    return json.dumps(values, ensure_ascii=False)
+
+def _sheets_update_range(sheets_service, spreadsheet_id: str, range_name: str, values: list) -> str:
+    body = {
+        'values': values
+    }
+    result = sheets_service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id, range=range_name,
+        valueInputOption="RAW", body=body).execute()
+    return f"{result.get('updatedCells')} cells updated."
+
+def _docs_read_document(docs_service, document_id: str) -> str:
+    document = docs_service.documents().get(documentId=document_id).execute()
+    text = ""
+    for element in document.get('body').get('content'):
+        if 'paragraph' in element:
+            elements = element.get('paragraph').get('elements')
+            for elem in elements:
+                if 'textRun' in elem:
+                    text += elem.get('textRun').get('content')
+    return text.strip()
+
 class GoogleMCPServer:
     """
     Minimal stdio MCP server implementing the 2024-11-05 protocol version.
@@ -250,11 +321,13 @@ class GoogleMCPServer:
     def __init__(self):
         self._drive_service = None
         self._gmail_service = None
+        self._sheets_service = None
+        self._docs_service = None
         self._initialized = False
 
         creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
         if creds_json:
-            self._drive_service, self._gmail_service = _build_services(creds_json)
+            self._drive_service, self._gmail_service, self._sheets_service, self._docs_service = _build_services(creds_json)
         else:
             logger.warning("GOOGLE_CREDENTIALS_JSON not set — tool calls will fail.")
 
@@ -292,7 +365,7 @@ class GoogleMCPServer:
         tool_name = params.get("name", "")
         arguments = params.get("arguments", {})
 
-        if not self._drive_service or not self._gmail_service:
+        if not self._drive_service or not self._gmail_service or not self._sheets_service or not self._docs_service:
             self._err(msg_id, -32000, "Google services not initialized. Check GOOGLE_CREDENTIALS_JSON.")
             return
 
@@ -321,6 +394,12 @@ class GoogleMCPServer:
                     subject=arguments.get("subject", ""),
                     body=arguments.get("body", "")
                 )
+            elif tool_name == "sheets_read_range":
+                text = _sheets_read_range(self._sheets_service, arguments.get("spreadsheet_id", ""), arguments.get("range", ""))
+            elif tool_name == "sheets_update_range":
+                text = _sheets_update_range(self._sheets_service, arguments.get("spreadsheet_id", ""), arguments.get("range", ""), arguments.get("values", []))
+            elif tool_name == "docs_read_document":
+                text = _docs_read_document(self._docs_service, arguments.get("document_id", ""))
             else:
                 self._err(msg_id, -32601, f"Unknown tool: {tool_name}")
                 return
@@ -381,16 +460,24 @@ class GoogleMCPServer:
                     self._err(msg_id, -32601, f"Method not found: {method}")
 
 
-if __name__ == "__main__":
+def run_server(args_list=None):
+    global TOOLS
     parser = argparse.ArgumentParser(description="Google Workspace MCP Server")
-    parser.add_argument("--service", type=str, default="all", help="Which service tools to expose (google_mail, google_drive, or all)")
-    args = parser.parse_args()
+    parser.add_argument("--service", type=str, default="all", help="Which service tools to expose")
+    args = parser.parse_args(args_list)
 
     # Filter tools based on the requested service
     if args.service == "google_mail":
         TOOLS = [t for t in TOOLS if t["name"].startswith("gmail_")]
     elif args.service == "google_drive":
         TOOLS = [t for t in TOOLS if t["name"].startswith("drive_")]
+    elif args.service == "google_sheets":
+        TOOLS = [t for t in TOOLS if t["name"].startswith("sheets_")]
+    elif args.service == "google_docs":
+        TOOLS = [t for t in TOOLS if t["name"].startswith("docs_")]
 
     server = GoogleMCPServer()
     server.run()
+
+if __name__ == "__main__":
+    run_server()

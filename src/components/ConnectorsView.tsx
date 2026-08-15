@@ -44,6 +44,40 @@ const CONNECTOR_DEFS = [
     rank: 2,
   },
   {
+    name: 'google_docs',
+    displayName: 'Google Docs',
+    description: 'Read and summarize your Google Docs.',
+    oauthService: 'google_docs',
+    authType: 'oauth',
+    loginUrl: 'http://localhost:8000/auth/google/login?service=google_docs',
+    icon: (
+      <svg viewBox="0 0 24 24" className="w-6 h-6" fill="none">
+        <rect width="16" height="20" x="4" y="2" rx="2" fill="#4285F4" opacity="0.15"/>
+        <rect width="16" height="20" x="4" y="2" rx="2" fill="none" stroke="#4285F4" strokeWidth="1.5"/>
+        <path d="M8 8h8M8 12h8M8 16h5" stroke="#4285F4" strokeWidth="1.5" strokeLinecap="round"/>
+      </svg>
+    ),
+    popularity: 'Productivity',
+    rank: 3,
+  },
+  {
+    name: 'google_sheets',
+    displayName: 'Google Sheets',
+    description: 'Read and update values in your spreadsheets.',
+    oauthService: 'google_sheets',
+    authType: 'oauth',
+    loginUrl: 'http://localhost:8000/auth/google/login?service=google_sheets',
+    icon: (
+      <svg viewBox="0 0 24 24" className="w-6 h-6" fill="none">
+        <rect width="18" height="18" x="3" y="3" rx="2" fill="#0F9D58" opacity="0.15"/>
+        <rect width="18" height="18" x="3" y="3" rx="2" fill="none" stroke="#0F9D58" strokeWidth="1.5"/>
+        <path d="M9 3v18M15 3v18M3 9h18M3 15h18" stroke="#0F9D58" strokeWidth="1.5"/>
+      </svg>
+    ),
+    popularity: 'Productivity',
+    rank: 4,
+  },
+  {
     name: 'figma',
     displayName: 'Figma',
     description: 'Read designs, inspect components, and search your Figma workspace.',

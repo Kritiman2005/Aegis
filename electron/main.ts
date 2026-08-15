@@ -62,7 +62,11 @@ function spawnSidecar(): void {
     cwd: backendDir,
     stdio: ['ignore', 'pipe', 'pipe'],
     // In production, the binary manages its own environment
-    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    env: { 
+      ...process.env, 
+      PYTHONUNBUFFERED: '1',
+      AEGIS_DATA_DIR: app.getPath('userData')
+    },
     // On Windows, use shell to resolve PATH commands like 'uvicorn'
     shell: process.platform === 'win32',
   });

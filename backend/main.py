@@ -97,7 +97,11 @@ async def on_startup():
 
     with SessionLocal() as db:
         # Seed default local model in SQLite models table
-        model_path = str(Path(__file__).resolve().parent / "models" / "qwen2.5-3b-instruct-q4_k_m.gguf")
+        data_dir = os.environ.get("AEGIS_DATA_DIR")
+        if data_dir:
+            model_path = str(Path(data_dir) / "models" / "qwen2.5-3b-instruct-q4_k_m.gguf")
+        else:
+            model_path = str(Path(__file__).resolve().parent / "models" / "qwen2.5-3b-instruct-q4_k_m.gguf")
         seed_default_model(db, model_path)
 
         # Auto-restore saved Google OAuth credentials from SQLite
@@ -172,11 +176,15 @@ def on_shutdown():
     from app.core.scheduler import scheduler_daemon
     scheduler_daemon.stop()
 
-# ─── Direct Execution ────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "mcp_google":
+        from app.mcp.servers.google_mcp_server import run_server
+        run_server(sys.argv[2:])
+        sys.exit(0)
+
     uvicorn.run(
-        "main:app",
+        app,
         host="127.0.0.1",   # Bind to loopback only — never expose externally
         port=8000,
         reload=False,        # Disable reload when run as a spawned binary

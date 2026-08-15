@@ -99,8 +99,11 @@ class MCPServerRegistry:
         Convenience wrapper to launch the Google Workspace MCP Python server
         configured for a specific service (google_mail or google_drive).
         """
-        google_script = Path(__file__).resolve().parent / "servers" / "google_mcp_server.py"
-        command = [sys.executable, str(google_script), "--service", service_name]
+        if getattr(sys, 'frozen', False):
+            command = [sys.executable, "mcp_google", "--service", service_name]
+        else:
+            main_script = Path(__file__).resolve().parent.parent.parent / "main.py"
+            command = [sys.executable, str(main_script), "mcp_google", "--service", service_name]
         env = {"GOOGLE_CREDENTIALS_JSON": credentials_json_str}
 
         return self.connect_server(
