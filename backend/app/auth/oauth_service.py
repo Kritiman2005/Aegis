@@ -81,12 +81,12 @@ OAUTH_CONFIGS: Dict[str, dict] = {
         "display_name": "Figma",
         "auth_url": "https://www.figma.com/oauth",
         "token_url": "https://api.figma.com/v1/oauth/token",
-        "scopes": "",  # Scopes are set per-app in the Figma Developer Portal — leave empty to use the app defaults
+        "scopes": "current_user:read file_comments:read file_comments:write file_content:read file_metadata:read file_versions:read library_assets:read library_content:read team_library_content:read file_dev_resources:read",
         "client_id_env": "FIGMA_CLIENT_ID",
         "client_secret_env": "FIGMA_CLIENT_SECRET",
         "token_auth": "basic",
         "token_response_format": "json",
-        "mcp_command": ["npx", "-y", "figma-developer-mcp", "--figma-api-key={FIGMA_ACCESS_TOKEN}"],
+        "mcp_command": ["npx", "-y", "figma-developer-mcp", "--stdio", "--figma-oauth-token={FIGMA_ACCESS_TOKEN}"],
         "env_extraction": {
             "FIGMA_ACCESS_TOKEN": ["access_token"],
         },

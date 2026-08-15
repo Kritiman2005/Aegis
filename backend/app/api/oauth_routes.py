@@ -262,17 +262,23 @@ async def service_oauth_callback(service_name: str, request: Request):
             from app.db.database import SessionLocal
             from app.db.crud import sync_mcp_server_and_tools
             with SessionLocal() as db:
+                # Substitute any {ENV_VAR} placeholders in the command
+                resolved_command = [
+                    arg.format(**env_vars) if "{" in arg else arg 
+                    for arg in config["mcp_command"]
+                ]
+
                 # Build config_json so this server can be auto-restored on restart
                 oauth_config_json = {
                     "type": "oauth",
                     "service_name": service_name,
-                    "command": config["mcp_command"],
+                    "command": resolved_command,
                     "env": env_vars,
                 }
                 # Start the subprocess
                 tools = mcp_registry.connect_server(
                     server_name=service_name,
-                    command=config["mcp_command"],
+                    command=resolved_command,
                     env=env_vars,
                     db=None,  # we'll sync manually below with account_context
                     config_json=oauth_config_json,
