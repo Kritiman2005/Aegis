@@ -1,7 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  // Use static HTML export only when building for production Electron package
-  output: process.env.NEXT_EXPORT ? 'export' : undefined,
+  // Export as static HTML for Electron packaging in production
+  output: process.env.NODE_ENV === 'production' ? 'export' : undefined,
 
   // Disable built-in image optimization for local desktop compatibility
   images: {
