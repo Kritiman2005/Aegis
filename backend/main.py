@@ -9,12 +9,14 @@ Or as a script:
 """
 
 import os
+import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load the .env file from the project root
-root_dir = Path(__file__).resolve().parent.parent
-load_dotenv(dotenv_path=root_dir / ".env")
+# Load the .env file from the project root (Dev only — .env is not bundled in packaged builds)
+if not getattr(sys, 'frozen', False):
+    root_dir = Path(__file__).resolve().parent.parent
+    load_dotenv(dotenv_path=root_dir / ".env")
 
 import uvicorn
 from fastapi import FastAPI

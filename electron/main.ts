@@ -24,10 +24,10 @@ import { spawn, ChildProcess } from 'child_process';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const IS_DEV = process.env.NODE_ENV !== 'production';
+const IS_DEV = !app.isPackaged;
 const BACKEND_PORT = 8000;
 const NEXT_DEV_URL = 'http://localhost:3000';
-const HEALTH_URL = `http://localhost:${BACKEND_PORT}/api/health`;
+const HEALTH_URL = `http://127.0.0.1:${BACKEND_PORT}/api/health`;
 const HEALTH_MAX_RETRIES = 40;     // 40 × 500ms = 20 seconds max wait
 const HEALTH_RETRY_INTERVAL = 500; // ms
 
@@ -51,7 +51,8 @@ let sidecarProcess: ChildProcess | null = null;
 function spawnSidecar(): void {
   const backendDir = path.join(PROJECT_ROOT, 'backend');
 
-  const command = IS_DEV ? 'uvicorn' : path.join(backendDir, 'main');
+  const binaryName = process.platform === 'win32' ? 'main.exe' : 'main';
+  const command = IS_DEV ? 'uvicorn' : path.join(backendDir, binaryName);
   const args = IS_DEV
     ? ['main:app', '--port', String(BACKEND_PORT), '--log-level', 'warning']
     : [];

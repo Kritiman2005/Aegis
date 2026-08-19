@@ -28,14 +28,76 @@ jobs:
 
       - name: Install Python Dependencies
         run: |
+          cd backend
           pip install -r requirements.txt
           pip install pyinstaller
+
+      - name: Build Python Sidecar (.exe)
+        run: npm run build:python
+
+      - name: Smoke Test Python Binary
+        shell: pwsh
+        run: |
+          $env:AEGIS_DATA_DIR = "$PWD\test_data"
+          New-Item -ItemType Directory -Force -Path $env:AEGIS_DATA_DIR | Out-Null
+
+          $process = Start-Process `
+            -FilePath "backend\dist\main.exe" `
+            -NoNewWindow -PassThru `
+            -RedirectStandardOutput "backend_stdout.log" `
+            -RedirectStandardError "backend_stderr.log"
+
+          $maxRetries = 15
+          $success = $false
+          for ($i = 0; $i -lt $maxRetries; $i++) {
+            if ($process.HasExited) {
+              Write-Error "Backend process exited prematurely (code $($process.ExitCode))!"
+              Write-Output "--- STDERR ---"
+              Get-Content "backend_stderr.log" -ErrorAction SilentlyContinue
+              Write-Output "--- STDOUT ---"
+              Get-Content "backend_stdout.log" -ErrorAction SilentlyContinue
+              exit 1
+            }
+
+            try {
+              $response = Invoke-WebRequest `
+                -Uri "http://127.0.0.1:8000/api/health" `
+                -UseBasicParsing `
+                -ErrorAction Stop
+              if ($response.StatusCode -eq 200) {
+                Write-Output "Backend booted successfully after $($i * 2)s!"
+                $success = $true
+                break
+              }
+            } catch {
+              Write-Output "Waiting for backend... attempt $i"
+              Start-Sleep -Seconds 2
+            }
+          }
+
+          if (-not $process.HasExited) {
+            Stop-Process -Id $process.Id -Force
+          }
+
+          if (-not $success) {
+            Write-Error "Backend failed to respond to health check after 30 seconds!"
+            Write-Output "--- STDERR ---"
+            Get-Content "backend_stderr.log" -ErrorAction SilentlyContinue
+            Write-Output "--- STDOUT ---"
+            Get-Content "backend_stdout.log" -ErrorAction SilentlyContinue
+            exit 1
+          }
 
       - name: Install NPM Dependencies
         run: npm install
 
-      - name: Build Windows .exe
-        run: npm run package:win
+      - name: Build Next.js + Electron
+        run: npm run build:next && npm run build:electron
+        env:
+          NODE_ENV: production
+
+      - name: Package Windows .exe
+        run: electron-builder --win
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
