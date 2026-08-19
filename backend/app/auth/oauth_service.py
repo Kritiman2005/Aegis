@@ -217,19 +217,30 @@ OAUTH_CONFIGS: Dict[str, dict] = {
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def get_client_credentials(service_name: str) -> Tuple[str, str]:
-    """Reads CLIENT_ID and CLIENT_SECRET from environment for a service."""
+    """Reads CLIENT_ID and CLIENT_SECRET from the bundled credentials module.
+
+    In dev, credentials.py falls back to os.environ (loaded from .env).
+    In prod, credentials.py is compiled into the binary with hardcoded values
+    injected from GitHub Secrets at CI build time.
+    """
+    from app.config import credentials as creds
+
     config = OAUTH_CONFIGS.get(service_name)
     if not config:
         raise ValueError(f"Unknown OAuth service: '{service_name}'")
 
-    client_id     = os.environ.get(config["client_id_env"], "").strip()
-    client_secret = os.environ.get(config["client_secret_env"], "").strip()
+    # Attribute names in credentials.py match the env-var names exactly
+    # e.g. "SLACK_CLIENT_ID" → creds.SLACK_CLIENT_ID
+    id_attr     = config["client_id_env"]      # e.g. "SLACK_CLIENT_ID"
+    secret_attr = config["client_secret_env"]  # e.g. "SLACK_CLIENT_SECRET"
+
+    client_id     = getattr(creds, id_attr, "").strip()
+    client_secret = getattr(creds, secret_attr, "").strip()
 
     if not client_id or not client_secret:
         raise ValueError(
-            f"Missing OAuth credentials for {config['display_name']}. "
-            f"Please set {config['client_id_env']} and {config['client_secret_env']} in your .env file. "
-            f"Get them here: {config.get('setup_url', '')}"
+            f"OAuth credentials for {config['display_name']} are not configured in this build. "
+            f"Please contact Aegis support or add your credentials to the .env file in dev mode."
         )
     return client_id, client_secret
 

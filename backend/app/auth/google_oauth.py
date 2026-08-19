@@ -31,12 +31,21 @@ DOCS_SCOPES = [
 REDIRECT_URI = "http://localhost:8000/auth/google/callback"
 
 def get_google_flow(service_name: str) -> Flow:
-    """Initialize the Google OAuth Flow using environment variables."""
-    client_id = os.environ.get("GOOGLE_CLIENT_ID")
-    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
+    """Initialize the Google OAuth Flow using bundled app credentials.
+
+    In dev, credentials.py falls back to os.environ (loaded from .env).
+    In prod, credentials.py is compiled into the binary at CI build time.
+    """
+    from app.config import credentials as creds
+    client_id     = creds.GOOGLE_CLIENT_ID
+    client_secret = creds.GOOGLE_CLIENT_SECRET
 
     if not client_id or not client_secret:
-        raise ValueError("GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be set in environment variables")
+        raise ValueError(
+            "Google OAuth credentials are not configured in this build. "
+            "Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in your .env file (dev) "
+            "or as GitHub Secrets (production build)."
+        )
         
     client_config = {
         "installed": {
