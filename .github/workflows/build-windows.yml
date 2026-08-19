@@ -31,9 +31,16 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
+      - name: Install Visual C++ Redistributable
+        shell: pwsh
+        run: |
+          # Required by llama-cpp-python which links against MSVC runtime DLLs
+          choco install vcredist140 -y --no-progress
+
       - name: Install Python Dependencies
         working-directory: backend
         run: |
+          pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 

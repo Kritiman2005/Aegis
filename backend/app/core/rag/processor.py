@@ -7,7 +7,9 @@ from pathlib import Path
 # Extractors
 import fitz  # PyMuPDF
 from pptx import Presentation
-import easyocr
+# easyocr is intentionally NOT imported here — it depends on torch (~2 GB)
+# and causes an immediate crash in PyInstaller bundles if loaded at startup.
+# It is lazy-imported inside get_ocr_reader() only when OCR is actually needed.
 
 # Vector DB & Embeddings
 from qdrant_client import QdrantClient, models
@@ -79,6 +81,7 @@ def get_ocr_reader():
     global _ocr_reader
     if _ocr_reader is None:
         logger.info("Initializing EasyOCR reader (this might take a moment)...")
+        import easyocr  # lazy import — avoids loading torch at server startup
         _ocr_reader = easyocr.Reader(['en'], gpu=False)
     return _ocr_reader
 

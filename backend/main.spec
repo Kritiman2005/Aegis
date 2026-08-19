@@ -29,7 +29,11 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['tkinter', 'PyQt5', 'PySide2'],
+    excludes=['tkinter', 'PyQt5', 'PySide2',
+              # easyocr is lazy-imported at runtime — don't bundle torch into the exe
+              'easyocr', 'torch', 'torchvision', 'torchaudio',
+              # test/dev tools
+              'pytest', 'setuptools', 'distutils'],
     noarchive=False,
     optimize=0,
 )
