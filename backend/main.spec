@@ -3,7 +3,9 @@
 import os
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
-# Collect all hidden imports for FastAPI, Uvicorn, and AI dependencies
+# ── Hidden imports ────────────────────────────────────────────────────────────
+# NOTE: easyocr, torch, torchvision, torchaudio are excluded — they are lazy-
+# imported at runtime when OCR is first used, not at startup.
 hidden_imports = (
     collect_submodules('app') +
     collect_submodules('uvicorn') +
@@ -29,34 +31,46 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['tkinter', 'PyQt5', 'PySide2',
-              # easyocr is lazy-imported at runtime — don't bundle torch into the exe
-              'easyocr', 'torch', 'torchvision', 'torchaudio',
-              # test/dev tools
-              'pytest', 'setuptools', 'distutils'],
+    excludes=[
+        'tkinter', 'PyQt5', 'PySide2',
+        # easyocr/torch are lazy-imported at runtime — never bundle them
+        'easyocr', 'torch', 'torchvision', 'torchaudio',
+        # dev-only tools
+        'pytest', 'setuptools', 'distutils',
+    ],
     noarchive=False,
     optimize=0,
 )
 
 pyz = PYZ(a.pure)
 
+# ── EXE: just the launcher, NOT the full onefile bundle ───────────────────────
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
-    [],
+    [],               # empty — binaries/datas go into COLLECT below
+    exclude_binaries=True,
     name='main',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
+    upx=False,        # DISABLED — UPX-packed binaries trigger Windows Defender
     console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+
+# ── COLLECT: output goes to dist/main/ folder (--onedir mode) ────────────────
+# No runtime extraction to %TEMP% → no Defender scan on launch → instant startup
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='main',      # output: backend/dist/main/main.exe  (+ all DLLs alongside)
 )

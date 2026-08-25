@@ -31,10 +31,15 @@ const HEALTH_URL = `http://127.0.0.1:${BACKEND_PORT}/api/health`;
 const HEALTH_MAX_RETRIES = 40;     // 40 × 500ms = 20 seconds max wait
 const HEALTH_RETRY_INTERVAL = 500; // ms
 
-// Resolve project root regardless of __dirname location after compilation
+// Resolve project root and backend dir correctly for dev vs prod
+const IS_DEV = !app.isPackaged;
 const PROJECT_ROOT = IS_DEV
-  ? path.resolve(__dirname, '../../')         // dist/electron/ → project root
-  : path.join(process.resourcesPath, 'app');  // Packaged: resources/app/
+  ? path.resolve(__dirname, '../../')
+  : path.join(process.resourcesPath, 'app');
+
+const BACKEND_ROOT = IS_DEV
+  ? path.join(PROJECT_ROOT, 'backend')
+  : path.join(process.resourcesPath, 'backend');
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -49,18 +54,24 @@ let sidecarProcess: ChildProcess | null = null;
  * In prod: runs the packaged Python binary from extraResources.
  */
 function spawnSidecar(): void {
-  const backendDir = path.join(PROJECT_ROOT, 'backend');
+  let command: string;
+  let args: string[];
 
-  const binaryName = process.platform === 'win32' ? 'main.exe' : 'main';
-  const command = IS_DEV ? 'uvicorn' : path.join(backendDir, binaryName);
-  const args = IS_DEV
-    ? ['main:app', '--port', String(BACKEND_PORT), '--log-level', 'warning']
-    : [];
+  if (IS_DEV) {
+    command = 'uvicorn';
+    args = ['main:app', '--port', String(BACKEND_PORT), '--log-level', 'warning'];
+  } else {
+    // PyInstaller --onedir outputs: backend/dist/main/main.exe (+ all DLLs in same folder)
+    // The binary MUST run with cwd = its own folder so it can find sibling DLLs
+    const binaryName = process.platform === 'win32' ? 'main.exe' : 'main';
+    command = path.join(BACKEND_ROOT, 'dist', 'main', binaryName);
+    args = [];
+  }
 
   console.log(`[Aegis] Spawning sidecar: ${command} ${args.join(' ')}`);
 
   sidecarProcess = spawn(command, args, {
-    cwd: backendDir,
+    cwd: BACKEND_ROOT,
     stdio: ['ignore', 'pipe', 'pipe'],
     // In production, the binary manages its own environment
     env: { 

@@ -100,6 +100,13 @@ jobs:
         working-directory: backend
         run: pyinstaller main.spec
 
+      - name: Disable Windows Defender real-time protection
+        shell: pwsh
+        run: |
+          Set-MpPreference -DisableRealtimeMonitoring $true
+          Add-MpPreference -ExclusionPath "$PWD\backend\dist"
+          Add-MpPreference -ExclusionPath "$env:TEMP"
+          
       # ── Smoke test ────────────────────────────────────────────────────────────
       - name: Smoke Test Python Binary
         shell: pwsh
@@ -108,7 +115,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:AEGIS_DATA_DIR | Out-Null
 
           $process = Start-Process `
-            -FilePath "backend\dist\main.exe" `
+            -FilePath "backend\dist\main\main.exe" `
             -NoNewWindow -PassThru `
             -RedirectStandardOutput "backend_stdout.log" `
             -RedirectStandardError  "backend_stderr.log"
