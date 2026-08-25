@@ -17,7 +17,24 @@ import {
   ipcMain,
   shell,
   session,
+  protocol,
+  net,
 } from 'electron';
+
+// Register the custom protocol as privileged before the app is ready
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: 'app',
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      bypassCSP: false,
+      corsEnabled: true,
+    },
+  },
+]);
+
 import path from 'path';
 import http from 'http';
 import { spawn, ChildProcess } from 'child_process';
@@ -279,14 +296,26 @@ app.whenReady().then(async () => {
     mainWindow.webContents.send('backend:error', 'Sidecar failed to start within timeout.');
   }
 
-  // 4. Load content based on environment
+  // 4. Register custom protocol handler for production
+  if (!IS_DEV) {
+    protocol.handle('app', (request) => {
+      const url = new URL(request.url);
+      let pathname = url.pathname;
+      if (pathname.endsWith('/')) pathname += 'index.html';
+      else if (!path.extname(pathname)) pathname += '/index.html';
+      
+      const absolutePath = path.join(PROJECT_ROOT, 'out', pathname);
+      return net.fetch(require('url').pathToFileURL(absolutePath).toString());
+    });
+  }
+
+  // 5. Load content based on environment
   if (IS_DEV) {
     console.log(`[Aegis] DEV mode — loading ${NEXT_DEV_URL}`);
     await mainWindow.loadURL(NEXT_DEV_URL);
   } else {
-    const indexPath = path.join(PROJECT_ROOT, 'out', 'index.html');
-    console.log(`[Aegis] PROD mode — loading file://${indexPath}`);
-    await mainWindow.loadFile(indexPath);
+    console.log(`[Aegis] PROD mode — loading app://-`);
+    await mainWindow.loadURL('app://-');
   }
 
   // macOS: re-create window when dock icon is clicked with no windows open

@@ -53,6 +53,7 @@ app.add_middleware(
         "http://localhost:3000",  # Next.js dev server
         "http://localhost",       # Electron production (file-based loads)
         "null",                   # file:// origin appears as 'null' in browsers
+        "app://-",                # Electron production custom protocol
     ],
     allow_credentials=True,
     allow_methods=["*"],
