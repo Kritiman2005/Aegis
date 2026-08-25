@@ -4,17 +4,16 @@ import logging
 from typing import List, Dict, Any
 from pathlib import Path
 
-# Extractors
+# ── Light extractors — safe to import at startup ──────────────────────────────
 import fitz  # PyMuPDF
 from pptx import Presentation
-# easyocr is intentionally NOT imported here — it depends on torch (~2 GB)
-# and causes an immediate crash in PyInstaller bundles if loaded at startup.
-# It is lazy-imported inside get_ocr_reader() only when OCR is actually needed.
 
-# Vector DB & Embeddings
-from qdrant_client import QdrantClient, models
-from fastembed import TextEmbedding, SparseTextEmbedding
-from sentence_transformers import CrossEncoder
+# ── ALL heavy ML libraries are lazy-imported inside functions ─────────────────
+# qdrant_client, fastembed, sentence_transformers, and easyocr all pull in
+# PyTorch (~2 GB of DLLs) when imported. Importing them at module level causes
+# the PyInstaller binary to crash immediately on Windows before /api/health
+# can respond. They are imported inside the getter functions below, so the
+# server starts in <1 second and the libraries load on first actual use.
 
 logger = logging.getLogger(__name__)
 
@@ -29,22 +28,28 @@ else:
 
 COLLECTION_NAME = "aegis_documents"
 
-# Initialize Qdrant persistent client on the event loop thread
+# ─── Lazy singletons ──────────────────────────────────────────────────────────
+
 _qdrant_client = None
+_dense_model    = None
+_sparse_model   = None
+_reranker       = None
+_ocr_reader     = None
+
 
 def init_qdrant():
     """Called on FastAPI startup to bind QdrantClient to the main event loop thread."""
     global _qdrant_client
     if _qdrant_client is None:
+        from qdrant_client import QdrantClient, models  # lazy import
         logger.info("Initializing QdrantClient on Uvicorn event loop thread...")
         _qdrant_client = QdrantClient(path=str(QDRANT_DB_DIR))
-        # Ensure Collection Exists
         if not _qdrant_client.collection_exists(COLLECTION_NAME):
             _qdrant_client.create_collection(
                 collection_name=COLLECTION_NAME,
                 vectors_config={
                     "text-dense": models.VectorParams(
-                        size=384,  # BAAI/bge-small-en-v1.5 output size
+                        size=384,
                         distance=models.Distance.COSINE
                     )
                 },
@@ -55,33 +60,45 @@ def init_qdrant():
                 }
             )
 
+
 def get_qdrant_client():
     if _qdrant_client is None:
         init_qdrant()
     return _qdrant_client
 
-# Initialize FastEmbed models (Downloaded automatically on first run)
-logger.info("Initializing Dense & Sparse Embedding Models...")
-dense_model = TextEmbedding("BAAI/bge-small-en-v1.5")
-sparse_model = SparseTextEmbedding("Qdrant/bm25")
 
-# Initialize Reranker
-_reranker = None
+def get_dense_model():
+    global _dense_model
+    if _dense_model is None:
+        from fastembed import TextEmbedding  # lazy import — pulls torch
+        logger.info("Initializing Dense Embedding Model...")
+        _dense_model = TextEmbedding("BAAI/bge-small-en-v1.5")
+    return _dense_model
+
+
+def get_sparse_model():
+    global _sparse_model
+    if _sparse_model is None:
+        from fastembed import SparseTextEmbedding  # lazy import — pulls torch
+        logger.info("Initializing Sparse Embedding Model...")
+        _sparse_model = SparseTextEmbedding("Qdrant/bm25")
+    return _sparse_model
+
+
 def get_reranker():
     global _reranker
     if _reranker is None:
+        from sentence_transformers import CrossEncoder  # lazy import — pulls torch
         logger.info("Initializing CrossEncoder Reranker...")
         _reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
     return _reranker
 
-# Initialize EasyOCR reader (Lazy load)
-_ocr_reader = None
 
 def get_ocr_reader():
     global _ocr_reader
     if _ocr_reader is None:
+        import easyocr  # lazy import — pulls torch
         logger.info("Initializing EasyOCR reader (this might take a moment)...")
-        import easyocr  # lazy import — avoids loading torch at server startup
         _ocr_reader = easyocr.Reader(['en'], gpu=False)
     return _ocr_reader
 
@@ -151,8 +168,9 @@ def ingest_document(document_id: int, file_path: str, file_type: str, filename: 
     logger.info(f"Generated {len(chunks)} chunks for document {document_id}.")
     
     # Generate Dense and Sparse Vectors
-    dense_vecs = list(dense_model.embed(chunks))
-    sparse_vecs = list(sparse_model.embed(chunks))
+    from qdrant_client import models  # lazy import
+    dense_vecs = list(get_dense_model().embed(chunks))
+    sparse_vecs = list(get_sparse_model().embed(chunks))
     
     points = []
     for i, chunk in enumerate(chunks):
@@ -206,9 +224,11 @@ def hybrid_search(query: str, conversation_id: str, top_k: int = 5) -> List[Dict
     if not valid_doc_ids:
         return []
     
-    query_dense = list(dense_model.embed([query]))[0]
-    query_sparse = list(sparse_model.embed([query]))[0]
-    
+    query_dense = list(get_dense_model().embed([query]))[0]
+    query_sparse = list(get_sparse_model().embed([query]))[0]
+
+    from qdrant_client import models  # lazy import — qdrant_client no longer imported at module level
+
     doc_filter = models.Filter(
         must=[
             models.FieldCondition(
