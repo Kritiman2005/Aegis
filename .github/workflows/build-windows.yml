@@ -41,7 +41,8 @@ jobs:
         working-directory: backend
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r ../requirements.txt
+          if (Test-Path requirements.txt) { pip install -r requirements.txt }
           pip install pyinstaller
 
       # ── Inject credentials before PyInstaller bundles them ───────────────────
@@ -124,9 +125,11 @@ jobs:
           $success = $false
           for ($i = 0; $i -lt $maxRetries; $i++) {
             if ($process.HasExited) {
-              Write-Error "Backend exited prematurely (code $($process.ExitCode))"
+              Write-Output "=== BACKEND STDERR ==="
               Get-Content "backend_stderr.log" -ErrorAction SilentlyContinue
+              Write-Output "=== BACKEND STDOUT ==="
               Get-Content "backend_stdout.log" -ErrorAction SilentlyContinue
+              Write-Error "Backend exited prematurely (code $($process.ExitCode))"
               exit 1
             }
             try {
@@ -145,9 +148,11 @@ jobs:
           if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
 
           if (-not $success) {
-            Write-Error "Backend did not respond in 30 seconds"
+            Write-Output "=== BACKEND STDERR ==="
             Get-Content "backend_stderr.log" -ErrorAction SilentlyContinue
+            Write-Output "=== BACKEND STDOUT ==="
             Get-Content "backend_stdout.log" -ErrorAction SilentlyContinue
+            Write-Error "Backend did not respond in 30 seconds"
             exit 1
           }
 
