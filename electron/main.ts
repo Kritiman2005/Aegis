@@ -32,7 +32,6 @@ const HEALTH_MAX_RETRIES = 40;     // 40 × 500ms = 20 seconds max wait
 const HEALTH_RETRY_INTERVAL = 500; // ms
 
 // Resolve project root and backend dir correctly for dev vs prod
-const IS_DEV = !app.isPackaged;
 const PROJECT_ROOT = IS_DEV
   ? path.resolve(__dirname, '../../')
   : path.join(process.resourcesPath, 'app');
