@@ -80,7 +80,11 @@ contextBridge.exposeInMainWorld('aegis', {
     getVersion: () => ipcRenderer.invoke('app:get-version'),
     getPlatform: () => process.platform,
   },
+
+  /** Open a URL in the system browser (safe OAuth redirects) */
+  openExternal: (url: string) => ipcRenderer.invoke('shell:openExternal', url),
 });
+
 
 // ─── TypeScript Global Type Declaration ──────────────────────────────────────
 // This type is co-located here for IDE support; it gets picked up via
@@ -98,6 +102,8 @@ declare global {
         getVersion: () => Promise<string>;
         getPlatform: () => string;
       };
+      openExternal: (url: string) => Promise<void>;
     };
   }
 }
+

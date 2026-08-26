@@ -30,24 +30,8 @@ class LLMManager:
         self._register_default_models()
         
     def _register_default_models(self):
-        """Register the models we know about from disk and SQLite."""
-        data_dir = os.environ.get("AEGIS_DATA_DIR")
-        if data_dir:
-            _models_dir = Path(data_dir) / "models"
-        else:
-            _models_dir = Path(__file__).resolve().parent.parent.parent / "models"
-        local_gemma_config = ModelConfig(
-            name="gemma-local",
-            model_path=str(_models_dir / "qwen2.5-3b-instruct-q4_k_m.gguf"),
-            chat_format="chatml",
-            kwargs={
-                "n_ctx": 6144,
-                "verbose": False
-            }
-        )
-        self.register_model(local_gemma_config)
-
-        # Sync additional models from SQLite if DB is initialized
+        """Register downloaded models from SQLite. No hardcoded defaults."""
+        # Sync downloaded models from SQLite
         try:
             from app.db.database import SessionLocal
             from app.db.models import ModelRegistry
@@ -66,6 +50,7 @@ class LLMManager:
                         self.register_model(cfg)
         except Exception as e:
             logger.debug(f"SQLite model sync skipped: {e}")
+
         
     def register_model(self, config: ModelConfig):
         """Add a new model configuration."""

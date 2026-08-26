@@ -50,7 +50,12 @@ async def google_callback(request: Request):
         # The OAuthLib fetch_token is synchronous and makes network requests.
         # To avoid blocking the FastAPI async event loop, run it in a thread.
         def fetch():
-            flow.fetch_token(authorization_response=str(request.url))
+            # Normalize the redirect URL: Google may return localhost but our
+            # registered URI is 127.0.0.1. Replacing here prevents a mismatch.
+            auth_response = str(request.url).replace(
+                "localhost:8000", "127.0.0.1:8000"
+            )
+            flow.fetch_token(authorization_response=auth_response)
             return flow.credentials
             
         credentials = await anyio.to_thread.run_sync(fetch)
@@ -100,4 +105,21 @@ async def google_callback(request: Request):
         )
     except Exception as e:
         logger.error(f"Error during token exchange or MCP initialization: {e}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return HTMLResponse(
+            status_code=500,
+            content=f"""
+            <html>
+                <head><title>Authentication Failed</title></head>
+                <body style="font-family: sans-serif; text-align: center; padding-top: 50px; color: #c00;">
+                    <h1>Authentication Failed</h1>
+                    <p style="color:#333">An error occurred while connecting to Google.</p>
+                    <pre style="text-align:left;display:inline-block;background:#f4f4f4;padding:16px;border-radius:8px;font-size:12px;color:#333;max-width:600px;white-space:pre-wrap;">{str(e)}</pre>
+                    <br/>
+                    <p style="color:#555;font-size:13px;">Please close this tab and try again from Aegis.<br/>
+                    Make sure <strong>http://127.0.0.1:8000/auth/google/callback</strong> is listed as an authorized redirect URI in your Google Cloud Console.</p>
+                    <button onclick="window.close()" style="padding:10px 20px;margin-top:20px;border-radius:8px;background:#555;color:#fff;border:none;cursor:pointer;font-size:15px;">Close</button>
+                </body>
+            </html>
+            """
+        )
+

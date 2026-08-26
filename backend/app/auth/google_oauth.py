@@ -28,7 +28,8 @@ DOCS_SCOPES = [
     'https://www.googleapis.com/auth/documents.readonly'
 ]
 
-REDIRECT_URI = "http://localhost:8000/auth/google/callback"
+REDIRECT_URI = "http://127.0.0.1:8000/auth/google/callback"
+
 
 def get_google_flow(service_name: str) -> Flow:
     """Initialize the Google OAuth Flow using bundled app credentials.

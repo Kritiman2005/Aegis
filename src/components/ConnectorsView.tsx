@@ -231,11 +231,20 @@ export default function ConnectorsView() {
 
   const handleConnect = (def: typeof CONNECTOR_DEFS[0]) => {
     if (def.authType === 'oauth' && def.loginUrl) {
-      window.open(def.loginUrl, '_blank');
+      // Use Electron's shell.openExternal so OAuth redirects work in the system browser.
+      // window.open() inside Electron creates an embedded window that cannot handle
+      // localhost redirects back to the FastAPI backend correctly.
+      if (window.aegis?.openExternal) {
+        window.aegis.openExternal(def.loginUrl);
+      } else {
+        // Fallback for dev (browser) — window.open works there
+        window.open(def.loginUrl, '_blank');
+      }
     } else if (def.authType === 'api_key') {
       setApiKeyConnector(def);
     }
   };
+
 
   const handleFigmaConnect = async (token: string) => {
     try {

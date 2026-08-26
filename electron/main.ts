@@ -275,6 +275,14 @@ function registerIpcHandlers(): void {
     killSidecar();
     setTimeout(spawnSidecar, 500);
   });
+
+  // Open URLs in the system browser (used for OAuth flows)
+  ipcMain.handle('shell:openExternal', async (_event, url: string) => {
+    // Only allow http/https URLs pointing to known safe targets
+    if (typeof url === 'string' && (url.startsWith('http://') || url.startsWith('https://'))) {
+      await shell.openExternal(url);
+    }
+  });
 }
 
 // ─── App Lifecycle ───────────────────────────────────────────────────────────

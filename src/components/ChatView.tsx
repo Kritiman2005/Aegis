@@ -310,7 +310,6 @@ export default function ChatView({
                         </div>
                       ) : (
                       <div className="p-5 space-y-4">
-                        {/* Formatted Markdown Content (hide JSON blocks of plan) */}
                         <div className="font-sans w-full overflow-hidden">
                           {msg.isStreaming && !msg.content ? (
                             <div className="flex items-center gap-1.5 h-6 opacity-70">
@@ -323,186 +322,15 @@ export default function ChatView({
                               prose-h3:text-sm prose-h3:font-bold prose-h3:text-gray-900 prose-h3:mb-2 prose-h3:mt-0
                               prose-code:bg-gray-100 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:text-[11px]
                               prose-strong:text-gray-900 prose-li:text-gray-700 prose-li:leading-snug">
-                              <ReactMarkdown 
-                                remarkPlugins={[remarkGfm]}
-                                components={{
-                                  code({node, className, children, ...props}) {
-                                    if (msg.content.includes('Proposed Execution Plan') && className === 'language-json') {
-                                      return null;
-                                    }
-                                    return <code className={className} {...props}>{children}</code>;
-                                  }
-                                }}
-                              >
+                              <ReactMarkdown remarkPlugins={[remarkGfm]}>
                                 {msg.content}
                               </ReactMarkdown>
                             </div>
                           )}
                         </div>
-
-                      {/* Interactive Execution Plan Card (if plan response detected) */}
-                      {msg.content.includes('Proposed Execution Plan') && (() => {
-                        let parsedPlan = null;
-                        try {
-                          const jsonMatch = msg.content.match(/```json\n([\s\S]*?)\n```/);
-                          if (jsonMatch && jsonMatch[1]) {
-                            parsedPlan = JSON.parse(jsonMatch[1]);
-                          }
-                        } catch (e) {
-                          console.error("Failed to parse plan json", e);
-                        }
-                        
-                        if (!parsedPlan) return null;
-
-                        return (
-                          <div className="p-4 rounded-xl bg-gray-50 border border-gray-200 space-y-3">
-                            <div className="flex items-center justify-between border-b border-gray-200 pb-2">
-                              <span className="text-xs font-bold text-gray-900 flex items-center gap-1.5">
-                                <CheckCircle2 className="w-4 h-4 text-teal-600" />
-                                Execution Confirmation Required
-                              </span>
-                              <span className="text-[10px] text-gray-400">Human-In-The-Loop</span>
-                            </div>
-                            <div className="flex flex-col gap-2 pt-1">
-                              {/* Render Plan Steps with Live Status */}
-                              <div className="space-y-1 mb-2">
-                                {(Array.isArray(parsedPlan) ? parsedPlan : parsedPlan.plan || []).map((step: any, i: number) => {
-                                  const isRunning = activeNodeId === step.step_id;
-                                  const isCompleted = completedNodeIds?.has(step.step_id);
-                                  const isFailed = failedNodeIds?.has(step.step_id);
-                                  
-                                  return (
-                                    <div key={step.step_id || i} className={`flex items-start gap-2.5 p-2 rounded-lg transition-colors ${isRunning ? 'bg-indigo-50/50' : ''}`}>
-                                      <div className="mt-0.5">
-                                        {isCompleted ? (
-                                          <CheckCircle2 className="w-4 h-4 text-teal-600" />
-                                        ) : isFailed ? (
-                                          <X className="w-4 h-4 text-red-600" />
-                                        ) : isRunning ? (
-                                          <Loader2 className="w-4 h-4 text-indigo-600 animate-spin" />
-                                        ) : (
-                                          <div className="w-4 h-4 rounded-full border-2 border-gray-300" />
-                                        )}
-                                      </div>
-                                      <div className="flex-1 min-w-0">
-                                        <div className="flex flex-col gap-0.5">
-                                          <div className="flex items-center gap-1.5 flex-wrap">
-                                            <span className="text-xs font-semibold text-gray-900 font-mono truncate">{step.tool}</span>
-                                            {step.fetch_scope && step.fetch_scope !== 'single' && (
-                                              <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full uppercase tracking-wide ${
-                                                step.fetch_scope === 'exhaustive'
-                                                  ? 'bg-orange-100 text-orange-700'
-                                                  : step.fetch_scope === 'sample'
-                                                  ? 'bg-yellow-100 text-yellow-700'
-                                                  : 'bg-gray-100 text-gray-500'
-                                              }`}>
-                                                {step.fetch_scope}
-                                              </span>
-                                            )}
-                                          </div>
-                                          {step.reason && (
-                                            <p className="text-[11px] text-gray-500 leading-snug">{step.reason}</p>
-                                          )}
-                                        </div>
-                                      </div>
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                              
-                              {editingPlanId === msg.id ? (
-                              <div className="space-y-2">
-                                <textarea
-                                  value={planEditContent}
-                                  onChange={(e) => setPlanEditContent(e.target.value)}
-                                  className="w-full text-xs font-mono bg-white border border-gray-200 rounded-lg p-3 h-48 outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
-                                />
-                                <div className="flex gap-2">
-                                  <button
-                                    onClick={() => {
-                                      onSendMessage(`Please use exactly this updated plan:\n\n${planEditContent}`, 'message', chatMode);
-                                      setEditingPlanId(null);
-                                    }}
-                                    className="px-4 py-2 rounded-xl bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700 transition-all shadow-sm"
-                                  >
-                                    Submit Edit
-                                  </button>
-                                  <button
-                                    onClick={() => setEditingPlanId(null)}
-                                    className="px-4 py-2 rounded-xl bg-gray-200 text-gray-700 text-xs font-medium hover:bg-gray-300 transition-all"
-                                  >
-                                    Cancel Edit
-                                  </button>
-                                </div>
-                              </div>
-                            ) : schedulingPlanId === msg.id ? (
-                              <div className="space-y-3 bg-white p-3 rounded-lg border border-gray-200">
-                                <label className="block text-xs font-semibold text-gray-700">Select Schedule Interval</label>
-                                <select 
-                                  value={scheduleCron}
-                                  onChange={(e) => setScheduleCron(e.target.value)}
-                                  className="w-full bg-gray-50 border border-gray-200 rounded-lg p-2 text-xs outline-none focus:ring-2 focus:ring-indigo-100"
-                                >
-                                  <option value="every_1_min">Every 1 Minute (Test)</option>
-                                  <option value="every_1_hour">Every 1 Hour</option>
-                                  <option value="every_1_day">Every 1 Day</option>
-                                </select>
-                                <div className="flex gap-2 pt-2">
-                                  <button
-                                    onClick={() => {
-                                      onSendMessage(scheduleCron, 'schedule_plan', chatMode, scheduleCron);
-                                      setSchedulingPlanId(null);
-                                    }}
-                                    className="px-4 py-2 rounded-xl bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700 transition-all shadow-sm"
-                                  >
-                                    Confirm Schedule
-                                  </button>
-                                  <button
-                                    onClick={() => setSchedulingPlanId(null)}
-                                    className="px-4 py-2 rounded-xl bg-gray-200 text-gray-700 text-xs font-medium hover:bg-gray-300 transition-all"
-                                  >
-                                    Cancel
-                                  </button>
-                                </div>
-                              </div>
-                            ) : (
-                              <div className="flex flex-wrap gap-2 mt-2">
-                                <button
-                                  onClick={() => onSendMessage('yes', 'message', chatMode)}
-                                  className="px-4 py-2 rounded-xl bg-black text-white text-xs font-semibold hover:bg-neutral-800 transition-all shadow-sm flex items-center gap-1"
-                                >
-                                  Proceed & Execute
-                                </button>
-                                <button
-                                  onClick={() => setSchedulingPlanId(msg.id)}
-                                  className="px-4 py-2 rounded-xl bg-indigo-100 text-indigo-700 text-xs font-semibold hover:bg-indigo-200 transition-all shadow-sm flex items-center gap-1"
-                                >
-                                  Schedule Plan
-                                </button>
-                                <button
-                                  onClick={() => {
-                                    setEditingPlanId(msg.id);
-                                    setPlanEditContent(msg.content);
-                                  }}
-                                  className="px-4 py-2 rounded-xl bg-gray-200 text-gray-700 text-xs font-medium hover:bg-gray-300 transition-all"
-                                >
-                                  Edit Payload
-                                </button>
-                                <button
-                                  onClick={() => onSendMessage('cancel', 'message', chatMode)}
-                                  className="px-4 py-2 rounded-xl border border-gray-200 text-red-600 bg-white text-xs font-medium hover:bg-red-50 transition-all"
-                                >
-                                  Cancel Plan
-                                </button>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      );
-                      })()}
-
                       </div>
                       )}
+
                     </div>
                   )}
                 </div>
@@ -518,39 +346,33 @@ export default function ChatView({
           })
         )}
 
-        {/* ── Streaming Bubble ── */}
-        {isStreaming && streamingContent && (
+        {/* ── Streaming Bubble: show when actively streaming OR waiting for first token ── */}
+        {isStreaming && (
           <div className="flex gap-3 max-w-4xl mx-auto justify-start">
             <div className="w-8 h-8 rounded-xl bg-black flex items-center justify-center text-white flex-shrink-0 mt-0.5 shadow-sm">
               <Zap className="w-4 h-4 fill-white text-black" />
             </div>
             <div className="space-y-2 max-w-2xl items-start w-full">
               <div className="flex items-center gap-2 text-[11px] text-gray-400 justify-start mb-1">
-                <span className="font-semibold text-gray-700 flex items-center gap-2">
-                  Aegis
-                </span>
+                <span className="font-semibold text-gray-700">Aegis</span>
                 <span>•</span>
-                <span className="italic">Generating...</span>
+                <span className="italic">{streamingContent ? 'Generating...' : 'Thinking...'}</span>
               </div>
-              <div className="bg-white border border-gray-200 rounded-2xl p-5 text-xs text-gray-800 leading-relaxed shadow-sm space-y-4">
-                <div className="font-sans w-full overflow-hidden">
+              <div className="bg-white border border-gray-200 rounded-2xl p-5 text-xs text-gray-800 leading-relaxed shadow-sm">
+                {streamingContent ? (
                   <div className="prose prose-sm prose-slate max-w-none break-words marker:text-gray-400 prose-p:leading-relaxed">
-                    <ReactMarkdown 
-                      remarkPlugins={[remarkGfm]}
-                      components={{
-                        code({node, className, children, ...props}) {
-                          if (streamingContent.includes('Proposed Execution Plan') && className === 'language-json') {
-                            return null;
-                          }
-                          return <code className={className} {...props}>{children}</code>;
-                        }
-                      }}
-                    >
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
                       {streamingContent}
                     </ReactMarkdown>
                     <span className="inline-block w-1.5 h-3 ml-1 bg-gray-500 animate-pulse align-middle rounded-sm" />
                   </div>
-                </div>
+                ) : (
+                  <div className="flex items-center gap-1.5 h-5 opacity-60">
+                    <div className="w-1.5 h-1.5 rounded-full bg-gray-400 animate-bounce" style={{ animationDelay: '0ms' }} />
+                    <div className="w-1.5 h-1.5 rounded-full bg-gray-400 animate-bounce" style={{ animationDelay: '150ms' }} />
+                    <div className="w-1.5 h-1.5 rounded-full bg-gray-400 animate-bounce" style={{ animationDelay: '300ms' }} />
+                  </div>
+                )}
               </div>
             </div>
           </div>

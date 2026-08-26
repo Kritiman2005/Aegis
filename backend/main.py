@@ -75,22 +75,45 @@ app.include_router(context_config_router) # /api/context-config
 
 # ─── Startup: SQLite Initialization & OAuth Auto-Restore ──────────────────────
 
+# ── System Readiness State (polled by the Splash Screen) ─────────────────────
+_system_status = {
+    "sqlite": False,
+    "qdrant": False,
+    "embedding_models": False,
+    "downloaded_models": [],
+}
+
+@app.get("/api/status")
+async def get_system_status():
+    """Returns the readiness state of all backend subsystems for the Splash Screen."""
+    return _system_status
+
+
 @app.on_event("startup")
 async def on_startup():
-    """Initialize SQLite database tables, seed default model, and auto-restore Google OAuth session."""
+    """Initialize SQLite, Vector DB, and auto-restore OAuth sessions."""
     import asyncio
     import logging
+    import threading
     from app.db.database import init_db, SessionLocal
-    from app.db.crud import seed_default_model, get_active_google_credentials
+    from app.db.crud import get_active_google_credentials
     from app.mcp.registry import mcp_registry
     from app.core.scheduler import scheduler_daemon
     from app.api.websocket import watch_timeouts
     from app.core.rag.processor import init_qdrant
+    from app.db.models import ModelRegistry
     
     _logger = logging.getLogger("startup")
     _logger.info("Initializing Databases...")
     init_db()
+    _system_status["sqlite"] = True
     init_qdrant()
+    _system_status["qdrant"] = True
+
+    # Refresh downloaded models list in status
+    with SessionLocal() as db:
+        downloaded = db.query(ModelRegistry).filter(ModelRegistry.status == "downloaded").all()
+        _system_status["downloaded_models"] = [m.display_name for m in downloaded]
 
     # Start the Scheduler Daemon for background jobs
     scheduler_daemon.start()
@@ -98,29 +121,23 @@ async def on_startup():
     # Start the WebSocket session timeout watcher
     asyncio.create_task(watch_timeouts())
 
-    with SessionLocal() as db:
-        # Eagerly preload embedding models in a background thread so they are resident
-        import threading
-        def _preload_embedding_models():
-            try:
-                _logger.info("Preloading embedding models in background...")
-                from app.core.rag.processor import get_dense_model, get_sparse_model, get_reranker
-                get_dense_model()
-                get_sparse_model()
-                get_reranker()
-                _logger.info("Embedding models preloaded successfully.")
-            except Exception as e:
-                _logger.error(f"Failed to preload embedding models: {e}")
-                
-        threading.Thread(target=_preload_embedding_models, daemon=True).start()
+    # Eagerly preload embedding models in a background thread
+    def _preload_embedding_models():
+        try:
+            _logger.info("Preloading embedding models in background...")
+            from app.core.rag.processor import get_dense_model, get_sparse_model, get_reranker
+            get_dense_model()
+            get_sparse_model()
+            get_reranker()
+            _system_status["embedding_models"] = True
+            _logger.info("Embedding models preloaded successfully.")
+        except Exception as e:
+            _logger.error(f"Failed to preload embedding models: {e}")
+            _system_status["embedding_models"] = True  # Non-fatal: mark done so splash doesn't block
+            
+    threading.Thread(target=_preload_embedding_models, daemon=True).start()
 
-        # Seed default local model in SQLite models table
-        data_dir = os.environ.get("AEGIS_DATA_DIR")
-        if data_dir:
-            model_path = str(Path(data_dir) / "models" / "qwen2.5-3b-instruct-q4_k_m.gguf")
-        else:
-            model_path = str(Path(__file__).resolve().parent / "models" / "qwen2.5-3b-instruct-q4_k_m.gguf")
-        seed_default_model(db, model_path)
+    with SessionLocal() as db:
 
         # Auto-restore saved Google OAuth credentials from SQLite
         for service_name in ["google_mail", "google_drive"]:

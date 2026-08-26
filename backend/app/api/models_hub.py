@@ -39,13 +39,21 @@ def search_models(q: str = "", limit: int = 20):
     Returns a list of models with their available .gguf files.
     """
     try:
-        # Search HF Hub for models with the 'gguf' tag
-        models = hf_api.list_models(search=q, library="gguf", limit=limit, sort="downloads", direction=-1)
+        # Search by tags rather than library to catch all GGUF repos.
+        # Most popular GGUF repos (bartowski, TheBloke, etc.) are tagged "gguf"
+        # but their library_name is "transformers" or "gguf", which varies.
+        # Using tags="gguf" is the most reliable filter.
+        search_q = q if q else "gguf"
+        models = hf_api.list_models(
+            search=search_q,
+            tags="gguf",
+            limit=limit,
+            sort="downloads",
+            direction=-1
+        )
         
         results = []
         for model in models:
-            # We don't fetch files for every model aggressively because it slows down the search.
-            # The UI will fetch the files when a user clicks on a model card, or we can fetch them async.
             results.append({
                 "id": model.id,
                 "author": model.author,
@@ -58,6 +66,7 @@ def search_models(q: str = "", limit: int = 20):
     except Exception as e:
         logger.error(f"Error searching models: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @router.get("/repo/{repo_id:path}")

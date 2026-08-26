@@ -389,7 +389,19 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
         """IDLE → generate plan → WAITING_CONFIRMATION."""
         await self._append_history("user", message)
         
+        # ── Early check: ensure a model is actually downloaded ──────────────
+        test_llm = self.get_llm()
+        if test_llm is None:
+            no_model_msg = (
+                "⚠️ **No AI model is loaded.** Please visit the **LLM Panel** in the sidebar "
+                "to download a model (e.g., Qwen 2.5 3B). Once downloaded, come back and try again.\n\n"
+                "The download only needs to happen once — after that, the model stays resident in memory."
+            )
+            await self._append_history("assistant", no_model_msg)
+            return no_model_msg
+        
         entity_context = self._get_entity_context()
+
 
         # Load context window config live from the JSON config store so changes
         # from the Context Management UI take effect without a backend restart.

@@ -82,8 +82,14 @@ export default function Home() {
   }));
 
   if (!isBackendReady) {
-    return <SplashScreen onReady={() => setIsBackendReady(true)} />;
+    return (
+      <SplashScreen
+        onReady={() => setIsBackendReady(true)}
+        onGoToLLMPanel={() => { setIsBackendReady(true); setActiveTab('llms'); }}
+      />
+    );
   }
+
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[#F4F5F7] text-gray-900 font-sans antialiased">
