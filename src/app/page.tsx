@@ -6,12 +6,14 @@ import ChatView from '@/components/ChatView';
 import ContextMemoryHub from '@/components/ContextMemoryHub';
 import ConnectorsView from '@/components/ConnectorsView';
 import ModelHub from '@/components/ModelHub';
+import SplashScreen from '@/components/SplashScreen';
 import { useSocket } from '@/hooks/useSocket';
 import { useAppSelector } from '@/hooks/useStore';
 import { selectSessionId } from '@/store/sessionSlice';
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState<TabType>('connectors');
+  const [isBackendReady, setIsBackendReady] = useState(false);
   const {
     messages,
     status,
@@ -78,6 +80,10 @@ export default function Home() {
     id: s.id,
     preview: s.preview || 'Untitled chat',
   }));
+
+  if (!isBackendReady) {
+    return <SplashScreen onReady={() => setIsBackendReady(true)} />;
+  }
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[#F4F5F7] text-gray-900 font-sans antialiased">

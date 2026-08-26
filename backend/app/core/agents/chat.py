@@ -422,13 +422,24 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
 
         # ── Mode Branching ─────────────────────────────
         if mode == "chat":
+            if status_callback:
+                await status_callback("Searching your documents...")
+                
             # 1. RAG Retrieval for Uploaded Documents
             try:
+                import asyncio
+                loop = asyncio.get_running_loop()
                 from app.core.rag.processor import hybrid_search
-                relevant_chunks = hybrid_search(query=message, conversation_id=self.connection_id, top_k=_MAX_RAG_CHUNKS)
+                relevant_chunks = await loop.run_in_executor(
+                    db_executor,
+                    lambda: hybrid_search(query=message, conversation_id=self.connection_id, top_k=_MAX_RAG_CHUNKS)
+                )
             except Exception as e:
                 logger.warning(f"RAG search failed: {e}")
                 relevant_chunks = []
+                
+            if status_callback:
+                await status_callback("Generating...")
                 
             document_context = ""
             if relevant_chunks:

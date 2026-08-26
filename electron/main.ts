@@ -289,13 +289,9 @@ app.whenReady().then(async () => {
   // 2. Create the window (hidden) immediately to show a loading state if desired
   mainWindow = createWindow();
 
-  // 3. Wait for the sidecar to be healthy before loading content
-  const sidecarReady = await waitForSidecar();
+  // 3. (Removed blocking waitForSidecar) The React frontend now handles the loading screen
+  // by polling the backend health endpoint, giving the user a beautiful instant splash screen.
 
-  if (!sidecarReady) {
-    // Still load the UI — it can show an error state via the backend:status IPC event
-    mainWindow.webContents.send('backend:error', 'Sidecar failed to start within timeout.');
-  }
 
   // 4. Register custom protocol handler for production
   if (!IS_DEV) {

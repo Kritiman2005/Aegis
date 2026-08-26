@@ -99,6 +99,21 @@ async def on_startup():
     asyncio.create_task(watch_timeouts())
 
     with SessionLocal() as db:
+        # Eagerly preload embedding models in a background thread so they are resident
+        import threading
+        def _preload_embedding_models():
+            try:
+                _logger.info("Preloading embedding models in background...")
+                from app.core.rag.processor import get_dense_model, get_sparse_model, get_reranker
+                get_dense_model()
+                get_sparse_model()
+                get_reranker()
+                _logger.info("Embedding models preloaded successfully.")
+            except Exception as e:
+                _logger.error(f"Failed to preload embedding models: {e}")
+                
+        threading.Thread(target=_preload_embedding_models, daemon=True).start()
+
         # Seed default local model in SQLite models table
         data_dir = os.environ.get("AEGIS_DATA_DIR")
         if data_dir:
