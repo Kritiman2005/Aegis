@@ -77,10 +77,11 @@ function spawnSidecar(): void {
     command = 'uvicorn';
     args = ['main:app', '--port', String(BACKEND_PORT), '--log-level', 'warning'];
   } else {
-    // PyInstaller --onedir outputs: backend/dist/main/main.exe (+ all DLLs in same folder)
+    // PyInstaller --onedir outputs to backend/dist/main/ during build,
+    // but electron-builder extraResources copies the contents directly to resources/backend/
     // The binary MUST run with cwd = its own folder so it can find sibling DLLs
     const binaryName = process.platform === 'win32' ? 'main.exe' : 'main';
-    command = path.join(BACKEND_ROOT, 'dist', 'main', binaryName);
+    command = path.join(BACKEND_ROOT, binaryName);
     args = [];
   }
 
@@ -301,10 +302,11 @@ app.whenReady().then(async () => {
     protocol.handle('app', (request) => {
       const url = new URL(request.url);
       let pathname = url.pathname;
+      // Directory-fallback logic for nested routes
       if (pathname.endsWith('/')) pathname += 'index.html';
       else if (!path.extname(pathname)) pathname += '/index.html';
       
-      const absolutePath = path.join(PROJECT_ROOT, 'out', pathname);
+      const absolutePath = path.join(process.resourcesPath, 'out', pathname);
       return net.fetch(require('url').pathToFileURL(absolutePath).toString());
     });
   }
