@@ -189,7 +189,7 @@ function ModelCard({
     if (files.length > 0) return;
     setLoadingFiles(true);
     try {
-      const res = await fetch(`http://localhost:8000/api/hub/repo/${encodeURIComponent(model.id)}`);
+      const res = await fetch(`http://127.0.0.1:8000/api/hub/repo/${encodeURIComponent(model.id)}`);
       const data = await res.json();
       setFiles(data.files || []);
     } catch { }
@@ -279,7 +279,7 @@ function FamilySection({
   useEffect(() => {
     if (open && !loaded) {
       setLoading(true);
-      fetch(`http://localhost:8000/api/hub/search?q=${encodeURIComponent(family.searchQuery)}&limit=8`)
+      fetch(`http://127.0.0.1:8000/api/hub/search?q=${encodeURIComponent(family.searchQuery)}&limit=8`)
         .then(r => r.json())
         .then(data => { setModels(data.models || []); setLoaded(true); })
         .catch(() => {})
@@ -358,7 +358,7 @@ export default function ModelHub() {
 
   const fetchLocalModels = useCallback(async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/hub/downloaded');
+      const res = await fetch('http://127.0.0.1:8000/api/hub/downloaded');
       const data = await res.json();
       const mapping: Record<string, LocalModel> = {};
       (data.models || []).forEach((m: LocalModel) => {
@@ -389,7 +389,7 @@ export default function ModelHub() {
 
   const startDownload = async (repoId: string, filename: string) => {
     try {
-      await fetch('http://localhost:8000/api/hub/download', {
+      await fetch('http://127.0.0.1:8000/api/hub/download', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ repo_id: repoId, filename }),

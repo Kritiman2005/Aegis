@@ -31,7 +31,7 @@ export default function Home() {
 
   const fetchSessions = useCallback(async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/chat/sessions');
+      const res = await fetch('http://127.0.0.1:8000/api/chat/sessions');
       const data = await res.json();
       setSessions(Array.isArray(data) ? data : []);
     } catch {}
@@ -58,7 +58,7 @@ export default function Home() {
     if (!confirm('Delete this chat? This cannot be undone.')) return;
     try {
       const res = await fetch(
-        `http://localhost:8000/api/chat/sessions/${encodeURIComponent(sessionId)}`,
+        `http://127.0.0.1:8000/api/chat/sessions/${encodeURIComponent(sessionId)}`,
         { method: 'DELETE' }
       );
       if (res.ok) {

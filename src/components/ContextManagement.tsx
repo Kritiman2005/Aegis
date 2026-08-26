@@ -189,7 +189,7 @@ export default function ContextManagement() {
 
   const fetchConfig = useCallback(async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/context-config');
+      const res = await fetch('http://127.0.0.1:8000/api/context-config');
       if (!res.ok) throw new Error('Failed to fetch');
       const data = await res.json();
       setConfig(data);
@@ -222,7 +222,7 @@ export default function ContextManagement() {
     if (!config) return;
     setSaving(true);
     try {
-      const res = await fetch('http://localhost:8000/api/context-config', {
+      const res = await fetch('http://127.0.0.1:8000/api/context-config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -268,7 +268,7 @@ export default function ContextManagement() {
     if (!confirm('Reset all agents to default context window settings?')) return;
     setSaving(true);
     try {
-      const res = await fetch('http://localhost:8000/api/context-config/reset', { method: 'POST' });
+      const res = await fetch('http://127.0.0.1:8000/api/context-config/reset', { method: 'POST' });
       if (!res.ok) throw new Error('Reset failed');
       const data = await res.json();
       setConfig(data.config);
@@ -286,7 +286,7 @@ export default function ContextManagement() {
   const handleUnloadModel = async () => {
     setUnloading(true);
     try {
-      const res = await fetch('http://localhost:8000/api/hardware/unload', { method: 'POST' });
+      const res = await fetch('http://127.0.0.1:8000/api/hardware/unload', { method: 'POST' });
       const data = await res.json();
       
       if (!res.ok) {

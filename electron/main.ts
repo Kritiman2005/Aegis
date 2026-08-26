@@ -245,7 +245,7 @@ function configureCSP(): void {
             "script-src 'self' 'unsafe-inline'",  // unsafe-inline needed for Next.js
             "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
             "font-src 'self' https://fonts.gstatic.com",
-            "connect-src 'self' ws://localhost:8000 http://localhost:8000",
+            "connect-src 'self' ws://localhost:8000 http://localhost:8000 ws://127.0.0.1:8000 http://127.0.0.1:8000",
             "img-src 'self' data: blob:",
           ].join('; '),
         ],
