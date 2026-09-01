@@ -35,35 +35,41 @@ def get_db_session():
 @router.get("/search")
 def search_models(q: str = "", limit: int = 20):
     """
-    Search Hugging Face Hub for GGUF models.
+    Search Hugging Face Hub for GGUF models using the REST API to avoid SDK version fragility.
     Returns a list of models with their available .gguf files.
     """
     try:
-        # Search by tags rather than library to catch all GGUF repos.
-        # Most popular GGUF repos (bartowski, TheBloke, etc.) are tagged "gguf"
-        # but their library_name is "transformers" or "gguf", which varies.
-        # Using tags="gguf" is the most reliable filter.
         search_q = q if q else "gguf"
-        models = hf_api.list_models(
-            search=search_q,
-            filter="gguf",
-            limit=limit,
-            sort="downloads"
-        )
+        
+        # Use httpx directly to hit the HF REST API. This is immune to huggingface_hub 
+        # python SDK version differences (like `direction` or `tags` kwargs breaking).
+        url = "https://huggingface.co/api/models"
+        params = {
+            "search": search_q,
+            "filter": "gguf",
+            "limit": limit,
+            "sort": "downloads",
+            "direction": -1,
+            "full": "False"
+        }
+        
+        res = httpx.get(url, params=params, timeout=15.0)
+        res.raise_for_status()
+        models_data = res.json()
         
         results = []
-        for model in models:
+        for model in models_data:
             results.append({
-                "id": model.id,
-                "author": model.author,
-                "downloads": model.downloads,
-                "likes": model.likes,
-                "tags": model.tags,
+                "id": model.get("id"),
+                "author": model.get("author"),
+                "downloads": model.get("downloads", 0),
+                "likes": model.get("likes", 0),
+                "tags": model.get("tags", []),
             })
             
         return {"models": results}
     except Exception as e:
-        logger.error(f"Error searching models: {e}")
+        logger.error(f"Error searching models via REST API: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
