@@ -119,8 +119,8 @@ async def download_file_task(repo_id: str, filename: str, file_path: Path, model
     })
 
     try:
-        # Use a generous timeout for large files
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=None)) as client:
+        # Use a generous timeout for large files and bypass SSL verify for PyInstaller
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=None), verify=False) as client:
             async with client.stream("GET", url, follow_redirects=True) as response:
                 response.raise_for_status()
                 total_bytes = int(response.headers.get("Content-Length", 0))

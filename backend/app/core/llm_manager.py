@@ -189,23 +189,23 @@ class LLMManager:
                 kwargs["n_ctx"] = 8192 # Safe default cap for agents that gives plenty of room
 
         
-        if config.repo_id and config.filename:
-            # Load from huggingface hub
+        if config.model_path and os.path.exists(config.model_path):
+            # Load from local file (this uses the file we downloaded directly via httpx, avoiding hf-hub SSL issues)
+            llm = Llama(
+                model_path=config.model_path,
+                chat_format=config.chat_format,
+                **kwargs
+            )
+        elif config.repo_id and config.filename:
+            # Fallback to huggingface hub
             llm = Llama.from_pretrained(
                 repo_id=config.repo_id,
                 filename=config.filename,
                 chat_format=config.chat_format,
                 **kwargs
             )
-        elif config.model_path:
-            # Load from local file
-            llm = Llama(
-                model_path=config.model_path,
-                chat_format=config.chat_format,
-                **kwargs
-            )
         else:
-            raise ValueError(f"Model config for {model_name} must have either repo_id/filename or model_path")
+            raise ValueError(f"Model config for {model_name} must have either model_path or repo_id/filename")
             
         self.loaded_models[model_name] = llm
         logger.info(f"Model {model_name} loaded successfully.")
