@@ -33,7 +33,7 @@ export default function Home() {
 
   const fetchSessions = useCallback(async () => {
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/chat/sessions');
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/chat/sessions`);
       const data = await res.json();
       setSessions(Array.isArray(data) ? data : []);
     } catch {}

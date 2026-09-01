@@ -372,7 +372,7 @@ export default function ModelHub() {
 
   const fetchLocalModels = useCallback(async () => {
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hub/downloaded');
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hub/downloaded`);
       const data = await res.json();
       const mapping: Record<string, LocalModel> = {};
       (data.models || []).forEach((m: LocalModel) => {
@@ -403,7 +403,7 @@ export default function ModelHub() {
 
   const startDownload = async (repoId: string, filename: string) => {
     try {
-      await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hub/download', {
+      await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hub/download`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ repo_id: repoId, filename }),

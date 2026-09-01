@@ -57,7 +57,7 @@ export default function ContextMemoryHub() {
 
   const fetchDownloadedModels = async () => {
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hub/downloaded');
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hub/downloaded`);
       if (res.ok) {
         const data = await res.json();
         setDownloadedModels(data.models || []);
@@ -67,7 +67,7 @@ export default function ContextMemoryHub() {
 
   const fetchHardware = async () => {
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hardware/status');
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hardware/status`);
       if (res.ok) {
         setHardware(await res.json());
       }
@@ -78,7 +78,7 @@ export default function ContextMemoryHub() {
 
   const fetchConfig = async () => {
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/context-config');
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/context-config`);
       if (res.ok) {
         const data = await res.json();
         if (data.chat) setChatConfig({ ...chatConfig, ...data.chat });
@@ -92,7 +92,7 @@ export default function ContextMemoryHub() {
   const saveConfig = async () => {
     setIsSaving(true);
     try {
-      await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/context-config', {
+      await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/context-config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -121,7 +121,7 @@ export default function ContextMemoryHub() {
   const handleUnloadModel = async () => {
     setUnloading(true);
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hardware/unload', { method: 'POST' });
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hardware/unload`, { method: 'POST' });
       if (res.ok) {
         toast.success("Model ejected from RAM.");
         fetchHardware();
@@ -139,7 +139,7 @@ export default function ContextMemoryHub() {
     if (!selectedModelId) return;
     setLoadingModel(true);
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hardware/load', {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hardware/load`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model_id: selectedModelId })

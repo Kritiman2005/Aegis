@@ -21,7 +21,7 @@ export default function MemoryViewer({ onClose }: { onClose: () => void }) {
   const fetchMemories = async () => {
     try {
       setLoading(true);
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/memories');
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/memories`);
       const data = await res.json();
       setMemories(data);
     } catch (err) {
