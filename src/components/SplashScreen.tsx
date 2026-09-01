@@ -28,11 +28,11 @@ export default function SplashScreen({ onReady, onGoToLLMPanel }: SplashScreenPr
 
   const poll = useCallback(async () => {
     try {
-      const healthRes = await fetch('http://127.0.0.1:8000/api/health', { cache: 'no-store' });
+      const healthRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/health', { cache: 'no-store' });
       if (!healthRes.ok) return;
       setBackendReachable(true);
 
-      const statusRes = await fetch('http://127.0.0.1:8000/api/status', { cache: 'no-store' });
+      const statusRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/status', { cache: 'no-store' });
       if (!statusRes.ok) return;
       const data: SystemStatus = await statusRes.json();
       setStatus(data);

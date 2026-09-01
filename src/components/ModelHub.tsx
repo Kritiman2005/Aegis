@@ -189,7 +189,7 @@ function ModelCard({
     if (files.length > 0) return;
     setLoadingFiles(true);
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/hub/repo/${encodeURIComponent(model.id)}`);
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hub/repo/${encodeURIComponent(model.id)}`);
       const data = await res.json();
       setFiles(data.files || []);
     } catch { }
@@ -275,14 +275,23 @@ function FamilySection({
   const [models, setModels] = useState<ModelResult[]>([]);
   const [loading, setLoading] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   useEffect(() => {
     if (open && !loaded) {
       setLoading(true);
-      fetch(`http://127.0.0.1:8000/api/hub/search?q=${encodeURIComponent(family.searchQuery)}&limit=8`)
-        .then(r => r.json())
+      setErrorMsg(null);
+      fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hub/search?q=${encodeURIComponent(family.searchQuery)}&limit=8`)
+        .then(async r => {
+          const data = await r.json();
+          if (!r.ok) throw new Error(data.detail || 'API Error');
+          return data;
+        })
         .then(data => { setModels(data.models || []); setLoaded(true); })
-        .catch(() => {})
+        .catch(err => {
+          console.error("Fetch models error:", err);
+          setErrorMsg(err.message || 'Failed to fetch models');
+        })
         .finally(() => setLoading(false));
     }
   }, [open, loaded, family.searchQuery]);
@@ -329,6 +338,11 @@ function FamilySection({
             <div className="flex items-center gap-2 text-sm text-gray-500 py-4 justify-center">
               <Loader2 className="w-4 h-4 animate-spin" /> Loading {family.label} models...
             </div>
+          ) : errorMsg ? (
+            <div className="text-sm text-red-500 text-center py-4 bg-red-50 rounded-lg border border-red-100">
+              <p className="font-semibold">Error loading models</p>
+              <p className="text-xs mt-1">{errorMsg}</p>
+            </div>
           ) : models.length === 0 ? (
             <p className="text-sm text-gray-400 text-center py-4">No models found.</p>
           ) : (
@@ -358,7 +372,7 @@ export default function ModelHub() {
 
   const fetchLocalModels = useCallback(async () => {
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/hub/downloaded');
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hub/downloaded');
       const data = await res.json();
       const mapping: Record<string, LocalModel> = {};
       (data.models || []).forEach((m: LocalModel) => {
@@ -389,7 +403,7 @@ export default function ModelHub() {
 
   const startDownload = async (repoId: string, filename: string) => {
     try {
-      await fetch('http://127.0.0.1:8000/api/hub/download', {
+      await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hub/download', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ repo_id: repoId, filename }),

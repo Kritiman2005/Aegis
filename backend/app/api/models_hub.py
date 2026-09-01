@@ -53,7 +53,10 @@ def search_models(q: str = "", limit: int = 20):
             "full": "False"
         }
         
-        res = httpx.get(url, params=params, timeout=15.0)
+        # Disable SSL verification (verify=False) because PyInstaller on Windows 
+        # frequently fails to bundle certifi's cacert.pem correctly, leading to 
+        # [SSL: CERTIFICATE_VERIFY_FAILED] errors and silent UI failures.
+        res = httpx.get(url, params=params, timeout=15.0, verify=False)
         res.raise_for_status()
         models_data = res.json()
         

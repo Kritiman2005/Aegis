@@ -48,7 +48,7 @@ interface ServerPayload {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const WS_URL = 'ws://127.0.0.1:8000/ws';
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL || 'ws://127.0.0.1:8000/ws';
 const MAX_RECONNECT_DELAY_MS = 30_000;
 const BASE_RECONNECT_DELAY_MS = 1_000;
 const PING_INTERVAL_MS = 60_000;

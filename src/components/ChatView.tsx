@@ -61,7 +61,7 @@ export default function ChatView({
   useEffect(() => {
     const fetchHardware = async () => {
       try {
-        const res = await fetch('http://127.0.0.1:8000/api/hardware/status');
+        const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hardware/status');
         const data = await res.json();
         setHardwareStatus(data);
       } catch (e) {
@@ -120,7 +120,7 @@ export default function ChatView({
     formData.append('conversation_id', sessionId);
     
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/documents/upload', {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/documents/upload', {
         method: 'POST',
         body: formData,
       });

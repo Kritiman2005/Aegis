@@ -115,7 +115,7 @@ export default function SettingsView() {
                 }`}
               >
                 <div>
-                  <p className="text-xs font-bold text-gray-900">Aegis Pro (Qwen2.5-3B-Instruct)</p>
+                  <p className="text-xs font-bold text-gray-900">Aegis Pro</p>
                   <p className="text-[11px] text-gray-500">Enhanced reasoning & structured tool planning</p>
                 </div>
                 <input

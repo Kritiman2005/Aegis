@@ -21,7 +21,7 @@ export default function MemoryViewer({ onClose }: { onClose: () => void }) {
   const fetchMemories = async () => {
     try {
       setLoading(true);
-      const res = await fetch('http://127.0.0.1:8000/api/memories');
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/memories');
       const data = await res.json();
       setMemories(data);
     } catch (err) {
@@ -37,7 +37,7 @@ export default function MemoryViewer({ onClose }: { onClose: () => void }) {
 
   const handleDelete = async (id: number) => {
     try {
-      await fetch(`http://127.0.0.1:8000/api/memories/${id}`, { method: 'DELETE' });
+      await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/memories/${id}`, { method: 'DELETE' });
       setMemories((prev) => prev.filter((m) => m.id !== id));
     } catch (err) {
       console.error('Failed to delete memory', err);
@@ -52,7 +52,7 @@ export default function MemoryViewer({ onClose }: { onClose: () => void }) {
 
   const saveEdit = async (id: number) => {
     try {
-      await fetch(`http://127.0.0.1:8000/api/memories/${id}`, {
+      await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/memories/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ label: editLabel, data_json: editData }),
