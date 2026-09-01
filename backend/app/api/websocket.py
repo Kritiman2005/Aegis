@@ -115,6 +115,12 @@ async def websocket_endpoint(
                 await manager.send_json(connection_id, {"type": "pong"})
                 continue
 
+            if msg_type == "cancel":
+                logger.info(f"[WS:{connection_id[:8]}] Cancel signal received.")
+                if hasattr(session, "cancel_event"):
+                    session.cancel_event.set()
+                continue
+
             # ── Handle User Message (Agent Workflow) ─────────────────────────
             if msg_type == "message" and content.strip():
                 logger.info(f"[WS:{connection_id[:8]}] User: {content[:80]!r}")
@@ -128,6 +134,8 @@ async def websocket_endpoint(
 
                 async def process_message_task(msg_content: str, msg_mode: str):
                     session.is_processing = True
+                    if hasattr(session, "cancel_event"):
+                        session.cancel_event.clear()
                     try:
                         streamed = False
                         loop = asyncio.get_running_loop()

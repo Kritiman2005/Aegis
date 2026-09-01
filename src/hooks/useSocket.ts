@@ -18,10 +18,12 @@ import { setSessionId, generateNewSession, selectSessionId } from '@/store/sessi
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export type MessageRole = 'user' | 'assistant' | 'system';
+export type MessageType = 'message' | 'thought' | 'tool_call';
 
 export interface ChatMessage {
   id: string;
   role: MessageRole;
+  msgType?: MessageType;
   content: string;
   timestamp: Date;
   isStreaming?: boolean;
@@ -111,30 +113,28 @@ export function useSocket() {
     });
   }, []);
 
-  const finalizeStreamingMessage = useCallback(() => {
-    const finalContent = streamingContentRef.current + bufferRef.current;
+  const finalizeStreamingMessage = useCallback((forceMsgType?: MessageType) => {
+    if (!streamingIdRef.current) return;
+    const finalContent = (streamingContentRef.current + bufferRef.current).trim();
     
-    bufferRef.current = '';
-    streamingContentRef.current = '';
-    setStreamingContent('');
-    
-    if (finalContent.trim()) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: streamingIdRef.current || generateId(),
-          role: 'assistant',
-          content: finalContent,
-          timestamp: new Date(),
-          isStreaming: false
-        }
-      ]);
+    if (finalContent) {
+      appendMessage({
+        id: streamingIdRef.current,
+        role: 'assistant',
+        msgType: forceMsgType || 'thought',
+        content: finalContent,
+        timestamp: new Date(),
+        isStreaming: false,
+      });
     }
     
     streamingIdRef.current = null;
+    bufferRef.current = "";
+    streamingContentRef.current = "";
+    setStreamingContent("");
     setIsStreaming(false);
-    setActiveNodeId(null);
-  }, []);
+    rafPending.current = false;
+  }, [appendMessage]);
 
   // ── Stable callback refs (prevents connect from being recreated on every render) ──
   const appendMessageRef = useRef(appendMessage);
@@ -270,12 +270,13 @@ export function useSocket() {
           // content and immediately render the result as its own message so the
           // user sees live progress without waiting for the full plan to complete.
           if (streamingContentRef.current || bufferRef.current) {
-            finalizeRef.current();
+            finalizeRef.current('thought');
           }
           if (payload.content) {
             appendMessageRef.current({
               id: generateId(),
               role: 'assistant',
+              msgType: 'tool_call',
               content: payload.content,
               timestamp: new Date(),
               isStreaming: false,
@@ -289,7 +290,7 @@ export function useSocket() {
           break;
 
         case 'done':
-          finalizeRef.current();
+          finalizeRef.current('message');
           break;
 
         case 'toast':
@@ -418,6 +419,14 @@ export function useSocket() {
     [isStreaming, appendMessage]
   );
 
+  const cancelGeneration = useCallback(() => {
+    if (socketRef.current?.readyState === WebSocket.OPEN && isStreaming) {
+      socketRef.current.send(JSON.stringify({ type: 'cancel' }));
+      // We don't immediately clear isStreaming here; the backend will send a done event 
+      // which handles state cleanup predictably.
+    }
+  }, [isStreaming]);
+
   const clearMessages = useCallback(() => {
     setMessages([]);
   }, []);
@@ -465,6 +474,7 @@ export function useSocket() {
     completedNodeIds,
     failedNodeIds,
     sendMessage,
+    cancelGeneration,
     clearMessages,
     switchSession,
     addMessageHandler,

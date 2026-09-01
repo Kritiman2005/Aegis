@@ -23,12 +23,12 @@ export default function Home() {
     completedNodeIds,
     failedNodeIds,
     sendMessage,
+    cancelGeneration,
     clearMessages,
     switchSession,
   } = useSocket();
 
   const currentSessionId = useAppSelector(selectSessionId);
-
   const [sessions, setSessions] = useState<any[]>([]);
 
   const fetchSessions = useCallback(async () => {
@@ -113,6 +113,7 @@ export default function Home() {
             isStreaming={isStreaming}
             streamingContent={streamingContent}
             onSendMessage={sendMessage}
+            onCancelGeneration={cancelGeneration}
             onClearMessages={clearMessages}
             activeNodeId={activeNodeId}
             completedNodeIds={completedNodeIds}

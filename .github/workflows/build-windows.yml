@@ -101,6 +101,11 @@ jobs:
         working-directory: backend
         run: pyinstaller main.spec
 
+      - name: Prune Unused Binaries
+        shell: pwsh
+        working-directory: backend
+        run: .\prune_build.ps1
+
       - name: Disable Windows Defender real-time protection
         shell: pwsh
         run: |

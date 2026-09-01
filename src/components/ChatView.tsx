@@ -21,12 +21,15 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useAppSelector } from '@/hooks/useStore';
 import { selectSessionId } from '@/store/sessionSlice';
+import AgentThinking from './AgentThinking';
+import { useMemo } from 'react';
 
 interface ChatViewProps {
   messages: ChatMessage[];
   status: ConnectionStatus;
   isStreaming: boolean;
   onSendMessage: (msg: string, msgType?: string, mode?: string, userPrompt?: string) => boolean;
+  onCancelGeneration?: () => void;
   onClearMessages: () => void;
   activeConnectorName?: string;
   activeNodeId?: string | null;
@@ -40,6 +43,7 @@ export default function ChatView({
   status,
   isStreaming,
   onSendMessage,
+  onCancelGeneration,
   onClearMessages,
   activeConnectorName = 'GitHub',
   activeNodeId,
@@ -80,6 +84,28 @@ export default function ChatView({
   const [editingPlanId, setEditingPlanId] = useState<string | null>(null);
   const [planEditContent, setPlanEditContent] = useState('');
   
+
+  const groupedMessages = useMemo(() => {
+    const groups: Array<{ type: 'message' | 'system' | 'thinking', content: ChatMessage[], id: string }> = [];
+    
+    messages.forEach(msg => {
+      if (msg.role === 'system') {
+        groups.push({ type: 'system', content: [msg], id: msg.id });
+      } else if (msg.msgType === 'thought' || msg.msgType === 'tool_call') {
+        const lastGroup = groups[groups.length - 1];
+        if (lastGroup && lastGroup.type === 'thinking') {
+          lastGroup.content.push(msg);
+        } else {
+          groups.push({ type: 'thinking', content: [msg], id: `thinking-${msg.id}` });
+        }
+      } else {
+        groups.push({ type: 'message', content: [msg], id: msg.id });
+      }
+    });
+
+    return groups;
+  }, [messages]);
+
   // Document Upload State
   const [isUploading, setIsUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -225,13 +251,11 @@ export default function ChatView({
             </div>
           </div>
         ) : (
-          messages.map((msg, index) => {
-            const isUser = msg.role === 'user';
-            const isSystem = msg.role === 'system';
-            
-            if (isSystem) {
+          groupedMessages.map((group, index) => {
+            if (group.type === 'system') {
+              const msg = group.content[0];
               return (
-                <div key={msg.id} className="flex justify-center my-4">
+                <div key={group.id} className="flex justify-center my-4">
                   <div className="px-4 py-1.5 bg-gray-100 text-gray-500 text-xs font-medium rounded-full shadow-sm border border-gray-200">
                     {msg.content}
                   </div>
@@ -239,6 +263,23 @@ export default function ChatView({
               );
             }
 
+            if (group.type === 'thinking') {
+              const isLast = index === groupedMessages.length - 1;
+              const shouldPassStream = isLast && isStreaming && chatMode === 'agent';
+              
+              return (
+                <AgentThinking 
+                  key={group.id} 
+                  messages={group.content} 
+                  isStreaming={shouldPassStream}
+                  streamingContent={shouldPassStream ? streamingContent : undefined}
+                />
+              );
+            }
+
+            const msg = group.content[0];
+            const isUser = msg.role === 'user';
+            
             return (
               <div
                 key={msg.id}
@@ -274,41 +315,7 @@ export default function ChatView({
                     /* Assistant Message Card */
                     <div className="bg-white border border-gray-100 rounded-2xl shadow-sm overflow-hidden">
 
-                      {/* Step-result card — distinct style for tool output */}
-                      {msg.content.includes('__PAGINATION_CAP__') ? (
-                        <div className="p-5 space-y-4">
-                          <div className="flex items-start gap-3 p-3 bg-amber-50 border border-amber-200 rounded-xl">
-                            <span className="text-lg mt-0.5">⚠️</span>
-                            <div className="flex-1">
-                              <p className="text-xs font-bold text-amber-900 mb-1">Pagination Limit Reached</p>
-                              <p className="text-[11px] text-amber-800 leading-relaxed">
-                                {msg.content
-                                  .replace('__PAGINATION_CAP__', '')
-                                  .replace(/\*\*Would you.*$/s, '')
-                                  .replace(/\n+/g, ' ')
-                                  .replace('Pagination Stalled', '')
-                                  .trim()}
-                              </p>
-                            </div>
-                          </div>
-                          <p className="text-xs font-semibold text-gray-700">Would you like to continue fetching or stop here?</p>
-                          <div className="flex gap-2">
-                            <button
-                              onClick={() => onSendMessage('yes', 'message', chatMode)}
-                              className="px-4 py-2 rounded-xl bg-black text-white text-xs font-semibold hover:bg-neutral-800 transition-all shadow-sm flex items-center gap-1.5"
-                            >
-                              <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2.5}><path d="M4 12h16M12 4l8 8-8 8"/></svg>
-                              Continue Fetching
-                            </button>
-                            <button
-                              onClick={() => onSendMessage('no', 'message', chatMode)}
-                              className="px-4 py-2 rounded-xl border border-gray-200 text-gray-700 bg-white text-xs font-medium hover:bg-gray-50 transition-all"
-                            >
-                              Stop &amp; Use Current Data
-                            </button>
-                          </div>
-                        </div>
-                      ) : (
+
                       <div className="p-5 space-y-4">
                         <div className="font-sans w-full overflow-hidden">
                           {msg.isStreaming && !msg.content ? (
@@ -328,10 +335,7 @@ export default function ChatView({
                             </div>
                           )}
                         </div>
-                      </div>
-                      )}
-
-                    </div>
+                      </div>                    </div>
                   )}
                 </div>
 
@@ -347,7 +351,7 @@ export default function ChatView({
         )}
 
         {/* ── Streaming Bubble: show when actively streaming OR waiting for first token ── */}
-        {isStreaming && (
+        {isStreaming && chatMode === 'chat' && (
           <div className="flex gap-3 max-w-4xl mx-auto justify-start">
             <div className="w-8 h-8 rounded-xl bg-black flex items-center justify-center text-white flex-shrink-0 mt-0.5 shadow-sm">
               <Zap className="w-4 h-4 fill-white text-black" />
@@ -376,6 +380,15 @@ export default function ChatView({
               </div>
             </div>
           </div>
+        )}
+
+        {/* If in agent mode and the last group is not thinking, we need a fresh AgentThinking for the stream */}
+        {isStreaming && chatMode === 'agent' && (!groupedMessages.length || groupedMessages[groupedMessages.length - 1].type !== 'thinking') && (
+          <AgentThinking 
+            messages={[]} 
+            isStreaming={true}
+            streamingContent={streamingContent}
+          />
         )}
 
         <div ref={messagesEndRef} />
@@ -491,13 +504,23 @@ export default function ChatView({
                 )}
               </button>
 
-              <button
-                onClick={handleSend}
-                disabled={!inputVal.trim() || isStreaming || status !== 'connected'}
-                className="w-8 h-8 rounded-full bg-[#5B50F0] hover:bg-[#4A40E0] text-white flex items-center justify-center transition-all shadow-sm disabled:opacity-30"
-              >
-                <Send className="w-3.5 h-3.5" />
-              </button>
+              {isStreaming ? (
+                <button
+                  onClick={onCancelGeneration}
+                  className="w-8 h-8 rounded-full bg-red-500 hover:bg-red-600 text-white flex items-center justify-center transition-all shadow-sm"
+                  title="Stop Generating"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              ) : (
+                <button
+                  onClick={handleSend}
+                  disabled={!inputVal.trim() || status !== 'connected'}
+                  className="w-8 h-8 rounded-full bg-[#5B50F0] hover:bg-[#4A40E0] text-white flex items-center justify-center transition-all shadow-sm disabled:opacity-30"
+                >
+                  <Send className="w-3.5 h-3.5" />
+                </button>
+              )}
             </div>
           </div>
         </div>

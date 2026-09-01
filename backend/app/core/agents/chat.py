@@ -104,9 +104,14 @@ class ChatAgent(BaseAgent):
         #         "tool_results": list, "token_callback": callable|None}
         self._pagination_state: Dict[str, Any] = {}
         
+        import threading
+        self.cancel_event = threading.Event()
+        
         # Instantiate sub-agents
         self.planner = PlannerAgent(llm_mgr)
         self.executor = ExecutorAgent(llm_mgr)
+        self.planner.cancel_event = self.cancel_event
+        self.executor.cancel_event = self.cancel_event
 
     async def _append_history(self, role: str, content: str):
         """Asynchronously persist a chat message to SQLite via db_executor."""
@@ -320,6 +325,9 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
             )
             full_response = ""
             for chunk in response:
+                if getattr(self, "cancel_event", None) and self.cancel_event.is_set():
+                    logger.info("JSON generation cancelled.")
+                    break
                 if "choices" in chunk and len(chunk["choices"]) > 0:
                     delta = chunk["choices"][0].get("delta", {})
                     if "content" in delta:
@@ -341,6 +349,9 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
             )
             full_response = ""
             for chunk in response:
+                if getattr(self, "cancel_event", None) and self.cancel_event.is_set():
+                    logger.info("Text generation cancelled.")
+                    break
                 if "choices" in chunk and len(chunk["choices"]) > 0:
                     delta = chunk["choices"][0].get("delta", {})
                     if "content" in delta:

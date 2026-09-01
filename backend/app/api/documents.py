@@ -8,6 +8,8 @@ from datetime import datetime
 from app.db.database import get_db
 from app.db.models import UserDocument
 from app.core.rag.processor import ingest_document
+from app.core.connection_manager import manager as ws_manager
+import anyio
 
 router = APIRouter(prefix="/api/documents", tags=["Documents"])
 
@@ -41,13 +43,26 @@ def process_upload_task(doc_id: int, file_path: str, file_type: str, filename: s
     finally:
         db.close()
 
+async def async_process_upload_task(doc_id: int, file_path: str, file_type: str, filename: str, conversation_id: str):
+    """Async wrapper to broadcast progress over WebSockets and run the heavy ML ingestion in a separate thread."""
+    await ws_manager.broadcast_json({"type": "document_progress", "content": f"Ingesting {filename} (this may take a moment)..."})
+    try:
+        # Run blocking processing in a thread pool so we don't freeze FastAPI's async event loop
+        await anyio.to_thread.run_sync(
+            process_upload_task, doc_id, file_path, file_type, filename
+        )
+        await ws_manager.broadcast_json({"type": "document_progress", "content": f"✅ {filename} is ready for chat."})
+    except Exception as e:
+        await ws_manager.broadcast_json({"type": "document_progress", "content": f"❌ Error processing {filename}."})
+
 @router.post("/upload")
 async def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     conversation_id: str = Form(...),
     db = Depends(get_db)
 ):
-    """Uploads a document and synchronously processes it for RAG ingestion."""
+    """Uploads a document and asynchronously processes it for RAG ingestion."""
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file uploaded")
         
@@ -69,17 +84,19 @@ async def upload_document(
     db.commit()
     db.refresh(doc)
     
-    logger.info(f"Received document upload: {file.filename} -> starting synchronous RAG ingestion.")
+    logger.info(f"Received document upload: {file.filename} -> starting background RAG ingestion.")
     
-    # Process synchronously on the main thread to avoid Qdrant/SQLite cross-thread errors
-    process_upload_task(
+    # Process asynchronously via BackgroundTasks to immediately return HTTP 200
+    background_tasks.add_task(
+        async_process_upload_task,
         doc_id=doc.id,
         file_path=doc.file_path,
         file_type=doc.file_type,
-        filename=doc.filename
+        filename=doc.filename,
+        conversation_id=conversation_id
     )
     
-    return {"message": "Upload successful and processed.", "document_id": doc.id}
+    return {"message": "Upload successful and processing started.", "document_id": doc.id}
 
 @router.get("")
 async def list_documents(conversation_id: str, db = Depends(get_db)):

@@ -174,6 +174,20 @@ class LLMManager:
             kwargs["n_gpu_layers"] = hw_cfg["n_gpu_layers"]
         if "n_threads" in hw_cfg:
             kwargs["n_threads"] = hw_cfg["n_threads"]
+            
+        # Context window detection and safety limits
+        if "n_ctx" not in kwargs:
+            # In llama.cpp, n_ctx=0 means "auto-detect from model metadata (llama.context_length)"
+            # This is vastly superior to the default 512.
+            # However, some modern models specify 128k+ contexts, which will OOM consumer GPUs
+            # if the KV cache is fully allocated. We cap the auto-detection to a safe 8192
+            # for agent workflows, unless the user explicitly overridden it in their hardware settings.
+            user_n_ctx = hw_cfg.get("n_ctx")
+            if user_n_ctx:
+                kwargs["n_ctx"] = user_n_ctx
+            else:
+                kwargs["n_ctx"] = 8192 # Safe default cap for agents that gives plenty of room
+
         
         if config.repo_id and config.filename:
             # Load from huggingface hub

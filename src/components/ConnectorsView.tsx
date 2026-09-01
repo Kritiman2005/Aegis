@@ -234,8 +234,8 @@ export default function ConnectorsView() {
       // Use Electron's shell.openExternal so OAuth redirects work in the system browser.
       // window.open() inside Electron creates an embedded window that cannot handle
       // localhost redirects back to the FastAPI backend correctly.
-      if (window.aegis?.openExternal) {
-        window.aegis.openExternal(def.loginUrl);
+      if ((window as any).aegis?.openExternal) {
+        (window as any).aegis.openExternal(def.loginUrl);
       } else {
         // Fallback for dev (browser) — window.open works there
         window.open(def.loginUrl, '_blank');
