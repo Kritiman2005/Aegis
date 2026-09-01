@@ -160,7 +160,7 @@ export default function ChatView({
     if (isNearBottom) {
       scrollToBottom();
     }
-  }, [messages, streamingContent, isNearBottom]);
+  }, [messages, streamingContent]);
 
   const handleSend = () => {
     if (!inputVal.trim() || isStreaming || status !== 'connected') return;

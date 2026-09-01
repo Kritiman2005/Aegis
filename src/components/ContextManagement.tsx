@@ -57,7 +57,7 @@ interface ContextConfig {
   hardware: HardwareConfig;
 }
 
-const TOTAL_CTX = 6144; // n_ctx of the loaded Qwen model
+
 
 // ── Token estimation (rough: 1 token ≈ 4 chars) ──────────────────────────────
 function estimatePlannerTokens(cfg: PlannerConfig): number {
@@ -186,6 +186,23 @@ export default function ContextManagement() {
   
   const [activeTab, setActiveTab] = useState<'A' | 'B' | 'C'>('A');
   const [unloading, setUnloading] = useState(false);
+  const [hardwareStatus, setHardwareStatus] = useState<{active_model: string, max_context: number, ram_percent: number} | null>(null);
+
+  const fetchHardware = async () => {
+    try {
+      const res = await fetch('http://127.0.0.1:8000/api/hardware/status');
+      const data = await res.json();
+      setHardwareStatus(data);
+    } catch (e) {
+      // ignore
+    }
+  };
+
+  useEffect(() => {
+    fetchHardware();
+    const interval = setInterval(fetchHardware, 10000);
+    return () => clearInterval(interval);
+  }, []);
 
   const fetchConfig = useCallback(async () => {
     try {
@@ -413,12 +430,14 @@ export default function ContextManagement() {
               <div className="flex items-center gap-2 mb-4">
                 <Zap className="w-4 h-4 text-indigo-500" />
                 <h2 className="text-sm font-bold text-gray-900">Context Window Overview</h2>
-                <span className="ml-auto text-[11px] text-gray-400 font-medium">Model: Qwen 2.5 3B · n_ctx = 6,144</span>
+                <span className="ml-auto text-[11px] text-gray-400 font-medium">
+                  Model: {hardwareStatus?.active_model !== 'None' ? hardwareStatus?.active_model : 'Not Loaded'} · n_ctx = {(hardwareStatus?.max_context || 4096).toLocaleString()}
+                </span>
               </div>
               <div className="grid grid-cols-3 gap-3">
                 {[
-                  { label: 'Chat Agent', tokens: chatTokens, color: chatTokens / TOTAL_CTX > 0.9 ? 'text-red-600' : 'text-indigo-600' },
-                  { label: 'Planner Agent', tokens: plannerTokens, color: plannerTokens / TOTAL_CTX > 0.9 ? 'text-red-600' : 'text-indigo-600' },
+                  { label: 'Chat Agent', tokens: chatTokens, color: chatTokens / (hardwareStatus?.max_context || 4096) > 0.9 ? 'text-red-600' : 'text-indigo-600' },
+                  { label: 'Planner Agent', tokens: plannerTokens, color: plannerTokens / (hardwareStatus?.max_context || 4096) > 0.9 ? 'text-red-600' : 'text-indigo-600' },
                   { label: 'Extractor Agent', tokens: extractorTokens, color: 'text-indigo-600' },
                 ].map(({ label, tokens, color }) => (
                   <div key={label} className="bg-gray-50 rounded-xl p-3 text-center border border-gray-100">
@@ -451,7 +470,7 @@ export default function ContextManagement() {
                 </div>
               </div>
               <div className="p-5 space-y-5">
-                <TokenBar used={chatTokens} total={TOTAL_CTX} />
+                <TokenBar used={chatTokens} total={hardwareStatus?.max_context || 4096} />
                 <div className="h-px bg-gray-100" />
                 <ParamSlider
                   label="Max History Messages"
@@ -507,7 +526,7 @@ export default function ContextManagement() {
                 </div>
               </div>
               <div className="p-5 space-y-5">
-                <TokenBar used={plannerTokens} total={TOTAL_CTX} />
+                <TokenBar used={plannerTokens} total={hardwareStatus?.max_context || 4096} />
                 <div className="h-px bg-gray-100" />
                 <ParamSlider
                   label="Max History Messages"
@@ -553,7 +572,7 @@ export default function ContextManagement() {
                 </div>
               </div>
               <div className="p-5 space-y-5">
-                <TokenBar used={extractorTokens} total={TOTAL_CTX} />
+                <TokenBar used={extractorTokens} total={hardwareStatus?.max_context || 4096} />
                 <div className="h-px bg-gray-100" />
                 <ParamSlider
                   label="Max Output Tokens"

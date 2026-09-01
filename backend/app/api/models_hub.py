@@ -46,7 +46,7 @@ def search_models(q: str = "", limit: int = 20):
         search_q = q if q else "gguf"
         models = hf_api.list_models(
             search=search_q,
-            tags="gguf",
+            filter="gguf",
             limit=limit,
             sort="downloads",
             direction=-1
