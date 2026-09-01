@@ -48,8 +48,7 @@ def search_models(q: str = "", limit: int = 20):
             search=search_q,
             filter="gguf",
             limit=limit,
-            sort="downloads",
-            direction=-1
+            sort="downloads"
         )
         
         results = []
