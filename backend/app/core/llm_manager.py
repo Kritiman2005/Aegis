@@ -59,12 +59,41 @@ class LLMManager:
     def get_model(self, model_name: str) -> Any:
         """Get a loaded model, loading it if necessary."""
         if model_name not in self.available_models:
+            # This manager is a long-lived singleton created at process start, so a
+            # model downloaded later in the same session won't be in the in-memory
+            # snapshot yet. Re-check SQLite before giving up — self-heals without
+            # requiring a backend restart after every download.
+            self._sync_model_from_db(model_name)
+
+        if model_name not in self.available_models:
             raise ValueError(f"Model {model_name} not found in available configurations.")
-            
+
         if model_name not in self.loaded_models:
             self._load_model(model_name)
-            
+
         return self.loaded_models[model_name]
+
+    def _sync_model_from_db(self, model_name: str) -> None:
+        """Pull a single model's config from SQLite in case it was downloaded after this process started."""
+        try:
+            from app.db.database import SessionLocal
+            from app.db.models import ModelRegistry
+            with SessionLocal() as db:
+                m = db.query(ModelRegistry).filter(
+                    ModelRegistry.name == model_name,
+                    ModelRegistry.status == "downloaded"
+                ).first()
+                if m:
+                    self.register_model(ModelConfig(
+                        name=m.name,
+                        repo_id=m.repo_id,
+                        filename=m.filename,
+                        model_path=m.file_path,
+                        chat_format=m.chat_format,
+                        kwargs={"n_ctx": m.context_length, "verbose": False}
+                    ))
+        except Exception as e:
+            logger.debug(f"Could not sync model '{model_name}' from DB: {e}")
         
     def _estimate_ram_required_gb(self, config: "ModelConfig") -> float:
         """

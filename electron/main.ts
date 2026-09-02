@@ -96,8 +96,12 @@ function spawnSidecar(): void {
       PYTHONUNBUFFERED: '1',
       AEGIS_DATA_DIR: app.getPath('userData')
     },
-    // On Windows, use shell to resolve PATH commands like 'uvicorn'
-    shell: process.platform === 'win32',
+    // On Windows dev builds, use shell to resolve PATH commands like 'uvicorn'.
+    // NEVER in prod: `command` there is already an absolute path to main.exe, and
+    // shell:true would spawn it via `cmd.exe /c "<path>"` — sidecarProcess.pid
+    // would then point at the cmd.exe wrapper, so killSidecar() only kills that
+    // wrapper and leaves main.exe (and its bound port) running as an orphan.
+    shell: IS_DEV && process.platform === 'win32',
   });
 
   sidecarProcess.stdout?.on('data', (data: Buffer) => {

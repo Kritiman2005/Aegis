@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
 from pydantic import BaseModel
 from huggingface_hub import HfApi
 import httpx
+import certifi
 
 from app.core.connection_manager import manager
 from app.db.database import get_db
@@ -18,7 +19,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/hub", tags=["Model Hub"])
 
 hf_api = HfApi()
-MODELS_DIR = Path(__file__).resolve().parent.parent.parent / "models"
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+_data_dir = os.environ.get("AEGIS_DATA_DIR")
+MODELS_DIR = Path(_data_dir) / "models" if _data_dir else BASE_DIR / "models"
 
 class DownloadRequest(BaseModel):
     repo_id: str
@@ -53,10 +56,12 @@ def search_models(q: str = "", limit: int = 20):
             "full": "False"
         }
         
-        # Disable SSL verification (verify=False) because PyInstaller on Windows 
-        # frequently fails to bundle certifi's cacert.pem correctly, leading to 
-        # [SSL: CERTIFICATE_VERIFY_FAILED] errors and silent UI failures.
-        res = httpx.get(url, params=params, timeout=15.0, verify=False)
+        # Explicitly point at certifi's bundled CA file rather than trusting
+        # Python's default SSL context — PyInstaller doesn't always locate the
+        # system cert store correctly (notably on Windows), which used to cause
+        # [SSL: CERTIFICATE_VERIFY_FAILED]. certifi.where() is bundled into the
+        # packaged app via main.spec's collect_data_files('certifi').
+        res = httpx.get(url, params=params, timeout=15.0, verify=certifi.where())
         res.raise_for_status()
         models_data = res.json()
         
@@ -119,8 +124,9 @@ async def download_file_task(repo_id: str, filename: str, file_path: Path, model
     })
 
     try:
-        # Use a generous timeout for large files and bypass SSL verify for PyInstaller
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=None), verify=False) as client:
+        # Use a generous timeout for large files; verify against certifi's bundled
+        # CA file (see search_models() above for why this isn't verify=False).
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=None), verify=certifi.where()) as client:
             async with client.stream("GET", url, follow_redirects=True) as response:
                 response.raise_for_status()
                 total_bytes = int(response.headers.get("Content-Length", 0))

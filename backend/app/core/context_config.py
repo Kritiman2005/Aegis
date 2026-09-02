@@ -39,6 +39,13 @@ DEFAULTS: Dict[str, Any] = {
         # Consumer-grade local inference cannot safely or performantly run
         # two decode passes concurrently — serialization is required everywhere.
         "llm_max_workers": 1,
+        # -1 = offload all layers to GPU (Metal/CUDA) when available. Without a
+        # default here, a fresh install has no "n_gpu_layers" key at all until the
+        # user opens and saves the Hardware settings panel once, so llm_manager
+        # never passes n_gpu_layers to Llama() and llama-cpp-python silently falls
+        # back to CPU-only inference.
+        "n_gpu_layers": -1,
+        "n_threads": 4,
     },
     "advanced": {
         # Advanced settings for Tier B

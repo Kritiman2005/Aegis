@@ -13,7 +13,9 @@ import anyio
 
 router = APIRouter(prefix="/api/documents", tags=["Documents"])
 
-UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent.parent / "uploads"
+BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
+_data_dir = os.environ.get("AEGIS_DATA_DIR")
+UPLOAD_DIR = Path(_data_dir) / "uploads" if _data_dir else BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 import logging
@@ -65,10 +67,17 @@ async def upload_document(
     """Uploads a document and asynchronously processes it for RAG ingestion."""
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file uploaded")
-        
-    ext = file.filename.split(".")[-1].lower() if "." in file.filename else "txt"
-    file_path = UPLOAD_DIR / f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{file.filename}"
-    
+
+    # Strip any directory components from the client-supplied filename before
+    # using it in a path — otherwise a name like "../../../etc/passwd" would
+    # let an upload write anywhere the backend process can reach.
+    safe_filename = os.path.basename(file.filename)
+    if not safe_filename or safe_filename in (".", ".."):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    ext = safe_filename.split(".")[-1].lower() if "." in safe_filename else "txt"
+    file_path = UPLOAD_DIR / f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{safe_filename}"
+
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
         

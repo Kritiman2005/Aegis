@@ -379,7 +379,10 @@ export default function ModelHub() {
         mapping[`${m.repo_id}/${m.filename}`] = m;
       });
       setLocalModels(mapping);
-    } catch {}
+      return mapping;
+    } catch {
+      return null;
+    }
   }, []);
 
   useEffect(() => { fetchLocalModels(); }, [fetchLocalModels]);
@@ -394,7 +397,21 @@ export default function ModelHub() {
           ...prev,
           [key]: { progress: payload.progress, downloaded_bytes: payload.downloaded_bytes, total_bytes: payload.total_bytes },
         }));
-      } else if (type === 'download_complete' || type === 'download_failed') {
+      } else if (type === 'download_complete') {
+        setProgressData(prev => { const n = { ...prev }; delete n[key]; return n; });
+        fetchLocalModels().then(mapping => {
+          const model = mapping?.[key];
+          if (!model) return;
+          // A freshly downloaded model otherwise sits unused until the user
+          // separately visits Context & Memory Hub to set it active — make
+          // "download a model, then chat" work without that extra trip.
+          fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hardware/load`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model_id: model.id }),
+          }).catch(() => {});
+        });
+      } else if (type === 'download_failed') {
         fetchLocalModels();
         setProgressData(prev => { const n = { ...prev }; delete n[key]; return n; });
       }

@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 import os
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_dynamic_libs
 
 # ── Hidden imports ────────────────────────────────────────────────────────────
 # NOTE: easyocr, torch, torchvision, torchaudio are excluded — they are lazy-
@@ -20,12 +20,29 @@ hidden_imports = (
     ['passlib.handlers.bcrypt', 'multipart']
 )
 
-datas = collect_data_files('fastembed') + collect_data_files('sentence_transformers')
+datas = (
+    collect_data_files('fastembed') +
+    collect_data_files('sentence_transformers') +
+    # certifi's cacert.pem so verify=certifi.where() in models_hub.py resolves
+    # to a real bundled CA file instead of a path that doesn't exist in the
+    # packaged app (the original cause of the Windows SSL failures this used
+    # to work around by disabling verification entirely).
+    collect_data_files('certifi')
+)
+
+# llama-cpp-python loads its actual inference engine as a compiled shared
+# library (llama.dll / libllama.dylib / libllama.so, plus ggml backends) via
+# ctypes at runtime — PyInstaller's static import-graph analysis can't see
+# that, so it must be collected explicitly or the packaged app fails the
+# moment a model is loaded (health checks still pass since they never touch
+# llama_cpp). Dev mode never shows this because the venv keeps the native
+# libs sitting right next to the .py files.
+binaries = collect_dynamic_libs('llama_cpp')
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hidden_imports,
     hookspath=[],
