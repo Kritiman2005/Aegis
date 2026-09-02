@@ -11,6 +11,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -44,6 +45,12 @@ class StdioMCPClient:
         self._process: Optional[subprocess.Popen] = None
         self._request_id: int = 0
         self._cached_tools: List[Dict] = []
+        # Serializes send+recv over this server's single stdin/stdout pipe pair.
+        # mcp_registry keeps one StdioMCPClient per server as a process-wide
+        # singleton shared by every chat session; without this lock, two sessions
+        # calling tools on the same server concurrently could interleave their
+        # writes/reads and each end up receiving the other's response.
+        self._io_lock = threading.Lock()
 
         # Populated after initialize()
         self.server_info: Dict = {}
@@ -94,25 +101,41 @@ class StdioMCPClient:
 
     def _send_recv(self, message: dict) -> dict:
         """
-        Send a JSON-RPC request over stdin and read one JSON-RPC response from stdout.
-        Raises RuntimeError on timeout or closed pipe.
+        Send a JSON-RPC request over stdin and read the matching JSON-RPC response
+        from stdout. Raises RuntimeError on timeout or closed pipe.
+
+        Holds _io_lock for the full write+read round trip so concurrent callers
+        (e.g. two chat sessions calling tools on the same MCP server) can't
+        interleave their writes or steal each other's response line.
         """
         if not self._process or not self._process.stdin:
             raise RuntimeError("MCP server is not running.")
 
+        request_id = message.get("id")
         line = json.dumps(message, ensure_ascii=False) + "\n"
-        self._process.stdin.write(line)
-        self._process.stdin.flush()
 
-        # Read one response line (blocking)
-        response_line = self._process.stdout.readline()
-        if not response_line:
-            stderr_output = self._process.stderr.read() if self._process.stderr else ""
-            raise RuntimeError(
-                f"MCP server stdout closed unexpectedly. stderr: {stderr_output[:500]}"
-            )
+        with self._io_lock:
+            self._process.stdin.write(line)
+            self._process.stdin.flush()
 
-        return json.loads(response_line.strip())
+            while True:
+                response_line = self._process.stdout.readline()
+                if not response_line:
+                    stderr_output = self._process.stderr.read() if self._process.stderr else ""
+                    raise RuntimeError(
+                        f"MCP server stdout closed unexpectedly. stderr: {stderr_output[:500]}"
+                    )
+
+                response = json.loads(response_line.strip())
+                # Defensive: with the lock held for the whole round trip this should
+                # always match on the first line, but skip anything that doesn't
+                # (e.g. a stray server-initiated notification) rather than handing
+                # a mismatched response back to the caller.
+                if request_id is None or response.get("id") == request_id:
+                    return response
+                logger.warning(
+                    f"[MCP] Discarding response id={response.get('id')!r}, expected {request_id!r}"
+                )
 
     def _send_notification(self, method: str, params: Optional[dict] = None):
         """Send a JSON-RPC notification (no id, no response expected)."""
@@ -120,8 +143,9 @@ class StdioMCPClient:
         if params:
             msg["params"] = params
         line = json.dumps(msg, ensure_ascii=False) + "\n"
-        self._process.stdin.write(line)
-        self._process.stdin.flush()
+        with self._io_lock:
+            self._process.stdin.write(line)
+            self._process.stdin.flush()
 
     # ── MCP Protocol ────────────────────────────────────────────────────────
 

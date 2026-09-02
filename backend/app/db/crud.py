@@ -274,9 +274,13 @@ def save_entity(
     Uses an UPSERT strategy based on conversation_id and (entity_id OR label).
     `data` is the full raw content (email body, file text, channel messages, etc.)
     """
+    # Scope the match to the same entity_type — otherwise two different kinds of
+    # entities that happen to share a label/id (e.g. an email thread and a Drive
+    # file both labeled "Q3 report") collide and silently overwrite each other.
     existing_entity = db.query(ConversationEntity).filter(
         ConversationEntity.conversation_id == conversation_id,
-        (ConversationEntity.entity_id == entity_id) | 
+        ConversationEntity.entity_type == entity_type,
+        (ConversationEntity.entity_id == entity_id) |
         (func.lower(func.trim(ConversationEntity.label)) == label.strip().lower())
     ).first()
 

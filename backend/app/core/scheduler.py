@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from app.db.database import SessionLocal
 from app.db.models import ScheduledJob
 from app.mcp.registry import mcp_registry
-from app.api.websocket import manager  # We will use this to send toasts
+from app.api.websocket import manager, agent_sessions  # ConnectionManager (for toasts) + live ChatAgent sessions (for busy check)
 
 logger = logging.getLogger(__name__)
 
@@ -61,10 +61,12 @@ class SchedulerDaemon:
                 return
 
             # Check Resource Contention: Is the system busy?
-            # We consider it busy if any active websocket session is NOT in IDLE state.
+            # We consider it busy if any active ChatAgent session is NOT in IDLE state.
+            # (AgentState is a plain class of string constants, not an Enum — session.state
+            # is already the string itself, e.g. "IDLE", so no ".name" lookup needed.)
             is_busy = False
-            for session in manager.sessions.values():
-                if session.state.name != "IDLE":
+            for session in agent_sessions.values():
+                if session.state != "IDLE":
                     is_busy = True
                     break
 
@@ -74,7 +76,7 @@ class SchedulerDaemon:
                     logger.warning(f"Job {job.id} skipped due to staleness (>1 hour late).")
                     job.status = "missed"
                     # Notify UI
-                    await manager.broadcast_toast(f"Scheduled job {job.id} missed due to system being busy.")
+                    await manager.broadcast_json({"type": "toast", "content": f"Scheduled job {job.id} missed due to system being busy."})
                     db.commit()
                     continue
 
@@ -89,11 +91,11 @@ class SchedulerDaemon:
                 except ValueError as ve:
                     logger.error(f"Job {job.id} failed due to schema drift: {ve}")
                     job.status = "FAILED - SCHEMA DRIFT"
-                    await manager.broadcast_toast(f"Scheduled job failed due to schema drift.")
+                    await manager.broadcast_json({"type": "toast", "content": "Scheduled job failed due to schema drift."})
                 except Exception as ex:
                     logger.error(f"Job {job.id} failed: {ex}")
                     job.status = "failed"
-                    await manager.broadcast_toast(f"Scheduled job failed: {ex}")
+                    await manager.broadcast_json({"type": "toast", "content": f"Scheduled job failed: {ex}"})
 
                 # Calculate next run
                 if job.status == "active":
@@ -125,6 +127,6 @@ class SchedulerDaemon:
                 lambda t=tool_name, a=arguments: mcp_registry.call_tool(t, a)
             )
             
-        await manager.broadcast_toast(f"Scheduled plan (Job {job.id}) completed successfully.")
+        await manager.broadcast_json({"type": "toast", "content": f"Scheduled plan (Job {job.id}) completed successfully."})
 
 scheduler_daemon = SchedulerDaemon()
