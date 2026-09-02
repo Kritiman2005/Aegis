@@ -218,6 +218,17 @@ if __name__ == "__main__":
         run_server(sys.argv[2:])
         sys.exit(0)
 
+    if len(sys.argv) > 2 and sys.argv[1] == "selftest_llama":
+        # CI-only entry point: proves the packaged binary can actually load and run
+        # a GGUF model through llama-cpp-python's compiled native library. The
+        # /api/health check alone can't catch a missing/broken native lib — it never
+        # touches llama_cpp (see main.spec's collect_dynamic_libs('llama_cpp')).
+        from llama_cpp import Llama
+        llm = Llama(model_path=sys.argv[2], n_ctx=64, n_gpu_layers=0, verbose=False)
+        llm.create_completion("Hello", max_tokens=4)
+        print("SELFTEST_LLAMA_OK")
+        sys.exit(0)
+
     uvicorn.run(
         app,
         host="127.0.0.1",   # Bind to loopback only — never expose externally

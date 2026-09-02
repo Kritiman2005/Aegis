@@ -161,6 +161,32 @@ jobs:
             exit 1
           }
 
+      # ── Smoke test: actually load a model through llama-cpp-python ────────────
+      # The health check above proves the process starts, but never touches
+      # llama_cpp — it would pass even if the native inference library (llama.dll
+      # etc, loaded via ctypes at runtime) wasn't bundled correctly by PyInstaller.
+      # This step proves a real model load + inference call works in the packaged
+      # binary, using a ~1MB public test GGUF (the same one llama.cpp's own CI uses).
+      - name: Download tiny GGUF test model
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path test_data | Out-Null
+          Invoke-WebRequest `
+            -Uri "https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllamas/stories260K.gguf" `
+            -OutFile "test_data\stories260K.gguf"
+
+      - name: Smoke Test llama_cpp Model Load
+        shell: pwsh
+        run: |
+          $env:AEGIS_DATA_DIR = "$PWD\test_data"
+          $output = & "backend\dist\main\main.exe" selftest_llama "test_data\stories260K.gguf" 2>&1 | Out-String
+          Write-Output $output
+
+          if ($LASTEXITCODE -ne 0 -or ($output -notmatch "SELFTEST_LLAMA_OK")) {
+            Write-Error "llama_cpp failed to load a model inside the packaged binary — the native library likely wasn't bundled correctly by PyInstaller."
+            exit 1
+          }
+
       # ── Build frontend + electron ─────────────────────────────────────────────
       - name: Build Next.js static export
         shell: pwsh
