@@ -4,24 +4,24 @@
 @tailwind components;
 @tailwind utilities;
 
-/* ─── Design Tokens (Aegis Clean Light System matching stitch mockup) ──── */
+/* ─── Design Tokens (Aegis — light content, dark sidebar, coral accent) ──── */
 
 :root {
-  --bg-app:          #F4F5F7;
-  --bg-sidebar:      #FFFFFF;
+  --bg-app:          #F4F4F5;
+  --bg-sidebar:      rgba(15,15,18,0.86);
   --bg-card:         #FFFFFF;
-  --border-subtle:   #E8EAED;
-  --border-strong:   #D1D5DB;
-  --text-main:       #111827;
-  --text-muted:      #6B7280;
-  --text-sub:        #9CA3AF;
-  --primary:         #5B50F0;
-  --primary-hover:   #4A40E0;
+  --border-subtle:   #E4E4E7;
+  --border-strong:   #D4D4D8;
+  --text-main:       #18181B;
+  --text-muted:      #52525B;
+  --text-sub:        #A1A1AA;
+  --primary:         #F4622D;
+  --primary-hover:   #D14A1D;
   --primary-black:   #09090B;
-  --badge-green:     #10B981;
-  --badge-green-bg:  #ECFDF5;
-  --badge-blue:      #3B82F6;
-  --badge-blue-bg:   #EFF6FF;
+  --badge-green:     #16A34A;
+  --badge-green-bg:  rgba(22,163,74,0.1);
+  --badge-blue:      #FBBF24;
+  --badge-blue-bg:   rgba(251,191,36,0.1);
 }
 
 *,
@@ -42,6 +42,49 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* ─── Glass theme ────────────────────────────────────────────────────────
+   Every screen's outermost element uses bg-aegis-base (an opaque full-
+   viewport div in page.tsx, and each standalone screen like SplashScreen) —
+   that's the layer that actually paints, so the ambient gradient lives here
+   rather than on <body>, which it would otherwise completely cover.
+   Every card uses bg-aegis-raised/bg-aegis-surface (translucent white in
+   tailwind.config.ts) — adding blur/shadow here once, rather than per
+   component, applies the frosted-glass treatment everywhere those tokens
+   are used without touching every file. */
+.bg-aegis-base {
+  background-image:
+    /* Stronger + closer to the top-left corner than the other blobs — this one
+       exists specifically to bleed warm light through the dark glass Sidebar
+       sitting on top of it (see .bg-aegis-sidebar below); the sidebar's own
+       opacity would otherwise mute a blob tuned for the light content area. */
+    radial-gradient(420px circle at 8% 15%, rgba(244,98,45,0.35), transparent 65%),
+    radial-gradient(680px circle at 12% 8%, rgba(244,98,45,0.09), transparent 60%),
+    radial-gradient(620px circle at 88% 92%, rgba(251,191,36,0.08), transparent 60%),
+    radial-gradient(500px circle at 90% 15%, rgba(244,98,45,0.05), transparent 55%);
+  background-attachment: fixed;
+}
+
+.bg-aegis-raised,
+.bg-aegis-surface {
+  backdrop-filter: blur(20px) saturate(160%);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  box-shadow: 0 8px 30px rgba(24,24,27,0.05), 0 1px 1px rgba(24,24,27,0.03);
+}
+
+/* Dark glass sidebar — translucent (see tailwind.config.ts) so the warm glow
+   from .bg-aegis-base directly behind it shows through instead of reading as
+   a flat black panel. A subtle sheen is layered directly on the panel too
+   (not just relying on blur pass-through of what's behind it), so the glass
+   quality is clearly visible rather than a barely-perceptible tint. */
+.bg-aegis-sidebar {
+  background-image:
+    radial-gradient(320px circle at 0% 0%, rgba(244,98,45,0.16), transparent 65%),
+    linear-gradient(160deg, rgba(255,255,255,0.06), transparent 40%);
+  backdrop-filter: blur(24px) saturate(150%);
+  -webkit-backdrop-filter: blur(24px) saturate(150%);
+  box-shadow: inset -1px 0 0 rgba(255,255,255,0.06);
+}
+
 /* ─── Custom Scrollbar ─────────────────────────────────────────────────── */
 
 ::-webkit-scrollbar {
@@ -54,12 +97,12 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #E5E7EB;
+  background: #D4D4D8;
   border-radius: 999px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #D1D5DB;
+  background: #A1A1AA;
 }
 
 /* ─── Utility classes ───────────────────────────────────────────────────── */
@@ -70,4 +113,20 @@ body {
 
 .card-hover-shadow:hover {
   box-shadow: 0 4px 12px -2px rgba(0, 0, 0, 0.06), 0 2px 4px -2px rgba(0, 0, 0, 0.04);
+}
+
+/* Claude-style shimmer text — a soft light band sweeping across otherwise
+   muted text, used for "Thinking…" / "Working…" labels instead of a spinner
+   or bouncing dots. No icon, just the label itself catching light. */
+.text-shimmer {
+  background-image: linear-gradient(
+    90deg,
+    var(--shimmer-base, #A1A1AA) 40%,
+    #F4622D 50%,
+    var(--shimmer-base, #A1A1AA) 60%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
 }

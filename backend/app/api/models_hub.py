@@ -23,6 +23,25 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 _data_dir = os.environ.get("AEGIS_DATA_DIR")
 MODELS_DIR = Path(_data_dir) / "models" if _data_dir else BASE_DIR / "models"
 
+
+def read_gguf_context_length(file_path: Path) -> Optional[int]:
+    """
+    Read the model's real trained context length straight from the GGUF file's
+    own metadata header (e.g. "qwen2.context_length", "llama.context_length")
+    — this only parses the header, not the multi-GB tensor data, so it's fast
+    regardless of model size. Returns None if the key can't be found/parsed,
+    so the caller can fall back to a safe default rather than crash.
+    """
+    try:
+        from gguf import GGUFReader
+        reader = GGUFReader(str(file_path))
+        for key, field in reader.fields.items():
+            if key.endswith(".context_length"):
+                return int(field.parts[field.data[0]][0])
+    except Exception as e:
+        logger.warning(f"Could not read context_length from GGUF metadata for {file_path}: {e}")
+    return None
+
 class DownloadRequest(BaseModel):
     repo_id: str
     filename: str
@@ -33,6 +52,40 @@ def get_db_session():
         yield db
     finally:
         db.close()
+
+
+@router.get("/recommendation")
+def get_recommendation(db: Session = Depends(get_db_session)):
+    """
+    Recommend one model from the curated catalog based on the machine's total
+    RAM (à la AnythingLLM's setup flow), so a new user gets a concrete
+    download/skip choice instead of an empty search box. If the recommended
+    model is already downloaded, say so instead of prompting to re-download.
+    """
+    import psutil
+    from app.core.model_catalog import recommend_model
+
+    total_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+    entry = recommend_model(total_ram_gb)
+
+    already_downloaded = db.query(ModelRegistry).filter(
+        ModelRegistry.repo_id == entry.repo_id,
+        ModelRegistry.filename == entry.filename,
+        ModelRegistry.status == "downloaded",
+    ).first() is not None
+
+    return {
+        "ram_total_gb": round(total_ram_gb, 1),
+        "model": {
+            "key": entry.key,
+            "display_name": entry.display_name,
+            "repo_id": entry.repo_id,
+            "filename": entry.filename,
+            "approx_download_gb": entry.approx_download_gb,
+            "description": entry.description,
+        },
+        "already_downloaded": already_downloaded,
+    }
 
 
 @router.get("/search")
@@ -159,6 +212,17 @@ async def download_file_task(repo_id: str, filename: str, file_path: Path, model
         if model_entry:
             model_entry.status = "downloaded"
             model_entry.file_size_bytes = downloaded_bytes
+
+            real_context_length = read_gguf_context_length(file_path)
+            if real_context_length:
+                model_entry.context_length = real_context_length
+                logger.info(f"Read real context length from GGUF metadata: {real_context_length}")
+            else:
+                logger.warning(
+                    f"Could not determine real context length for {filename} — "
+                    f"keeping the default of {model_entry.context_length}."
+                )
+
             db.commit()
         db.close()
         
@@ -252,5 +316,6 @@ def list_downloaded_models(db: Session = Depends(get_db_session)):
         "filename": m.filename,
         "status": m.status,
         "file_size_bytes": m.file_size_bytes,
-        "is_active": m.is_active
+        "is_active": m.is_active,
+        "context_length": m.context_length
     } for m in models]}

@@ -19,6 +19,8 @@ import {
   session,
   protocol,
   net,
+  Menu,
+  MenuItemConstructorOptions,
 } from 'electron';
 
 // Register the custom protocol as privileged before the app is ready
@@ -184,6 +186,55 @@ async function waitForSidecar(): Promise<boolean> {
   return false;
 }
 
+// ─── Application Menu ────────────────────────────────────────────────────────
+// Electron shows a generic "File Edit View Window Help" menu by default unless
+// the app sets its own — that boilerplate bar is what makes a custom-chrome
+// desktop app look like unbranded Electron scaffolding. Fully removing the
+// menu (Menu.setApplicationMenu(null)) is tempting but a known footgun: on
+// macOS, Cmd+C/Cmd+V/Cmd+Z etc. in text fields are wired through the menu's
+// role-based accelerators, so nulling it out silently breaks copy/paste and
+// undo. Building a minimal menu with just the standard roles keeps those
+// shortcuts working everywhere while dropping the generic View/Window/Help
+// items nobody asked for.
+function buildAppMenu(): Menu {
+  const isMac = process.platform === 'darwin';
+
+  const template: MenuItemConstructorOptions[] = [
+    ...(isMac
+      ? [{
+          label: app.name,
+          submenu: [
+            { role: 'about' as const },
+            { type: 'separator' as const },
+            { role: 'services' as const },
+            { type: 'separator' as const },
+            { role: 'hide' as const },
+            { role: 'hideOthers' as const },
+            { role: 'unhide' as const },
+            { type: 'separator' as const },
+            { role: 'quit' as const },
+          ],
+        }]
+      : []),
+    {
+      label: 'Edit',
+      submenu: [
+        { role: 'undo' as const },
+        { role: 'redo' as const },
+        { type: 'separator' as const },
+        { role: 'cut' as const },
+        { role: 'copy' as const },
+        { role: 'paste' as const },
+        ...(isMac ? [{ role: 'pasteAndMatchStyle' as const }] : []),
+        { role: 'delete' as const },
+        { role: 'selectAll' as const },
+      ],
+    },
+  ];
+
+  return Menu.buildFromTemplate(template);
+}
+
 // ─── Window Creation ─────────────────────────────────────────────────────────
 
 function createWindow(): BrowserWindow {
@@ -194,7 +245,8 @@ function createWindow(): BrowserWindow {
     minHeight: 600,
     show: false, // Hidden until content is ready (prevents flash)
     titleBarStyle: 'hiddenInset', // Native traffic lights, no default title bar
-    backgroundColor: '#080B14',   // Match Aegis dark theme to prevent white flash
+    backgroundColor: '#F4F4F5',   // Match Aegis's light theme to prevent a dark flash
+    autoHideMenuBar: true,        // Windows/Linux: no visible in-window menu bar
     webPreferences: {
       // ── Security: NEVER change these three ──────────────────────────────
       contextIsolation: true,   // Renderer runs in isolated JS context
@@ -205,6 +257,10 @@ function createWindow(): BrowserWindow {
       devTools: IS_DEV,
     },
   });
+
+  // Belt-and-suspenders alongside autoHideMenuBar above — some Linux window
+  // managers ignore that option, so hide it explicitly too.
+  win.setMenuBarVisibility(false);
 
   // Intercept navigation — prevent renderer from opening arbitrary URLs
   win.webContents.on('will-navigate', (event, url) => {
@@ -292,6 +348,7 @@ function registerIpcHandlers(): void {
 // ─── App Lifecycle ───────────────────────────────────────────────────────────
 
 app.whenReady().then(async () => {
+  Menu.setApplicationMenu(buildAppMenu());
   configureCSP();
   registerIpcHandlers();
 

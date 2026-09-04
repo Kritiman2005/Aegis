@@ -173,7 +173,17 @@ def unload_model():
     loaded = list(manager.loaded_models.keys())
     for name in loaded:
         manager.unload_model(name)
-        
+
+    # Clear is_active so /api/hardware/status stops reporting this model as
+    # active via its "nothing loaded, fall back to the DB's active row" path —
+    # otherwise ejecting looks like a no-op in the UI even though the model
+    # really was freed from RAM.
+    from app.db.database import SessionLocal
+    from app.db.models import ModelRegistry
+    with SessionLocal() as db:
+        db.query(ModelRegistry).update({ModelRegistry.is_active: False})
+        db.commit()
+
     return {"success": True, "message": f"Unloaded {len(loaded)} model(s)."}
 
 class LoadModelRequest(BaseModel):
@@ -195,16 +205,24 @@ def load_active_model(req: LoadModelRequest):
         model = db.query(ModelRegistry).filter(ModelRegistry.id == req.model_id).first()
         if not model or model.status != "downloaded":
             raise HTTPException(status_code=404, detail="Model not found or not downloaded.")
-            
+
         db.query(ModelRegistry).update({ModelRegistry.is_active: False})
         model.is_active = True
         db.commit()
-        
+        model_name = model.name
+
     manager = get_llm_manager()
     loaded = list(manager.loaded_models.keys())
     for name in loaded:
         manager.unload_model(name)
-        
+
+    # Load the newly-active model in the background right away, so the switch
+    # is already warm by the time you send a message instead of lazily loading
+    # (and stalling) on that first chat request.
+    from app.core.agents.chat import llm_executor
+    llm_executor.submit(lambda: manager.get_model(model_name))
+
+
     return {"success": True, "message": f"Set active model successfully."}
 
 @router.get("/api/hardware/status")
@@ -216,8 +234,9 @@ def get_hardware_status():
     loaded_models = list(manager.loaded_models.keys())
     
     active_model = "None"
+    active_model_display = "None"
     max_context = 4096
-    
+
     from app.db.database import SessionLocal
     from app.db.models import ModelRegistry
     with SessionLocal() as db:
@@ -227,25 +246,115 @@ def get_hardware_status():
             model_info = db.query(ModelRegistry).filter(ModelRegistry.name == active_model).first()
             if not model_info:
                 model_info = db.query(ModelRegistry).filter(ModelRegistry.repo_id == active_model).first()
-            if model_info and model_info.context_length:
-                max_context = model_info.context_length
+            if model_info:
+                active_model_display = model_info.display_name
+                if model_info.context_length:
+                    max_context = model_info.context_length
+            else:
+                active_model_display = active_model
         else:
+            # Only trust an explicit is_active flag here — silently falling back to
+            # "any downloaded model" would make the UI claim a model is active right
+            # after the user explicitly ejected it (is_active gets cleared on eject,
+            # but a leftover downloaded row would otherwise still get picked and
+            # displayed as if it were active/loaded).
             active = db.query(ModelRegistry).filter(ModelRegistry.is_active == True).first()
-            if not active:
-                active = db.query(ModelRegistry).filter(ModelRegistry.status == "downloaded").first()
             if active:
                 active_model = active.repo_id or active.name
+                active_model_display = active.display_name
                 max_context = active.context_length or 4096
-    
+
     mem = psutil.virtual_memory()
     total_gb = mem.total / (1024**3)
     used_gb = mem.used / (1024**3)
-    
+
     return {
         "active_model": active_model,
+        "active_model_display": active_model_display,
         "max_context": max_context,
         "ram_total_gb": round(total_gb, 1),
         "ram_used_gb": round(used_gb, 1),
         "ram_percent": mem.percent
     }
+
+
+# ─── Hardware detection (first-run "Your Mac is ready" screen) ────────────────
+
+def _sysctl(key: str) -> Optional[str]:
+    """macOS only — returns None (never raises) on any other platform or failure."""
+    try:
+        import subprocess
+        out = subprocess.check_output(["sysctl", "-n", key], stderr=subprocess.DEVNULL, timeout=2)
+        return out.decode().strip() or None
+    except Exception:
+        return None
+
+
+def _detect_gpu_backend(is_apple_silicon: bool) -> str:
+    """Best-effort, never fabricated: only claims a backend we can actually confirm."""
+    if is_apple_silicon:
+        return "Metal"
+    try:
+        import subprocess
+        subprocess.check_output(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], stderr=subprocess.DEVNULL, timeout=2)
+        return "CUDA"
+    except Exception:
+        return "CPU"
+
+
+@router.get("/api/hardware/detect")
+def detect_hardware():
+    """
+    Real, honestly-detected machine capabilities for the one-time "Your Mac
+    is ready" welcome screen — no fabricated specs. Apple Silicon gets the
+    full breakdown (chip name, performance/efficiency core split) since
+    sysctl exposes it directly; other platforms get an honest subset.
+    """
+    import os
+    import platform as _platform
+    import psutil
+
+    system = _platform.system()
+    is_apple_silicon = system == "Darwin" and _platform.machine() == "arm64"
+
+    chip_name = _sysctl("machdep.cpu.brand_string") if system == "Darwin" else None
+    perf_raw = _sysctl("hw.perflevel0.logicalcpu") if is_apple_silicon else None
+    eff_raw = _sysctl("hw.perflevel1.logicalcpu") if is_apple_silicon else None
+
+    hw_cfg = cfg_store.load().get("hardware", {})
+
+    return {
+        "platform": system,
+        "is_apple_silicon": is_apple_silicon,
+        "chip_name": chip_name,
+        "total_cores": os.cpu_count() or 0,
+        "performance_cores": int(perf_raw) if perf_raw and perf_raw.isdigit() else None,
+        "efficiency_cores": int(eff_raw) if eff_raw and eff_raw.isdigit() else None,
+        "gpu_backend": _detect_gpu_backend(is_apple_silicon),
+        "ram_total_gb": round(psutil.virtual_memory().total / (1024 ** 3), 1),
+        "gpu_offload_layers": hw_cfg.get("n_gpu_layers", -1),
+    }
+
+
+# ─── One-time onboarding state ─────────────────────────────────────────────────
+
+@router.get("/api/onboarding/status")
+def get_onboarding_status():
+    from app.db.models import OnboardingState
+    with SessionLocal() as db:
+        row = db.query(OnboardingState).filter(OnboardingState.id == 1).first()
+        return {"welcome_seen": bool(row.welcome_seen) if row else False}
+
+
+@router.post("/api/onboarding/welcome-seen")
+def mark_welcome_seen():
+    from app.db.models import OnboardingState
+    with SessionLocal() as db:
+        row = db.query(OnboardingState).filter(OnboardingState.id == 1).first()
+        if row:
+            row.welcome_seen = True
+        else:
+            db.add(OnboardingState(id=1, welcome_seen=True))
+        db.commit()
+    return {"status": "ok"}
 

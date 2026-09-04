@@ -237,24 +237,46 @@ def get_active_google_credentials(db: Session, service_name: str) -> Optional[Cr
 
 # ─── Model Registry Persistence ─────────────────────────────────────────────
 
-def seed_default_model(db: Session, model_path: str):
-    """Ensures default local Qwen 2.5 3B model is registered in the models table."""
-    existing = db.query(ModelRegistry).filter(ModelRegistry.name == "gemma-local").first()
-    if not existing:
-        model = ModelRegistry(
-            name="gemma-local",
-            display_name="Qwen 2.5 3B Instruct (Local GGUF)",
-            repo_id="Qwen/Qwen2.5-3B-Instruct-GGUF",
-            filename="qwen2.5-3b-instruct-q4_k_m.gguf",
-            file_path=model_path,
-            status="downloaded",
-            chat_format="chatml",
-            context_length=4096,
-            is_active=True
-        )
-        db.add(model)
+def reconcile_model_registry(db: Session) -> int:
+    """
+    Delete any ModelRegistry row claiming status='downloaded' whose file no
+    longer exists on disk. Run once at startup so a stale/orphaned row (e.g.
+    from a removed model file, or manual disk cleanup) can never make the UI
+    report a model as downloaded/active when it isn't really there. Returns
+    the number of rows removed.
+    """
+    import os
+    orphans = [
+        m for m in db.query(ModelRegistry).filter(ModelRegistry.status == "downloaded").all()
+        if not m.file_path or not os.path.exists(m.file_path)
+    ]
+    for m in orphans:
+        logger.warning(f"Removing orphaned model registry row '{m.name}' — file not found at {m.file_path}")
+        db.delete(m)
+    if orphans:
         db.commit()
-        logger.info("Registered default Qwen model in SQLite models table.")
+    return len(orphans)
+
+
+def reconcile_stuck_documents(db: Session) -> int:
+    """
+    Mark any UserDocument still 'processing' as failed at startup. Ingestion
+    runs as a background task inside the backend process — if the process
+    gets killed or restarted mid-ingestion (an app restart, a crash), that
+    row is orphaned permanently: no process will ever resume it, so its
+    attachment chip in the chat would show a spinner forever with nothing
+    coming (confirmed against two real rows stuck this way after a restart
+    during testing). Returns the number of rows fixed.
+    """
+    from app.db.models import UserDocument
+    stuck = db.query(UserDocument).filter(UserDocument.status == "processing").all()
+    for d in stuck:
+        d.status = "failed"
+        d.error_message = "Processing was interrupted (app restarted) — please re-upload."
+        logger.warning(f"Marking orphaned in-progress document '{d.filename}' (id={d.id}) as failed.")
+    if stuck:
+        db.commit()
+    return len(stuck)
 
 
 # ─── Conversation Entity Memory ──────────────────────────────────────────────
@@ -376,12 +398,22 @@ def update_entity(db: Session, entity_id: int, label: str = None, data_json: str
 
 from app.db.models import ChatMessage
 
-def add_chat_message(db: Session, conversation_id: str, role: str, content: str) -> ChatMessage:
-    """Adds a new message to the persistent chat history."""
+def add_chat_message(
+    db: Session, conversation_id: str, role: str, content: str,
+    attachments: Optional[list] = None, msg_type: Optional[str] = None,
+) -> ChatMessage:
+    """Adds a new message to the persistent chat history. `attachments` is an
+    optional list of {document_id, filename, file_type} dicts — set when this
+    message represents an uploaded document, so it renders as an attachment
+    chip in the transcript (see get_chat_history_with_attachments). `msg_type`
+    of 'tool_call' marks internal-only entries that should replay into the
+    collapsed "Agent is working" card instead of a normal chat bubble."""
     msg = ChatMessage(
         conversation_id=conversation_id,
         role=role,
-        content=content
+        content=content,
+        attachments_json=json.dumps(attachments) if attachments else None,
+        msg_type=msg_type,
     )
     db.add(msg)
     db.commit()
@@ -389,16 +421,46 @@ def add_chat_message(db: Session, conversation_id: str, role: str, content: str)
     return msg
 
 def get_chat_history(db: Session, conversation_id: str) -> List[dict]:
-    """Retrieves all chat messages for a given session, ordered by time."""
+    """Retrieves all chat messages for a given session, ordered by time.
+
+    Returns ONLY role+content — this feeds directly into the LLM's messages
+    list (create_chat_completion), so it deliberately excludes attachments:
+    an extra key there risks breaking the chat-completion message schema.
+    For the frontend's own history payload, use
+    get_chat_history_with_attachments instead.
+    """
     messages = (
         db.query(ChatMessage)
         .filter(ChatMessage.conversation_id == conversation_id)
         .order_by(ChatMessage.created_at.asc())
         .all()
     )
-    
+
     # Return as standard dict array for LLM injection
     return [{"role": m.role, "content": m.content} for m in messages]
+
+def get_chat_history_with_attachments(db: Session, conversation_id: str) -> List[dict]:
+    """Like get_chat_history but includes each message's attachments (if
+    any) — for the frontend's own history payload only. Never pass this to
+    the LLM's messages list."""
+    messages = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.conversation_id == conversation_id)
+        .order_by(ChatMessage.created_at.asc())
+        .all()
+    )
+    result = []
+    for m in messages:
+        entry: dict = {"role": m.role, "content": m.content}
+        if m.attachments_json:
+            try:
+                entry["attachments"] = json.loads(m.attachments_json)
+            except Exception:
+                pass
+        if m.msg_type:
+            entry["msg_type"] = m.msg_type
+        result.append(entry)
+    return result
 
 def get_all_sessions(db: Session) -> List[dict]:
     """Retrieves all distinct chat sessions, with the first user message as a preview."""
@@ -513,3 +575,128 @@ def log_setting_change(db: Session, setting_path: str, old_value: str, new_value
 def get_all_connected_servers(db: Session) -> List[MCPServer]:
     """Returns all servers marked as connected in the DB."""
     return db.query(MCPServer).filter(MCPServer.status == "connected").all()
+
+
+# ─── Token Usage / Analytics ─────────────────────────────────────────────────
+
+from app.db.models import TokenUsage
+from datetime import datetime as _datetime, timedelta as _timedelta
+
+def get_active_model_display_name(db: Session) -> str:
+    """
+    Resolve the currently active model's display name for usage logging.
+    Mirrors the fallback logic in agents/base.py's get_llm(): prefer the
+    explicitly active model, else the first downloaded one.
+    """
+    active = db.query(ModelRegistry).filter(
+        ModelRegistry.status == "downloaded",
+        ModelRegistry.is_active == True
+    ).first()
+    if not active:
+        active = db.query(ModelRegistry).filter(ModelRegistry.status == "downloaded").first()
+    return active.display_name if active else "unknown"
+
+
+def log_token_usage(
+    db: Session,
+    conversation_id: Optional[str],
+    model_name: str,
+    source: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+) -> None:
+    """Record one LLM call's real token counts (source: 'chat' or 'agent')."""
+    db.add(TokenUsage(
+        conversation_id=conversation_id,
+        model_name=model_name,
+        source=source,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    ))
+    db.commit()
+
+
+def get_analytics_summary(db: Session) -> dict:
+    """Aggregate totals for the Analytics page's headline stat cards."""
+    row = db.query(
+        func.coalesce(func.sum(TokenUsage.prompt_tokens), 0),
+        func.coalesce(func.sum(TokenUsage.completion_tokens), 0),
+    ).first()
+    prompt_total, completion_total = row[0], row[1]
+    return {
+        "tokens_generated": completion_total,
+        "prompt_tokens_processed": prompt_total,
+        "total_tokens": prompt_total + completion_total,
+    }
+
+
+def get_token_usage_daily(db: Session, days: int = 7) -> List[dict]:
+    """Tokens generated per calendar day for the last N days, oldest first."""
+    since = _datetime.utcnow() - _timedelta(days=days - 1)
+    day_expr = func.date(TokenUsage.created_at)
+    rows = (
+        db.query(day_expr.label("day"), func.sum(TokenUsage.prompt_tokens + TokenUsage.completion_tokens))
+        .filter(TokenUsage.created_at >= since)
+        .group_by(day_expr)
+        .order_by(day_expr)
+        .all()
+    )
+    by_day = {r[0]: r[1] for r in rows}
+    result = []
+    for i in range(days):
+        d = (since + _timedelta(days=i)).date()
+        key = d.isoformat()
+        result.append({"date": key, "tokens": by_day.get(key, 0)})
+    return result
+
+
+def get_token_usage_by_model(db: Session) -> List[dict]:
+    """Total tokens (prompt + completion) grouped by model, most-used first."""
+    rows = (
+        db.query(TokenUsage.model_name, func.sum(TokenUsage.prompt_tokens + TokenUsage.completion_tokens))
+        .group_by(TokenUsage.model_name)
+        .order_by(func.sum(TokenUsage.prompt_tokens + TokenUsage.completion_tokens).desc())
+        .all()
+    )
+    return [{"model": r[0], "tokens": r[1]} for r in rows]
+
+
+def get_token_usage_by_source(db: Session) -> List[dict]:
+    """Total tokens (prompt + completion) grouped by source ('chat' / 'agent')."""
+    rows = (
+        db.query(TokenUsage.source, func.sum(TokenUsage.prompt_tokens + TokenUsage.completion_tokens))
+        .group_by(TokenUsage.source)
+        .all()
+    )
+    return [{"source": r[0], "tokens": r[1]} for r in rows]
+
+
+# ── Per-conversation Tool/Skill activation ──────────────────────────────────
+from app.db.models import ConversationDisabledCapability
+
+
+def is_capability_active(db: Session, conversation_id: str, capability_type: str, capability_id: str) -> bool:
+    """Active unless explicitly turned off for this conversation — see
+    ConversationDisabledCapability's docstring for why absence means active."""
+    row = db.query(ConversationDisabledCapability).filter(
+        ConversationDisabledCapability.conversation_id == conversation_id,
+        ConversationDisabledCapability.capability_type == capability_type,
+        ConversationDisabledCapability.capability_id == capability_id,
+    ).first()
+    return row is None
+
+
+def set_capability_active(db: Session, conversation_id: str, capability_type: str, capability_id: str, active: bool) -> None:
+    row = db.query(ConversationDisabledCapability).filter(
+        ConversationDisabledCapability.conversation_id == conversation_id,
+        ConversationDisabledCapability.capability_type == capability_type,
+        ConversationDisabledCapability.capability_id == capability_id,
+    ).first()
+    if active and row:
+        db.delete(row)
+        db.commit()
+    elif not active and not row:
+        db.add(ConversationDisabledCapability(
+            conversation_id=conversation_id, capability_type=capability_type, capability_id=capability_id,
+        ))
+        db.commit()

@@ -1,11 +1,65 @@
 import json
 import logging
 import re
-from typing import List, Dict
+from typing import List, Dict, Optional
 from .base import BaseAgent
 from app.prompts import build_planner_prompt
 
 logger = logging.getLogger(__name__)
+
+
+def _build_plan_grammar(tool_names: List[str]):
+    """
+    Grammar-constrains the plan JSON so every step's "tool" field can ONLY be
+    a name from `tool_names` — the exact set the model was actually offered
+    this turn. This makes inventing a tool name structurally impossible
+    (the sampler simply cannot produce those tokens), rather than catching it
+    after the fact with a validation-error message once the plan is already
+    generated. "plan": [] + "direct_response" stays a fully legal shape, so
+    the model always has a real way to say "I don't have a tool for this"
+    instead of being forced to pick something from the enum just to satisfy
+    the schema.
+
+    Returns None if there are no tools to constrain against (grammar with an
+    empty enum is unsatisfiable) or if grammar compilation fails for any
+    reason — callers fall back to plain JSON-object mode in that case.
+    """
+    if not tool_names:
+        return None
+    try:
+        from llama_cpp import LlamaGrammar
+    except ImportError:
+        return None
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "direct_response": {"type": "string"},
+            "clarifying_question": {"type": "string"},
+            "warnings": {"type": "array", "items": {"type": "string"}},
+            "plan": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "step_id": {"type": "string"},
+                        "tool": {"type": "string", "enum": list(tool_names)},
+                        "reason": {"type": "string"},
+                        "arguments": {"type": "object"},
+                        "depends_on": {"type": "array", "items": {"type": "string"}},
+                        "foreach": {"type": ["string", "null"]},
+                        "fetch_scope": {"type": "string", "enum": ["single", "sample", "exhaustive"]},
+                    },
+                    "required": ["step_id", "tool", "arguments"],
+                },
+            },
+        },
+    }
+    try:
+        return LlamaGrammar.from_json_schema(json.dumps(schema))
+    except Exception as e:
+        logger.warning(f"[PlannerAgent] Grammar compile failed, falling back to json_object mode: {e}")
+        return None
 
 # Tool name prefixes that are clearly read-only list/search operations.
 # These are safe to force to exhaustive when counting intent is detected.
@@ -54,6 +108,7 @@ class PlannerAgent(BaseAgent):
         chat_history: List[Dict],
         token_callback=None,
         is_counting: bool = False,
+        tool_names: Optional[List[str]] = None,
     ) -> str:
         llm = self.get_llm()
         if not llm:
@@ -77,14 +132,18 @@ class PlannerAgent(BaseAgent):
         messages.extend(chat_history)
         messages.append({"role": "user", "content": augmented_message})
 
-        try:
-            response = llm.create_chat_completion(
-                messages=messages,
-                response_format={"type": "json_object"},
-                temperature=0.1,
-                stream=True,
-                max_tokens=1024,
-            )
+        grammar = _build_plan_grammar(tool_names or [])
+        base_kwargs = dict(messages=messages, temperature=0.1, stream=True, max_tokens=1024)
+
+        def _run_completion(use_grammar: bool):
+            kwargs = dict(base_kwargs)
+            if use_grammar and grammar is not None:
+                kwargs["grammar"] = grammar
+            else:
+                # No tool set to constrain against, grammar compile failed, or
+                # this is the plain-JSON-mode fallback retry.
+                kwargs["response_format"] = {"type": "json_object"}
+            response = llm.create_chat_completion(**kwargs)
             full_response = ""
             print("\n--- PLANNER OUTPUT STREAM ---")
             for chunk in response:
@@ -97,6 +156,19 @@ class PlannerAgent(BaseAgent):
                         if token_callback:
                             token_callback(token)
             print("\n-----------------------------\n")
+            return full_response
+
+        try:
+            try:
+                full_response = _run_completion(use_grammar=True)
+            except Exception as e:
+                if grammar is not None:
+                    logger.warning(f"[PlannerAgent] Grammar-constrained generation failed, retrying without it: {e}")
+                    full_response = _run_completion(use_grammar=False)
+                else:
+                    raise
+
+            self._log_token_usage(llm, messages, full_response, "agent")
 
             # Second safety net: override scope on list tools if counting intent
             if is_counting:

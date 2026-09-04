@@ -38,3 +38,28 @@ class BaseAgent:
             logger.error(f"Failed to load LLM '{model_name}': {e}")
             return None
 
+    def _log_token_usage(self, llm, messages, response_text: str, source: str, conversation_id: str = None):
+        """
+        Record real token counts for one LLM call, using the active model's own
+        tokenizer (not an estimate) — feeds the Analytics page. Shared by
+        ChatAgent, PlannerAgent, and ExecutorAgent so every create_chat_completion
+        call site logs consistently.
+        """
+        try:
+            prompt_text = "\n".join(
+                m.get("content", "") for m in messages if isinstance(m.get("content"), str)
+            )
+            prompt_tokens = len(llm.tokenize(prompt_text.encode("utf-8", errors="ignore")))
+            completion_tokens = len(llm.tokenize(response_text.encode("utf-8", errors="ignore"))) if response_text else 0
+
+            from app.db.database import SessionLocal
+            from app.db.crud import log_token_usage, get_active_model_display_name
+            db = SessionLocal()
+            try:
+                model_name = get_active_model_display_name(db)
+                log_token_usage(db, conversation_id, model_name, source, prompt_tokens, completion_tokens)
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning(f"Failed to log token usage: {e}")
+

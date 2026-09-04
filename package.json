@@ -11,7 +11,7 @@
     "dev": "concurrently -n \"NEXT,BACKEND\" -c \"cyan,green\" \"npm run dev:next\" \"npm run dev:backend\"",
     "build:next": "next build",
     "build:electron": "tsc -p electron/tsconfig.json",
-    "build:python": "cd backend && pyinstaller main.spec",
+    "build:python": "cd backend && python scripts/download_whisper_model.py && pyinstaller main.spec",
     "build": "next build && tsc -p electron/tsconfig.json && npm run build:python && electron-builder",
     "package:mac": "npm run build && electron-builder --mac",
     "package:win": "npm run build && electron-builder --win",

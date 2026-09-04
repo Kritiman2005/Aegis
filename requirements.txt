@@ -4,6 +4,13 @@
 # Core framework
 fastapi>=0.111.0
 uvicorn[standard]>=0.30.1
+# Starlette 1.x returns 404 on the app's @router.websocket("/ws") route (verified
+# directly: fastapi 0.141.1 + starlette 1.6.0 rejects the handshake with 404;
+# the same fastapi version + starlette 0.52.1 correctly returns 101 Switching
+# Protocols). Since chat, download progress, and document ingestion status all
+# depend on that one route, an unpinned install silently breaks the entire app.
+# Capped below 1.0 until the route is confirmed working against Starlette 1.x.
+starlette>=0.40.0,<1.0
 
 # WebSocket support
 websockets>=12.0
@@ -23,6 +30,10 @@ anyio>=4.5.0
 llama-cpp-python>=0.2.79
 huggingface-hub>=0.23.0
 mcp>=0.1.0
+# Reads a downloaded GGUF file's real metadata (context length, architecture)
+# without loading the model — lets us store the model's true max context
+# instead of a hardcoded guess.
+gguf>=0.10.0
 
 # Google OAuth & APIs
 google-auth-oauthlib>=1.2.0
@@ -41,3 +52,39 @@ easyocr>=1.7.1
 qdrant-client>=1.7.0
 fastembed>=0.2.0
 sentence-transformers>=2.3.00
+
+# Word/Excel read + write — python-docx and openpyxl back document upload's
+# .docx/.xlsx text extraction (app/core/rag/processor.py); python-docx,
+# xlsxwriter, and markdown-it-py back the export_document tool + manual
+# Export menu's PDF/DOCX/XLSX conversion (app/core/exporter.py). All four
+# were previously missing from this file (present only by accident in an
+# existing dev venv, or — python-docx — declared only in
+# backend/requirements.txt, which a plain `pip install -r requirements.txt`
+# from repo root never installs) — same class of gap faster-whisper had.
+python-docx>=1.1.0
+openpyxl>=3.1.0
+xlsxwriter>=3.2.0
+markdown-it-py>=3.0.0
+
+# Web Scraping — Playwright drives a real headless Chromium so JS-rendered
+# pages actually render before extraction (a plain HTTP fetch can't). The
+# browser binary itself is NOT bundled (see app/core/scraper.py) — it
+# downloads on first use into AEGIS_DATA_DIR, same as GGUF models.
+playwright>=1.47,<2.0
+trafilatura>=1.12,<2.0
+
+# Refresh-token storage — wraps the OS credential store (macOS Keychain /
+# Windows Credential Manager / Linux Secret Service) so it isn't sitting in
+# plaintext in aegis.db. See app/auth/token_store.py; falls back to plain
+# SQLite storage if the OS backend is ever unavailable.
+keyring>=25.0,<26.0
+# keyring's Windows Credential Manager backend needs this; only installed
+# on Windows — keyring itself catches the ImportError gracefully on other
+# platforms and just marks that backend unavailable (confirmed by reading
+# keyring/backends/Windows.py's own import-guard).
+pywin32-ctypes>=0.2.2; sys_platform == "win32"
+
+# Voice input (chat composer mic button) — local speech-to-text, audio never
+# leaves the machine. Model itself downloads on first explicit use into
+# AEGIS_DATA_DIR, same convention as GGUF models. See app/core/transcription.py.
+faster-whisper>=1.0,<2.0

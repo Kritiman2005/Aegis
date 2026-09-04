@@ -190,6 +190,10 @@ class MCPServerRegistry:
                     all_tools.append(t_copy)
         return all_tools
 
+    def get_server_for_tool(self, tool_name: str) -> Optional[str]:
+        """Which connected server (== its catalog key) provides this tool, if any."""
+        return self._tool_to_server.get(tool_name)
+
     def call_tool(self, tool_name: str, arguments: dict) -> str:
         """Routes a tool call to the server providing it."""
         server_name = self._tool_to_server.get(tool_name)

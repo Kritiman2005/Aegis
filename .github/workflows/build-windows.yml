@@ -95,6 +95,13 @@ jobs:
           Write-Output "=== credentials.py written ==="
           Get-Content $file
 
+      # ── Bundle the Whisper model into the app itself (see
+      # app/core/transcription.py) — main.spec's Analysis step fails loudly
+      # if this hasn't run, so it must happen before pyinstaller.
+      - name: Download bundled Whisper model
+        working-directory: backend
+        run: python scripts/download_whisper_model.py
+
       # ── Build Python sidecar — run from backend/ where main.spec lives ────────
       - name: Build Python Sidecar (.exe)
         shell: pwsh

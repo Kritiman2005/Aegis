@@ -134,7 +134,51 @@ class ChatMessage(Base):
     conversation_id = Column(String, index=True, nullable=False)
     role = Column(String, nullable=False)                         # 'user', 'assistant', 'system'
     content = Column(Text, nullable=False)
+    # JSON array of {document_id, filename, file_type} — set when this message
+    # represents (or includes) an uploaded document, so it renders as an
+    # attachment chip in the transcript instead of living only in the
+    # separate Files page. Null/empty for ordinary text messages.
+    attachments_json = Column(Text, nullable=True)
+    # 'tool_call' marks internal-only entries (e.g. execution-result summaries
+    # kept for LLM memory) that should replay into the collapsed "Agent is
+    # working" card on reload instead of a normal top-level chat bubble.
+    # Null for ordinary user-visible messages.
+    msg_type = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class TokenUsage(Base):
+    """
+    One row per LLM call, recording real token counts (via the model's own
+    tokenizer, not an estimate) for the Analytics page.
+    """
+    __tablename__ = "token_usage"
+
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(String, index=True, nullable=True)
+    model_name = Column(String, nullable=False)
+    source = Column(String, nullable=False)  # 'chat' or 'agent'
+    prompt_tokens = Column(Integer, nullable=False, default=0)
+    completion_tokens = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+class ConversationDisabledCapability(Base):
+    """
+    Per-conversation OFF-toggles for installed tools/skills — the '+' menu's
+    Tools/Skills switches (Claude Desktop-style: installed once globally via
+    the Marketplace, then turned on/off per chat).
+
+    Absence of a row means active (the default once installed) — only
+    explicit "turned it off in this chat" state gets a row, so a newly
+    installed capability is immediately usable everywhere without needing a
+    row inserted for every conversation up front.
+    """
+    __tablename__ = "conversation_disabled_capabilities"
+
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(String, index=True, nullable=False)
+    capability_type = Column(String, nullable=False)  # 'tool' | 'skill'
+    capability_id = Column(String, nullable=False)
+
 
 class SystemSettings(Base):
     """
@@ -160,3 +204,42 @@ class SettingsHistory(Base):
     old_value = Column(String, nullable=True)
     new_value = Column(String, nullable=True)
     changed_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AegisAccount(Base):
+    """
+    The signed-in Aegis cloud account (Supabase-backed) — deliberately
+    separate from the legacy `User` table above, which is really "Google
+    OAuth credentials for the connector system," not an app-account concept.
+    Single-row, same convention as SystemSettings: this is a single-user
+    desktop app, so there is at most one signed-in account at a time.
+    Only the long-lived refresh_token is persisted — the short-lived access
+    token is kept in memory and re-derived on demand (see account_auth.py).
+    refresh_token itself normally holds token_store.KEYCHAIN_SENTINEL, not
+    the real value — that lives in the OS keychain (macOS Keychain / Windows
+    Credential Manager / Linux Secret Service) instead, so a plaintext copy
+    of a live bearer credential isn't sitting in this SQLite file. Falls
+    back to storing the real value directly here only if the OS keychain is
+    ever unavailable — see app/auth/token_store.py.
+    """
+    __tablename__ = "aegis_account"
+
+    id = Column(Integer, primary_key=True, default=1)
+    supabase_user_id = Column(String, nullable=False)
+    email = Column(String, nullable=False)
+    refresh_token = Column(Text, nullable=False)
+    cached_plan = Column(String, default="free")
+    plan_synced_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class OnboardingState(Base):
+    """
+    Single-row table (same convention as SystemSettings/AegisAccount) tracking
+    one-time onboarding moments — right now just the "Your Mac is ready"
+    hardware-detection welcome screen, shown once ever, not once per launch.
+    """
+    __tablename__ = "onboarding_state"
+
+    id = Column(Integer, primary_key=True, default=1)
+    welcome_seen = Column(Boolean, default=False)

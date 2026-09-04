@@ -25,16 +25,27 @@ agent_sessions: Dict[str, ChatAgent] = {}
 
 import time
 async def watch_timeouts():
-    """Background task to cancel pending states that sit idle for > 5 minutes."""
+    """
+    Background task to cancel pending states that sit idle for > 5 minutes.
+    Covers every state that blocks the dispatcher on a specific reply —
+    WAITING_TOOL_INPUT and WAITING_LOOP_CONTINUATION included, since missing
+    either here means a user who abandons a cookie prompt or a "continue
+    fetching?" prompt leaves that session stuck forever: every future
+    message, even an unrelated new request, keeps getting swallowed into
+    that stale handler with no way out.
+    """
     while True:
         await asyncio.sleep(10)
         now = time.time()
         for cid, session in list(agent_sessions.items()):
-            if session.state in [AgentState.WAITING_CONFIRMATION, AgentState.WAITING_MEMORY_CONFIRMATION]:
+            if session.state in [
+                AgentState.WAITING_CONFIRMATION, AgentState.WAITING_TOOL_INPUT, AgentState.WAITING_LOOP_CONTINUATION,
+            ]:
                 if now - session.state_entered_at > 300: # 5 minutes
                     session.state = AgentState.IDLE
                     session.plan = None
-                    session._pending_entities = []
+                    session._tool_input_state = None
+                    session._pagination_state = {}
                     try:
                         await manager.send_json(cid, {
                             "type": "toast",
@@ -72,13 +83,33 @@ async def websocket_endpoint(
             return
 
         # Load history from DB in a thread so we don't block the event loop,
-        # then push it to the client as a dedicated "history" event.
+        # then push it to the client as a dedicated "history" event. Uses the
+        # attachments-including variant (not session._get_history(), which
+        # feeds the LLM and deliberately omits them) so uploaded documents
+        # render as attachment chips when a conversation reloads.
         try:
-            full_history = await session._get_history()
+            def _load_history_with_attachments():
+                from app.db.database import SessionLocal
+                from app.db.crud import get_chat_history_with_attachments
+                db = SessionLocal()
+                try:
+                    return get_chat_history_with_attachments(db, connection_id)
+                finally:
+                    db.close()
+
+            full_history = await anyio.to_thread.run_sync(_load_history_with_attachments)
             if full_history:
                 await websocket.send_json({
                     "type": "history",
                     "history": full_history,
+                    # Lets the frontend restore Agent Mode (and re-enable the
+                    # plan-confirmation buttons) when reopening a conversation
+                    # that has a paused Agent Mode task — chatMode is otherwise
+                    # a UI-local toggle with no memory of which mode a given
+                    # conversation was actually in. Any state other than IDLE
+                    # only ever happens in Agent Mode (Chat Mode never calls
+                    # tools), so it's an unambiguous signal.
+                    "agent_state": session.state,
                 })
         except Exception as e:
             logger.warning(f"Failed to load/send history for {connection_id}: {e}")
@@ -110,6 +141,7 @@ async def websocket_endpoint(
             msg_type = payload.get("type", "message")
             content = payload.get("content", "")
             mode = payload.get("mode", "chat")
+            attachments = payload.get("attachments") or None
 
             if msg_type == "ping":
                 await manager.send_json(connection_id, {"type": "pong"})
@@ -119,11 +151,25 @@ async def websocket_endpoint(
                 logger.info(f"[WS:{connection_id[:8]}] Cancel signal received.")
                 if hasattr(session, "cancel_event"):
                     session.cancel_event.set()
+                # Unstick the UI immediately rather than waiting for the
+                # in-flight task to notice. It often can't notice in time:
+                # llama.cpp's prefill (producing the very first token) is one
+                # uninterruptible blocking C call, so a turn stuck in
+                # "Thinking…" — no tokens sent yet — has nowhere for
+                # cancel_event to even be checked until that call returns on
+                # its own. When it eventually does, the generation id check
+                # in process_message_task below recognizes it's stale and
+                # discards it instead of sending it to the client.
+                if getattr(session, "is_processing", False):
+                    session.is_processing = False
+                    await manager.send_json(connection_id, {"type": "done", "content": ""})
                 continue
 
             # ── Handle User Message (Agent Workflow) ─────────────────────────
-            if msg_type == "message" and content.strip():
-                logger.info(f"[WS:{connection_id[:8]}] User: {content[:80]!r}")
+            # Allow attachment-only sends (no typed text) — Claude-style: a
+            # user can just attach a file and hit send with nothing typed.
+            if msg_type == "message" and (content.strip() or attachments):
+                logger.info(f"[WS:{connection_id[:8]}] User: {content[:80]!r} attachments={len(attachments) if attachments else 0}")
 
                 if getattr(session, 'is_processing', False):
                     await manager.send_json(connection_id, {
@@ -132,10 +178,31 @@ async def websocket_endpoint(
                     })
                     continue
 
-                async def process_message_task(msg_content: str, msg_mode: str):
-                    session.is_processing = True
-                    if hasattr(session, "cancel_event"):
-                        session.cancel_event.clear()
+                # Claimed synchronously, right here in the receive loop — NOT
+                # inside process_message_task below. asyncio.create_task()
+                # only schedules that coroutine to start on a future event
+                # loop tick, so if these were set at the top of the task body
+                # instead, a "cancel" sent immediately after "message" could
+                # reach this same receive loop and be processed first,
+                # finding is_processing still False and doing nothing — then
+                # the task starts a moment later and clobbers cancel_event
+                # right back to unset, silently swallowing the cancel.
+                # Claiming the turn here, before create_task even runs,
+                # closes that window.
+                session.is_processing = True
+                session.generation_id += 1
+                my_generation_id = session.generation_id
+                if hasattr(session, "cancel_event"):
+                    session.cancel_event.clear()
+
+                async def process_message_task(msg_content: str, msg_mode: str, msg_attachments=attachments):
+                    def superseded() -> bool:
+                        # True once a cancel (or a newer message) has moved
+                        # the session on from this task — its eventual
+                        # result, whenever the blocked call underneath it
+                        # returns, should be discarded rather than sent.
+                        return session.generation_id != my_generation_id
+
                     try:
                         streamed = False
                         loop = asyncio.get_running_loop()
@@ -143,6 +210,8 @@ async def websocket_endpoint(
 
                         def send_token_sync(token: str):
                             nonlocal streamed
+                            if superseded():
+                                return
                             streamed = True
                             loop.call_soon_threadsafe(token_queue.put_nowait, token)
 
@@ -159,23 +228,43 @@ async def websocket_endpoint(
                         sender_task = asyncio.create_task(token_sender_loop())
 
                         async def send_status(msg: str):
+                            # Deliberately its own type, not "toast" — this
+                            # fires several times per turn ("Analyzing
+                            # request...", "Searching your documents...",
+                            # "Generating...") and the frontend collapses it
+                            # into a single transient line that updates in
+                            # place. A real "toast" (e.g. "Plan successfully
+                            # scheduled!") is a one-off the user should
+                            # actually see, so it stays a separate type.
+                            if superseded():
+                                return
                             await manager.send_json(connection_id, {
-                                "type": "toast",
+                                "type": "status",
                                 "content": msg
                             })
 
                         # Process the message through the state machine
                         await send_status("Analyzing request...")
                         response_text = await session.handle_message(
-                            msg_content, 
-                            msg_mode, 
+                            msg_content,
+                            msg_mode,
                             token_callback=send_token_sync,
-                            status_callback=send_status
+                            status_callback=send_status,
+                            attachments=msg_attachments,
                         )
-                        
+
                         # Stop the token sender task
                         loop.call_soon_threadsafe(token_queue.put_nowait, None)
                         await sender_task
+
+                        if superseded():
+                            # A cancel (or a newer message) already moved the
+                            # session on while this call was blocked — the
+                            # cancel handler already told the client "done";
+                            # sending this now would resurrect a turn the
+                            # user thinks they cancelled.
+                            logger.info(f"[WS:{connection_id[:8]}] Discarding superseded generation {my_generation_id}.")
+                            return
 
                         if response_text.startswith("__system_toast__:"):
                             toast_msg = response_text.split(":", 1)[1]
@@ -199,7 +288,10 @@ async def websocket_endpoint(
                         
                         if session.state == AgentState.EXECUTING:
                             # Stream the execution progress token by token
-                            async for progress in session.execute_plan():
+                            async for progress in session.execute_plan(token_callback=send_token_sync):
+                                if superseded():
+                                    logger.info(f"[WS:{connection_id[:8]}] Cancelled mid-execution; stopping plan stream for generation {my_generation_id}.")
+                                    break
                                 if isinstance(progress, dict):
                                     if progress.get("type") == "step_result":
                                         await manager.send_json(connection_id, {
@@ -223,19 +315,28 @@ async def websocket_endpoint(
                                     })
 
                             # End stream when execution finishes
-                            await manager.send_json(connection_id, {
-                                "type": "done",
-                                "content": "",
-                            })
+                            if not superseded():
+                                await manager.send_json(connection_id, {
+                                    "type": "done",
+                                    "content": "",
+                                })
 
                     except Exception as e:
                         logger.error(f"Error processing message: {e}", exc_info=True)
-                        await manager.send_json(connection_id, {
-                            "type": "error",
-                            "content": "An internal error occurred while processing your request.",
-                        })
+                        if not superseded():
+                            await manager.send_json(connection_id, {
+                                "type": "error",
+                                "content": "An internal error occurred while processing your request.",
+                            })
                     finally:
-                        session.is_processing = False
+                        # Only clear is_processing if this task is still the
+                        # session's current one — a superseded task (a cancel,
+                        # or the user sending a new message before this one's
+                        # blocked call finally returned) means something else
+                        # already owns that flag, and stomping it here could
+                        # wrongly mark a legitimately-running newer turn as idle.
+                        if not superseded():
+                            session.is_processing = False
 
                 asyncio.create_task(process_message_task(content, mode))
 

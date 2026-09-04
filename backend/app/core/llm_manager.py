@@ -14,7 +14,11 @@ class ModelConfig:
     filename: Optional[str] = None
     model_path: Optional[str] = None
     chat_format: Optional[str] = None
-    # Add other llama_cpp parameters as needed (e.g., n_ctx, n_gpu_layers)
+    # The model's real trained max context (read from its own GGUF metadata at
+    # download time) — informational ceiling used by _load_model to pick a safe
+    # n_ctx; NOT baked directly into kwargs, so large values still get capped.
+    context_length: Optional[int] = None
+    # Add other llama_cpp parameters as needed (e.g., n_gpu_layers)
     kwargs: Optional[Dict[str, Any]] = None
 
 class LLMManager:
@@ -45,7 +49,8 @@ class LLMManager:
                             filename=m.filename,
                             model_path=m.file_path,
                             chat_format=m.chat_format,
-                            kwargs={"n_ctx": m.context_length, "verbose": False}
+                            context_length=m.context_length,
+                            kwargs={"verbose": False}
                         )
                         self.register_model(cfg)
         except Exception as e:
@@ -90,11 +95,30 @@ class LLMManager:
                         filename=m.filename,
                         model_path=m.file_path,
                         chat_format=m.chat_format,
-                        kwargs={"n_ctx": m.context_length, "verbose": False}
+                        context_length=m.context_length,
+                        kwargs={"verbose": False}
                     ))
         except Exception as e:
             logger.debug(f"Could not sync model '{model_name}' from DB: {e}")
         
+    def _resolve_n_ctx(self, config: "ModelConfig") -> int:
+        """
+        Decide the actual n_ctx to load a model with. If the user explicitly set
+        one in Hardware settings, honor it as-is. Otherwise use the model's real
+        trained context (read from its GGUF metadata at download time), capped at
+        a safe default — a 128k+ context model would otherwise try to allocate a
+        KV cache that OOMs typical consumer hardware. Shared by the RAM estimator
+        and the actual load call so both agree on the same number.
+        """
+        from app.core import context_config
+        hw_cfg = context_config.get("hardware")
+        user_n_ctx = hw_cfg.get("n_ctx")
+        if user_n_ctx:
+            return user_n_ctx
+        safe_cap = 8192
+        model_max = config.context_length or safe_cap
+        return min(model_max, safe_cap)
+
     def _estimate_ram_required_gb(self, config: "ModelConfig") -> float:
         """
         Estimate how much RAM (in GB) loading this model will require at runtime.
@@ -118,8 +142,8 @@ class LLMManager:
             except OSError:
                 weight_gb = 2.0  # conservative fallback if file not found yet
 
-        # KV cache estimate: 0.20 GB per 1024 context tokens
-        n_ctx = (config.kwargs or {}).get("n_ctx", 4096)
+        # KV cache estimate: 0.20 GB per 1024 context tokens.
+        n_ctx = self._resolve_n_ctx(config)
         kv_cache_gb = (n_ctx / 1024) * 0.20
 
         # Fixed overhead for OS + Electron + backend processes
@@ -195,7 +219,7 @@ class LLMManager:
         logger.info(f"Loading model: {model_name}")
             
         kwargs = config.kwargs or {}
-        
+
         # Inject dynamic hardware config
         from app.core import context_config
         hw_cfg = context_config.get("hardware")
@@ -203,21 +227,14 @@ class LLMManager:
             kwargs["n_gpu_layers"] = hw_cfg["n_gpu_layers"]
         if "n_threads" in hw_cfg:
             kwargs["n_threads"] = hw_cfg["n_threads"]
-            
-        # Context window detection and safety limits
-        if "n_ctx" not in kwargs:
-            # In llama.cpp, n_ctx=0 means "auto-detect from model metadata (llama.context_length)"
-            # This is vastly superior to the default 512.
-            # However, some modern models specify 128k+ contexts, which will OOM consumer GPUs
-            # if the KV cache is fully allocated. We cap the auto-detection to a safe 8192
-            # for agent workflows, unless the user explicitly overridden it in their hardware settings.
-            user_n_ctx = hw_cfg.get("n_ctx")
-            if user_n_ctx:
-                kwargs["n_ctx"] = user_n_ctx
-            else:
-                kwargs["n_ctx"] = 8192 # Safe default cap for agents that gives plenty of room
 
-        
+        # n_ctx: the model's real trained context (from its GGUF metadata),
+        # capped to a hardware-safe default unless the user explicitly overrode
+        # it — see _resolve_n_ctx. Not baked in at registration time so this
+        # always reflects the current hardware config.
+        kwargs["n_ctx"] = self._resolve_n_ctx(config)
+
+
         if config.model_path and os.path.exists(config.model_path):
             # Load from local file (this uses the file we downloaded directly via httpx, avoiding hf-hub SSL issues)
             llm = Llama(

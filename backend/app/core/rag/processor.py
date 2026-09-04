@@ -1,6 +1,7 @@
 import os
 import uuid
 import logging
+import threading
 from typing import List, Dict, Any
 from pathlib import Path
 
@@ -36,6 +37,18 @@ _sparse_model   = None
 _reranker       = None
 _ocr_reader     = None
 
+# Qdrant's embedded/local mode persists to a plain sqlite3 connection created
+# once, in init_qdrant(), on whichever thread calls it first (FastAPI startup —
+# the main event loop thread). Every other call site touches that same
+# connection from a background worker thread (document ingestion runs via
+# anyio.to_thread.run_sync, chat's RAG search runs via db_executor), which
+# sqlite3 rejects by default ("SQLite objects created in a thread can only be
+# used in that same thread"). force_disable_check_same_thread=True below lifts
+# that check, but does not make the connection safe for genuinely concurrent
+# use — this lock serializes all access to it so ingestion and retrieval never
+# touch it at the same instant.
+_qdrant_lock = threading.Lock()
+
 
 def init_qdrant():
     """Called on FastAPI startup to bind QdrantClient to the main event loop thread."""
@@ -43,7 +56,7 @@ def init_qdrant():
     if _qdrant_client is None:
         from qdrant_client import QdrantClient, models  # lazy import
         logger.info("Initializing QdrantClient on Uvicorn event loop thread...")
-        _qdrant_client = QdrantClient(path=str(QDRANT_DB_DIR))
+        _qdrant_client = QdrantClient(path=str(QDRANT_DB_DIR), force_disable_check_same_thread=True)
         if not _qdrant_client.collection_exists(COLLECTION_NAME):
             _qdrant_client.create_collection(
                 collection_name=COLLECTION_NAME,
@@ -105,6 +118,17 @@ def get_ocr_reader():
 
 # ─── Text Extraction ──────────────────────────────────────────────────────────
 
+# Handled by app.core.transcription (bundled faster-whisper — see that
+# module's docstring for why it ships in the app itself rather than being a
+# marketplace download like everything else here). av/ffmpeg decodes the
+# audio track directly out of any of these containers, video included, so
+# no separate demuxing step is needed before handing the path to whisper.
+_AUDIO_VIDEO_EXTENSIONS = {
+    "mp3", "wav", "m4a", "ogg", "flac", "aac", "wma",
+    "mp4", "mov", "mkv", "webm", "avi",
+}
+
+
 def extract_text(file_path: str, file_type: str) -> str:
     ext = file_type.lower()
     try:
@@ -114,7 +138,7 @@ def extract_text(file_path: str, file_type: str) -> str:
             for page in doc:
                 text_content += page.get_text() + "\n"
             return text_content
-            
+
         elif ext in ['ppt', 'pptx']:
             prs = Presentation(file_path)
             text_content = ""
@@ -123,16 +147,51 @@ def extract_text(file_path: str, file_type: str) -> str:
                     if hasattr(shape, "text"):
                         text_content += shape.text + "\n"
             return text_content
-            
+
         elif ext in ['txt', 'md', 'csv']:
             with open(file_path, 'r', encoding='utf-8') as f:
                 return f.read()
-                
+
+        elif ext == 'docx':
+            from docx import Document
+            doc = Document(file_path)
+            parts = [p.text for p in doc.paragraphs if p.text]
+            # Tables aren't walked by doc.paragraphs at all — a docx with a
+            # table and no surrounding prose would otherwise extract as
+            # empty text.
+            for table in doc.tables:
+                for row in table.rows:
+                    cells = [cell.text for cell in row.cells if cell.text]
+                    if cells:
+                        parts.append(" | ".join(cells))
+            return "\n".join(parts)
+
+        elif ext == 'xlsx':
+            from openpyxl import load_workbook
+            # data_only=True reads each cell's last-calculated value rather
+            # than its formula string — "=SUM(A1:A5)" is useless as
+            # searchable text, the number it evaluated to isn't.
+            wb = load_workbook(file_path, data_only=True, read_only=True)
+            parts = []
+            for sheet in wb.worksheets:
+                parts.append(f"# {sheet.title}")
+                for row in sheet.iter_rows(values_only=True):
+                    cells = [str(c) for c in row if c is not None]
+                    if cells:
+                        parts.append(" | ".join(cells))
+            return "\n".join(parts)
+
         elif ext in ['png', 'jpg', 'jpeg']:
             reader = get_ocr_reader()
             results = reader.readtext(file_path)
             return " ".join([res[1] for res in results])
-            
+
+        elif ext in _AUDIO_VIDEO_EXTENSIONS:
+            from app.core.transcription import transcribe, is_installed
+            if not is_installed():
+                raise ValueError("Voice model unavailable in this build — can't transcribe audio/video.")
+            return transcribe(file_path)
+
         else:
             logger.warning(f"Unsupported file type for extraction: {ext}")
             return ""
@@ -161,9 +220,19 @@ def ingest_document(document_id: int, file_path: str, file_type: str, filename: 
     
     raw_text = extract_text(file_path, file_type)
     if not raw_text.strip():
-        logger.warning(f"Document {document_id} resulted in empty text.")
-        return
-        
+        # Raise rather than return — the caller (process_upload_task) marks the
+        # document "ready" on a normal return, which previously made empty-text
+        # ingestion (a blank page, or an image with no OCR-readable text) look
+        # like a success with zero searchable content actually indexed.
+        ext = file_type.lower()
+        if ext in ('png', 'jpg', 'jpeg'):
+            raise ValueError(
+                "No readable text found in this image via OCR. This app can only "
+                "search images for printed/on-screen text — it can't describe or "
+                "reason about visual content unless the active model supports vision."
+            )
+        raise ValueError("No extractable text was found in this file.")
+
     chunks = chunk_text(raw_text)
     logger.info(f"Generated {len(chunks)} chunks for document {document_id}.")
     
@@ -196,11 +265,24 @@ def ingest_document(document_id: int, file_path: str, file_type: str, filename: 
         points.append(point)
         
     client = get_qdrant_client()
-    client.upsert(
-        collection_name=COLLECTION_NAME,
-        points=points
-    )
+    with _qdrant_lock:
+        client.upsert(
+            collection_name=COLLECTION_NAME,
+            points=points
+        )
     logger.info(f"Successfully ingested document {document_id} into Qdrant.")
+
+
+def delete_document_points(document_id: int) -> None:
+    """Remove all indexed chunks for a document from Qdrant (used by the Files panel's delete action)."""
+    from qdrant_client import models  # lazy import
+    client = get_qdrant_client()
+    doc_filter = models.Filter(
+        must=[models.FieldCondition(key="document_id", match=models.MatchValue(value=document_id))]
+    )
+    with _qdrant_lock:
+        client.delete(collection_name=COLLECTION_NAME, points_selector=doc_filter)
+    logger.info(f"Deleted Qdrant points for document {document_id}.")
 
 
 # ─── Advanced Hybrid Retrieval & Reranking ────────────────────────────────────
@@ -240,28 +322,29 @@ def hybrid_search(query: str, conversation_id: str, top_k: int = 5) -> List[Dict
 
     # Query Qdrant with Reciprocal Rank Fusion (RRF) implicitly by querying both
     # Qdrant's query_points automatically fuses multiple prefetches
-    results = get_qdrant_client().query_points(
-        collection_name=COLLECTION_NAME,
-        prefetch=[
-            models.Prefetch(
-                query=query_dense.tolist(),
-                using="text-dense",
-                limit=15,
-                filter=doc_filter
-            ),
-            models.Prefetch(
-                query=models.SparseVector(
-                    indices=query_sparse.indices.tolist(),
-                    values=query_sparse.values.tolist()
+    with _qdrant_lock:
+        results = get_qdrant_client().query_points(
+            collection_name=COLLECTION_NAME,
+            prefetch=[
+                models.Prefetch(
+                    query=query_dense.tolist(),
+                    using="text-dense",
+                    limit=15,
+                    filter=doc_filter
                 ),
-                using="text-sparse",
-                limit=15,
-                filter=doc_filter
-            )
-        ],
-        query=models.FusionQuery(fusion=models.Fusion.RRF),
-        limit=15
-    )
+                models.Prefetch(
+                    query=models.SparseVector(
+                        indices=query_sparse.indices.tolist(),
+                        values=query_sparse.values.tolist()
+                    ),
+                    using="text-sparse",
+                    limit=15,
+                    filter=doc_filter
+                )
+            ],
+            query=models.FusionQuery(fusion=models.Fusion.RRF),
+            limit=15
+        )
     
     unique_chunks = []
     for point in results.points:

@@ -20,6 +20,12 @@ import { setSessionId, generateNewSession, selectSessionId } from '@/store/sessi
 export type MessageRole = 'user' | 'assistant' | 'system';
 export type MessageType = 'message' | 'thought' | 'tool_call';
 
+export interface Attachment {
+  document_id: number;
+  filename: string;
+  file_type: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: MessageRole;
@@ -27,6 +33,7 @@ export interface ChatMessage {
   content: string;
   timestamp: Date;
   isStreaming?: boolean;
+  attachments?: Attachment[];
 }
 
 export type ConnectionStatus =
@@ -37,10 +44,11 @@ export type ConnectionStatus =
   | 'error';
 
 interface ServerPayload {
-  type: 'connected' | 'token' | 'done' | 'error' | 'pong' | 'history' | 'toast' | 'step_result';
+  type: 'connected' | 'token' | 'done' | 'error' | 'pong' | 'history' | 'toast' | 'status' | 'step_result' | 'document_progress';
   content?: string;
   connection_id?: string;
-  history?: Array<{ role: string; content: string }>;
+  history?: Array<{ role: string; content: string; attachments?: Attachment[] }>;
+  agent_state?: string;
   node_id?: string;
   status?: string;
   tool?: string;
@@ -71,6 +79,36 @@ export function useSocket() {
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamingContent, setStreamingContent] = useState('');
+  // The backend agent's own state for this conversation (IDLE unless a
+  // plan/cookie/pagination prompt is paused mid-flight) — reported once on
+  // the "history" message so the UI can tell whether the conversation it's
+  // opening was actually left in Agent Mode with something still pending.
+  const [agentState, setAgentState] = useState<string>('IDLE');
+  // A single transient "what's happening right now" line (e.g. "Searching
+  // your documents...") — replaced in place as each stage reports in, never
+  // appended as its own permanent message. Cleared the moment real content
+  // starts streaming or the turn ends. Claude-style: one line, not a stack
+  // of separate status bubbles.
+  const [statusText, setStatusText] = useState<string | null>(null);
+  const statusClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Chat-turn stages clear statusText themselves the moment a real event
+  // (token/step_result/done/error) arrives. A document/scrape upload has no
+  // such follow-up event once it reaches a terminal state ("✅ ready" / "❌
+  // failed"), so that line would otherwise sit there forever — this debounced
+  // timer clears it a few seconds after the *last* update, giving the reader
+  // enough time to see the terminal message without it becoming a permanent
+  // fixture in the UI.
+  useEffect(() => {
+    if (statusClearTimerRef.current) clearTimeout(statusClearTimerRef.current);
+    if (statusText) {
+      statusClearTimerRef.current = setTimeout(() => setStatusText(null), 4000);
+    }
+    return () => {
+      if (statusClearTimerRef.current) clearTimeout(statusClearTimerRef.current);
+    };
+  }, [statusText]);
+
   const bufferRef = useRef("");
   const streamingContentRef = useRef("");
   const rafPending = useRef(false);
@@ -224,11 +262,18 @@ export function useSocket() {
               role: m.role as MessageRole,
               content: m.content,
               timestamp: new Date(),
+              attachments: m.attachments,
+              msgType: m.msg_type as MessageType | undefined,
             })));
+            setAgentState(payload.agent_state || 'IDLE');
           }
           break;
 
         case 'token':
+          // Real content is arriving — the "Analyzing.../Generating..."
+          // status line has served its purpose.
+          setStatusText(null);
+
           if (payload.node_id) {
             if (payload.status === 'running') {
               setActiveNodeId(payload.node_id);
@@ -269,6 +314,7 @@ export function useSocket() {
           // A single tool has finished executing. Flush any current streaming
           // content and immediately render the result as its own message so the
           // user sees live progress without waiting for the full plan to complete.
+          setStatusText(null);
           if (streamingContentRef.current || bufferRef.current) {
             finalizeRef.current('thought');
           }
@@ -290,10 +336,28 @@ export function useSocket() {
           break;
 
         case 'done':
+          setStatusText(null);
           finalizeRef.current('message');
           break;
 
+        case 'status':
+        case 'document_progress':
+          // A transient "what's happening right now" update — Chat Mode's
+          // status_callback ("Analyzing request...", "Searching your
+          // documents...") or a document/scrape lifecycle stage ("Ingesting
+          // X...", "✅ ready", "❌ failed"). Replaces the single status line
+          // in place rather than becoming its own permanent message, so a
+          // turn (or an upload) with several stages doesn't leave a stack of
+          // pill bubbles behind. The Files panel is the durable record of
+          // an upload's outcome — the chat transcript doesn't need its own
+          // permanent copy of the same status.
+          setStatusText(payload.content ?? null);
+          break;
+
         case 'toast':
+          // Genuine one-off notifications (job scheduled, action expired,
+          // agent busy) — these ARE meant to be a persistent, visible
+          // record, unlike the transient line above.
           appendMessageRef.current({
             id: generateId(),
             role: 'system',
@@ -303,6 +367,7 @@ export function useSocket() {
           break;
 
         case 'error':
+          setStatusText(null);
           finalizeRef.current();
           appendMessageRef.current({
             id: generateId(),
@@ -379,9 +444,10 @@ export function useSocket() {
   // ── Public API ───────────────────────────────────────────────────────────────
 
   const sendMessage = useCallback(
-    (content: string, msgType: string = 'message', mode: string = 'chat', userPrompt?: string): boolean => {
+    (content: string, msgType: string = 'message', mode: string = 'chat', userPrompt?: string, attachments?: Attachment[]): boolean => {
       const trimmed = content.trim();
-      if (!trimmed) return false;
+      // Claude-style: a message can be attachments alone with no typed text.
+      if (!trimmed && !(attachments && attachments.length > 0)) return false;
       if (socketRef.current?.readyState !== WebSocket.OPEN) {
         console.warn('[useSocket] Cannot send — socket not open');
         return false;
@@ -398,7 +464,17 @@ export function useSocket() {
           role: 'user',
           content: trimmed,
           timestamp: new Date(),
+          attachments,
         });
+        // Turn the animated response indicator on immediately, not only once
+        // the first 'token' event arrives — that event only fires after the
+        // backend's whole pre-generation phase (RAG search, skills, status
+        // updates) completes, which can take a real, visible amount of time.
+        // Without this, that entire wait shows nothing at all if a status
+        // update is slow, dropped, or the connection hiccups — exactly the
+        // blank-screen gap this was reported against. Claude's own "thinking"
+        // indicator appears the instant you hit send, not after a round trip.
+        setIsStreaming(true);
       } else if (msgType === 'toast') {
         // Add a local system message for visual feedback
         appendMessage({
@@ -412,7 +488,7 @@ export function useSocket() {
       }
 
       socketRef.current.send(
-        JSON.stringify({ type: msgType, content: trimmed, mode, user_prompt: userPrompt })
+        JSON.stringify({ type: msgType, content: trimmed, mode, user_prompt: userPrompt, attachments })
       );
       return true;
     },
@@ -429,6 +505,7 @@ export function useSocket() {
 
   const clearMessages = useCallback(() => {
     setMessages([]);
+    setStatusText(null);
   }, []);
 
   const switchSession = useCallback((newSessionId?: string) => {
@@ -436,6 +513,13 @@ export function useSocket() {
     isSessionSwitchRef.current = true;
     // Reset history flag so the new session's history gets loaded
     historyLoadedRef.current = false;
+    setStatusText(null);
+    // A fresh/empty conversation never gets a "history" message at all (see
+    // the backend's `if full_history:` guard), so without this reset a new
+    // chat would inherit whatever agentState the *previous* conversation
+    // last reported — stale, and specifically the wrong direction to leak
+    // (turning Agent Mode's confirmation UI back on for an unrelated chat).
+    setAgentState('IDLE');
 
     if (newSessionId) {
       // Load a historical session — dispatch to Redux (store subscriber writes to localStorage)
@@ -470,6 +554,8 @@ export function useSocket() {
     status,
     isStreaming,
     streamingContent,
+    statusText,
+    agentState,
     activeNodeId,
     completedNodeIds,
     failedNodeIds,

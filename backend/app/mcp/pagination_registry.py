@@ -89,6 +89,11 @@ READ_ONLY_TOOLS = {
     "linear_list_issues",
     "jira_list_issues",
     "jira_search_issues",
+    # Local tool (not an MCP server) — always reads a page and never
+    # persists or mutates anything (see ChatAgent._execute_web_scrape).
+    # Doesn't match the get_/list_/search_ verb-prefix heuristic in
+    # is_write_tool below, so it needs to be listed explicitly.
+    "web_scrape",
 }
 
 
@@ -115,6 +120,58 @@ def is_tool_safe_to_autoloop(tool_name: str, tool_schema: Optional[Dict] = None)
         "is_mutating field — defaulting to mutating (auto-loop BLOCKED)."
     )
     return False
+
+
+# Common write-verb prefixes across the tool ecosystems this app connects to
+# (GitHub, Gmail, Drive, Slack, Notion, Jira, Linear, ...). Used only for the
+# plan-confirmation card's read/write badge — a different, lower-stakes
+# purpose than is_tool_safe_to_autoloop above, which deliberately fail-closes
+# to "mutating" for anything not in the curated READ_ONLY_TOOLS allowlist.
+# Reusing that fail-closed check here would badge ordinary read tools like
+# 'get_repository' or 'search_code' as "writes" just because they're not on
+# that narrow list, making the badge noisy enough that users learn to ignore
+# it — so this checks verb shape first, and only stays cautious for names
+# that don't look like either.
+_WRITE_VERB_PREFIXES = (
+    "create_", "update_", "delete_", "remove_", "send_", "push_", "merge_",
+    "add_", "upload_", "set_", "write_", "close_", "reopen_", "assign_",
+    "invite_", "archive_", "disable_", "enable_", "revoke_", "approve_",
+    "reject_", "cancel_", "schedule_", "execute_", "run_", "fork_", "star_",
+    "unstar_", "watch_", "unwatch_", "connect_", "disconnect_", "post_",
+    "publish_", "share_", "grant_", "block_", "unblock_", "move_", "copy_",
+    "rename_", "trash_", "restore_", "invoke_",
+)
+_READ_VERB_PREFIXES = (
+    "list_", "get_", "search_", "find_", "fetch_", "read_", "check_",
+    "count_", "describe_", "show_", "view_", "download_", "query_",
+)
+
+
+def is_write_tool(tool_name: str, tool_schema: Optional[Dict] = None) -> bool:
+    """
+    Best-effort read/write classification for surfacing to the user — e.g.
+    "this step only reads data" vs "this step changes something" on the plan
+    confirmation card. NOT the same bar as is_tool_safe_to_autoloop (that one
+    guards unattended auto-pagination and rightly fail-closes much harder).
+
+    Priority:
+    1. Explicit is_mutating field on the tool schema, if present — authoritative.
+    2. READ_ONLY_TOOLS registry — known-safe list.
+    3. Verb-prefix match against the tool's own name (covers the vast
+       majority of real tool names in this app without needing every one
+       individually registered).
+    4. Unrecognized shape — stays cautious and reports "write".
+    """
+    if tool_schema and "is_mutating" in tool_schema:
+        return bool(tool_schema["is_mutating"])
+    if tool_name in READ_ONLY_TOOLS:
+        return False
+    name_lower = (tool_name or "").lower()
+    if any(name_lower.startswith(p) for p in _WRITE_VERB_PREFIXES):
+        return True
+    if any(name_lower.startswith(p) for p in _READ_VERB_PREFIXES):
+        return False
+    return True
 
 
 def _match_pattern(tool_name: str) -> Optional[Dict[str, str]]:

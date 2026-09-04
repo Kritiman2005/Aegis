@@ -52,6 +52,7 @@ class ExecutorAgent(BaseAgent):
             )
             
             raw_content = response.get("choices", [])[0].get("message", {}).get("content", "{}")
+            self._log_token_usage(llm, messages, raw_content, "agent")
             return json.loads(raw_content)
         except Exception as e:
             logger.error(f"Executor LLM failed to generate arguments: {e}")

@@ -96,18 +96,18 @@ def _gh_search_repositories_exec(raw: Any) -> Dict:
 def _gh_search_repositories_disp(raw: Any) -> str:
     shaped = _gh_search_repositories_exec(raw)
     if "error" in shaped:
-        return f"⚠️ {shaped['error']}"
+        return f"{shaped['error']}"
     repos = shaped.get("repositories", [])
     total = shaped.get("total_count", len(repos))
     if not repos:
         return "No repositories found."
     lines = [f"**Found {_num(total)} repositories** (showing top {len(repos)}):\n"]
     for r in repos:
-        priv = "🔒" if r.get("private") else "🌍"
+        visibility = "Private" if r.get("private") else "Public"
         desc = r.get("description") or "_No description_"
         lines.append(
-            f"{priv} **[{r['full_name']}]({r['html_url']})** — "
-            f"⭐ {_num(r.get('stars', 0))} · 🍴 {_num(r.get('forks', 0))}\n"
+            f"**[{r['full_name']}]({r['html_url']})** ({visibility}) — "
+            f"{_num(r.get('stars', 0))} stars · {_num(r.get('forks', 0))} forks\n"
             f"> {desc}"
         )
     return "\n\n".join(lines)
@@ -134,7 +134,7 @@ def _gh_list_commits_exec(raw: Any) -> Dict:
 def _gh_list_commits_disp(raw: Any) -> str:
     shaped = _gh_list_commits_exec(raw)
     if "error" in shaped:
-        return f"⚠️ {shaped['error']}"
+        return f"{shaped['error']}"
     commits = shaped.get("commits", [])
     total = shaped.get("total_shown", len(commits))
     if not commits:
@@ -169,13 +169,13 @@ def _gh_get_repository_exec(raw: Any) -> Dict:
 def _gh_get_repository_disp(raw: Any) -> str:
     s = _gh_get_repository_exec(raw)
     if "error" in s:
-        return f"⚠️ {s['error']}"
+        return f"{s['error']}"
     return (
         f"## [{s['full_name']}]({s['html_url']})\n"
         f"{s.get('description') or '_No description_'}\n\n"
-        f"- ⭐ **{_num(s.get('stars', 0))}** stars · "
-        f"🍴 **{_num(s.get('forks', 0))}** forks · "
-        f"🐛 **{_num(s.get('open_issues', 0))}** open issues\n"
+        f"- **{_num(s.get('stars', 0))}** stars · "
+        f"**{_num(s.get('forks', 0))}** forks · "
+        f"**{_num(s.get('open_issues', 0))}** open issues\n"
         f"- Default branch: `{s.get('default_branch')}` · Private: `{s.get('private')}`\n"
         f"- Created: {s.get('created_at')} · Updated: {s.get('updated_at')}"
     )
@@ -205,16 +205,15 @@ def _gh_list_issues_exec(raw: Any) -> Dict:
 def _gh_list_issues_disp(raw: Any) -> str:
     s = _gh_list_issues_exec(raw)
     if "error" in s:
-        return f"⚠️ {s['error']}"
+        return f"{s['error']}"
     issues = s.get("issues", [])
     if not issues:
         return "No issues found."
     lines = [f"**{_num(s.get('total_shown', len(issues)))} issues shown**:\n"]
     for issue in issues:
-        icon = "🟢" if issue["state"] == "open" else "🔴"
         labels = ", ".join(f"`{l}`" for l in issue.get("labels", [])) or "—"
         lines.append(
-            f"{icon} **#{issue['number']} {issue['title']}** "
+            f"**#{issue['number']} {issue['title']}** (`{issue['state']}`) "
             f"by _{issue['user']}_ on {issue['created_at']}\n"
             f"  Labels: {labels} · [View]({issue['html_url']})"
         )
@@ -236,9 +235,9 @@ def _gh_create_repository_exec(raw: Any) -> Dict:
 def _gh_create_repository_disp(raw: Any) -> str:
     s = _gh_create_repository_exec(raw)
     if "error" in s:
-        return f"⚠️ {s['error']}"
+        return f"{s['error']}"
     return (
-        f"✅ Repository **[{s['full_name']}]({s['html_url']})** created!\n\n"
+        f"Repository **[{s['full_name']}]({s['html_url']})** created!\n\n"
         f"Clone: `git clone {s['clone_url']}`"
     )
 
@@ -250,8 +249,8 @@ def _gh_fork_repository_exec(raw: Any) -> Dict:
 def _gh_fork_repository_disp(raw: Any) -> str:
     s = _gh_fork_repository_exec(raw)
     if "error" in s:
-        return f"⚠️ {s['error']}"
-    return f"✅ Forked as **[{s['full_name']}]({s['html_url']})**"
+        return f"{s['error']}"
+    return f"Forked as **[{s['full_name']}]({s['html_url']})**"
 
 
 def _gh_create_issue_exec(raw: Any) -> Dict:
@@ -269,8 +268,8 @@ def _gh_create_issue_exec(raw: Any) -> Dict:
 def _gh_create_issue_disp(raw: Any) -> str:
     s = _gh_create_issue_exec(raw)
     if "error" in s:
-        return f"⚠️ {s['error']}"
-    return f"✅ Issue **#{s['number']}: {s['title']}** created! [View]({s['html_url']})"
+        return f"{s['error']}"
+    return f"Issue **#{s['number']}: {s['title']}** created! [View]({s['html_url']})"
 
 
 def _gh_search_code_exec(raw: Any) -> Dict:
@@ -293,7 +292,7 @@ def _gh_search_code_exec(raw: Any) -> Dict:
 def _gh_search_code_disp(raw: Any) -> str:
     s = _gh_search_code_exec(raw)
     if "error" in s:
-        return f"⚠️ {s['error']}"
+        return f"{s['error']}"
     results = s.get("results", [])
     if not results:
         return "No code matches found."
@@ -331,10 +330,10 @@ def _decode_gh_content(raw: Dict) -> Optional[str]:
 def _gh_get_file_contents_disp(raw: Any) -> str:
     s = _gh_get_file_contents_exec(raw)
     if "error" in s:
-        return f"⚠️ {s['error']}"
+        return f"{s['error']}"
     content = s.get("content") or "_Binary or empty file_"
     return (
-        f"📄 **[{s['path']}]({s['html_url']})** ({s.get('size', '?')} bytes)\n\n"
+        f"**[{s['path']}]({s['html_url']})** ({s.get('size', '?')} bytes)\n\n"
         f"```\n{content}\n```"
     )
 
@@ -353,8 +352,8 @@ def _gh_push_files_exec(raw: Any) -> Dict:
 def _gh_push_files_disp(raw: Any) -> str:
     s = _gh_push_files_exec(raw)
     if "error" in s:
-        return f"⚠️ {s['error']}"
-    return f"✅ Pushed! Commit `{s['sha']}`: _{s.get('message')}_  [View]({s.get('html_url')})"
+        return f"{s['error']}"
+    return f"Pushed! Commit `{s['sha']}`: _{s.get('message')}_  [View]({s.get('html_url')})"
 
 
 def _gh_create_pull_request_exec(raw: Any) -> Dict:
@@ -373,9 +372,9 @@ def _gh_create_pull_request_exec(raw: Any) -> Dict:
 def _gh_create_pull_request_disp(raw: Any) -> str:
     s = _gh_create_pull_request_exec(raw)
     if "error" in s:
-        return f"⚠️ {s['error']}"
+        return f"{s['error']}"
     return (
-        f"✅ Pull Request **#{s['number']}: {s['title']}** opened!\n"
+        f"Pull Request **#{s['number']}: {s['title']}** opened!\n"
         f"`{s['head']}` → `{s['base']}` · [View PR]({s['html_url']})"
     )
 
@@ -400,7 +399,7 @@ def _gmail_list_messages_exec(raw: Any) -> Dict:
 def _gmail_list_messages_disp(raw: Any) -> str:
     s = _gmail_list_messages_exec(raw)
     if "error" in s:
-        return f"⚠️ {s['error']}"
+        return f"{s['error']}"
     msgs = s.get("messages", [])
     est = s.get("result_size_estimate")
     if not msgs:
@@ -465,11 +464,11 @@ def _gmail_get_message_exec(raw: Any) -> Dict:
 def _gmail_get_message_disp(raw: Any) -> str:
     s = _gmail_get_message_exec(raw)
     if "error" in s:
-        return f"⚠️ {s['error']}"
+        return f"{s['error']}"
     body_section = s.get("body") or s.get("snippet") or "_No body_"
     cc_line = f"**CC:** {s['cc']}  \n" if s.get("cc") else ""
     return (
-        f"### ✉️ {s.get('subject')}\n\n"
+        f"### {s.get('subject')}\n\n"
         f"**From:** {s.get('from')}  \n"
         f"**To:** {s.get('to')}  \n"
         f"{cc_line}"
@@ -491,8 +490,8 @@ def _gmail_send_message_exec(raw: Any) -> Dict:
 def _gmail_send_message_disp(raw: Any) -> str:
     s = _gmail_send_message_exec(raw)
     if "error" in s:
-        return f"⚠️ {s['error']}"
-    return f"✅ Email sent! Message ID: `{s.get('id')}`"
+        return f"{s['error']}"
+    return f"Email sent! Message ID: `{s.get('id')}`"
 
 
 def _gmail_list_drafts_exec(raw: Any) -> Dict:
@@ -511,7 +510,7 @@ def _gmail_list_drafts_exec(raw: Any) -> Dict:
 def _gmail_list_drafts_disp(raw: Any) -> str:
     s = _gmail_list_drafts_exec(raw)
     if "error" in s:
-        return f"⚠️ {s['error']}"
+        return f"{s['error']}"
     drafts = s.get("drafts", [])
     if not drafts:
         return "No drafts found."
@@ -533,10 +532,10 @@ def _gmail_get_draft_exec(raw: Any) -> Dict:
 def _gmail_get_draft_disp(raw: Any) -> str:
     s = _gmail_get_draft_exec(raw)
     if "error" in s:
-        return f"⚠️ {s['error']}"
+        return f"{s['error']}"
     body_section = s.get("body") or s.get("snippet") or "_No body_"
     return (
-        f"### 📝 Draft: {s.get('subject')}\n\n"
+        f"### Draft: {s.get('subject')}\n\n"
         f"**To:** {s.get('to')}  \n"
         f"**Date:** {s.get('date')}  \n\n"
         f"---\n\n{body_section}"
@@ -571,16 +570,17 @@ def _drive_list_files_exec(raw: Any) -> Dict:
 def _drive_list_files_disp(raw: Any) -> str:
     s = _drive_list_files_exec(raw)
     if "error" in s:
-        return f"⚠️ {s['error']}"
+        return f"{s['error']}"
     files = s.get("files", [])
     if not files:
         return "No files found."
     lines = [f"**{len(files)} file(s)**:\n"]
     for f in files:
-        icon = "📁" if "folder" in (f.get("mime_type") or "") else "📄"
+        is_folder = "folder" in (f.get("mime_type") or "")
         name_part = f"[{f['name']}]({f['web_url']})" if f.get("web_url") else f["name"]
         size_part = f" · {f['size']} bytes" if f.get("size") else ""
-        lines.append(f"- {icon} {name_part} · {f.get('modified', '—')}{size_part}")
+        type_part = " (folder)" if is_folder else ""
+        lines.append(f"- {name_part}{type_part} · {f.get('modified', '—')}{size_part}")
     return "\n".join(lines)
 
 
@@ -602,11 +602,11 @@ def _drive_get_file_exec(raw: Any) -> Dict:
 def _drive_get_file_disp(raw: Any) -> str:
     s = _drive_get_file_exec(raw)
     if "error" in s:
-        return f"⚠️ {s['error']}"
+        return f"{s['error']}"
     link = f"[{s['name']}]({s['web_url']})" if s.get("web_url") else s["name"]
     size = f"{_num(s.get('size'))} bytes" if s.get("size") else "—"
     return (
-        f"📄 **{link}**\n\n"
+        f"**{link}**\n\n"
         f"- Type: `{s.get('mime_type')}`\n"
         f"- Size: {size}\n"
         f"- Modified: {s.get('modified')}\n"
@@ -628,9 +628,9 @@ def _drive_create_file_exec(raw: Any) -> Dict:
 def _drive_create_file_disp(raw: Any) -> str:
     s = _drive_create_file_exec(raw)
     if "error" in s:
-        return f"⚠️ {s['error']}"
+        return f"{s['error']}"
     link = f"[{s['name']}]({s['web_url']})" if s.get("web_url") else s["name"]
-    return f"✅ **{link}** created! File ID: `{s['id']}`"
+    return f"**{link}** created! File ID: `{s['id']}`"
 
 
 def _drive_read_file_exec(raw: Any) -> Dict:
@@ -646,7 +646,7 @@ def _drive_read_file_exec(raw: Any) -> Dict:
 def _drive_read_file_disp(raw: Any) -> str:
     s = _drive_read_file_exec(raw)
     content = s.get("content") or "_Empty file_"
-    return f"📄 **File contents:**\n\n```\n{content}\n```"
+    return f"**File contents:**\n\n```\n{content}\n```"
 
 
 
@@ -669,10 +669,10 @@ def _sheets_read_range_disp(raw: Any) -> str:
             raw = json.loads(raw)
         except json.JSONDecodeError:
             return raw
-    
+
     if not isinstance(raw, list) or not raw:
         return "*No data found or empty range*"
-    
+
     # Try to make a markdown table
     try:
         md = "| " + " | ".join(str(c).replace('|', '\|') for c in raw[0]) + " |\n"
@@ -687,7 +687,7 @@ def _sheets_update_range_exec(raw: Any) -> Dict:
     return {"result": str(raw)}
 
 def _sheets_update_range_disp(raw: Any) -> str:
-    return f"✅ **Spreadsheet updated:** {str(raw)}"
+    return f"**Spreadsheet updated:** {str(raw)}"
 
 def _docs_read_document_exec(raw: Any) -> Dict:
     if isinstance(raw, str):
@@ -697,11 +697,198 @@ def _docs_read_document_exec(raw: Any) -> Dict:
 def _docs_read_document_disp(raw: Any) -> str:
     s = _docs_read_document_exec(raw)
     content = s.get("content") or "_Empty document_"
-    return f"📄 **Document contents:**\n\n```\n{content}\n```"
+    return f"**Document contents:**\n\n```\n{content}\n```"
+
+def _web_scrape_exec(raw: Any) -> Dict:
+    """
+    Passes text_preview through untouched — app/core/agents/chat.py's
+    _execute_web_scrape already bounds it to exactly one _SCRAPE_CHUNK_CHARS
+    chunk via `offset`, so re-truncating it here (this used to hard-clip to
+    2000 chars regardless of that) would silently shrink what the caller
+    deliberately sized. Also, critically, forwards `warnings` and `note` —
+    the old version dropped both, which meant the Executor LLM never saw
+    the "call again with offset=N to keep reading" continuation instruction
+    that makes long-page pagination actually usable.
+    """
+    if not isinstance(raw, dict):
+        return {"error": _trunc(str(raw), 300)}
+    if raw.get("error"):
+        out = {"error": raw["error"]}
+        if raw.get("note"):
+            out["note"] = raw["note"]
+        return out
+    out = {
+        "title": raw.get("title") or "",
+        "text_preview": raw.get("text_preview", ""),
+    }
+    if raw.get("warnings"):
+        out["warnings"] = raw["warnings"]
+    if raw.get("note"):
+        out["note"] = raw["note"]
+    return out
+
+def _web_scrape_disp(raw: Any) -> str:
+    """Shows the full chunk that was actually fetched — see _web_scrape_exec
+    for why re-truncating it here would misrepresent what's available."""
+    if not isinstance(raw, dict):
+        return _trunc(str(raw), 2000)
+    if raw.get("error"):
+        note = f"\n\n_{raw['note']}_" if raw.get("note") else ""
+        return f"**Scrape failed:** {raw['error']}{note}"
+    title = raw.get("title") or "Untitled page"
+    preview = raw.get("text_preview", "")
+    warnings = raw.get("warnings") or []
+    warn_txt = "\n\n" + "\n".join(f"> {w}" for w in warnings) if warnings else ""
+    note = f"\n\n_{raw['note']}_" if raw.get("note") else ""
+    return f"### {title}\n\n{preview}{warn_txt}{note}"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Persistent browser session (browser_* tools — app.core.browser_session)
+#
+# browser_navigate and browser_extract_text land in _web_scrape_exec/_disp
+# above (registered a second time under those names below) — chat.py's
+# execution loop already normalizes all three into the identical
+# {title, text_preview, warnings, note} / {error, note} shape before this
+# layer ever sees them, so there's nothing tool-specific left to shape.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _browser_error(raw: Any) -> Optional[str]:
+    """Every browser_* action dict is {error: "..."} on failure — see
+    ChatAgent's executor loop, which builds this the same way for all of
+    them. Returns None when raw isn't an error dict."""
+    if isinstance(raw, dict) and raw.get("error"):
+        return raw["error"]
+    return None
+
+def _browser_click_exec(raw: Any) -> Dict:
+    err = _browser_error(raw)
+    if err:
+        return {"error": err}
+    return {"clicked": raw.get("selector"), "url": raw.get("url"), "title": raw.get("title")}
+
+def _browser_click_disp(raw: Any) -> str:
+    err = _browser_error(raw)
+    if err:
+        return f"**Click failed:** {err}"
+    return f"Clicked `{raw.get('selector')}` — now on **{raw.get('title') or raw.get('url')}**."
+
+def _browser_fill_exec(raw: Any) -> Dict:
+    err = _browser_error(raw)
+    return {"error": err} if err else {"filled": raw.get("selector")}
+
+def _browser_fill_disp(raw: Any) -> str:
+    err = _browser_error(raw)
+    return f"**Fill failed:** {err}" if err else f"Filled `{raw.get('selector')}`."
+
+def _browser_scroll_exec(raw: Any) -> Dict:
+    err = _browser_error(raw)
+    return {"error": err} if err else {"scrolled": raw.get("direction")}
+
+def _browser_scroll_disp(raw: Any) -> str:
+    err = _browser_error(raw)
+    return f"**Scroll failed:** {err}" if err else f"Scrolled {raw.get('direction')}."
+
+def _browser_wait_exec(raw: Any) -> Dict:
+    err = _browser_error(raw)
+    return {"error": err} if err else {"appeared": raw.get("selector")}
+
+def _browser_wait_disp(raw: Any) -> str:
+    err = _browser_error(raw)
+    return f"**Wait failed:** {err}" if err else f"`{raw.get('selector')}` appeared."
+
+def _browser_nav_history_exec(raw: Any) -> Dict:
+    """Shared by browser_go_back/browser_go_forward — same result shape."""
+    err = _browser_error(raw)
+    if err:
+        return {"error": err}
+    return {"url": raw.get("url"), "title": raw.get("title")}
+
+def _browser_nav_history_disp(raw: Any) -> str:
+    err = _browser_error(raw)
+    if err:
+        return f"**Navigation failed:** {err}"
+    return f"Now on **{raw.get('title') or raw.get('url')}** ({raw.get('url')})."
+
+def _browser_list_tabs_exec(raw: Any) -> Dict:
+    err = _browser_error(raw)
+    if err:
+        return {"error": err}
+    return {"tabs": raw.get("tabs") or [], "current": raw.get("current")}
+
+def _browser_list_tabs_disp(raw: Any) -> str:
+    err = _browser_error(raw)
+    if err:
+        return f"**Could not list tabs:** {err}"
+    tabs = raw.get("tabs") or []
+    current = raw.get("current")
+    lines = ["**Open tabs:**"]
+    for t in tabs:
+        marker = " ← active" if t.get("index") == current else ""
+        lines.append(f"- [{t.get('index')}] {t.get('title') or '(untitled)'} — {t.get('url')}{marker}")
+    return "\n".join(lines)
+
+def _browser_switch_tab_exec(raw: Any) -> Dict:
+    err = _browser_error(raw)
+    if err:
+        return {"error": err}
+    return {"switched_to": raw.get("tabIndex"), "url": raw.get("url"), "title": raw.get("title")}
+
+def _browser_switch_tab_disp(raw: Any) -> str:
+    err = _browser_error(raw)
+    if err:
+        return f"**Switch tab failed:** {err}"
+    return f"Switched to tab {raw.get('tabIndex')}: **{raw.get('title') or raw.get('url')}**."
+
+def _browser_close_exec(raw: Any) -> Dict:
+    err = _browser_error(raw)
+    return {"error": err} if err else {"closed": True}
+
+def _browser_close_disp(raw: Any) -> str:
+    err = _browser_error(raw)
+    return f"**Close failed:** {err}" if err else "Browser session closed."
+
+# Deliberately drops screenshot_base64 from what the Executor LLM sees —
+# the model has no vision capability in this app (see browser_screenshot's
+# own tool description), so the raw image data would just be dead weight
+# in its context. The display shaper below is what actually shows it, as
+# an inline image, to the human.
+def _browser_screenshot_exec(raw: Any) -> Dict:
+    err = _browser_error(raw)
+    if err:
+        return {"error": err}
+    return {"note": "Screenshot captured and shown to the user above. You cannot see its contents."}
+
+def _browser_screenshot_disp(raw: Any) -> str:
+    err = _browser_error(raw)
+    if err:
+        return f"**Screenshot failed:** {err}"
+    b64 = raw.get("screenshot_base64") or ""
+    if not b64:
+        return "**Screenshot failed:** no image data returned."
+    return f"![Screenshot](data:image/jpeg;base64,{b64})"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Document export (export_document — app.core.exporter, not an MCP server)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _export_document_exec(raw: Any) -> Dict:
+    if not isinstance(raw, dict):
+        return {"error": _trunc(str(raw), 300)}
+    if raw.get("error") or not raw.get("success"):
+        return {"error": raw.get("error") or "Export failed."}
+    return {
+        "filename": raw.get("filename"),
+        "download_url": raw.get("download_url"),
+    }
+
+def _export_document_disp(raw: Any) -> str:
+    s = _export_document_exec(raw)
+    if "error" in s:
+        return f"**Export failed:** {s['error']}"
+    return f"📄 **[{s['filename']}]({s['download_url']})** is ready to download."
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Shaper registry
-
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _ShapeEntry = Tuple[Callable[[Any], Dict], Callable[[Any], str]]
@@ -736,11 +923,34 @@ _SHAPERS: Dict[str, _ShapeEntry] = {
     "upload_file":            (_drive_create_file_exec,       _drive_create_file_disp),
     "drive_read_file":        (_drive_read_file_exec,         _drive_read_file_disp),
     "google_drive_read_file": (_drive_read_file_exec,         _drive_read_file_disp),
-    
+
     # ── Google Sheets & Docs ─────────────────────────────────────────────────
     "sheets_read_range":      (_sheets_read_range_exec,       _sheets_read_range_disp),
     "sheets_update_range":    (_sheets_update_range_exec,     _sheets_update_range_disp),
     "docs_read_document":     (_docs_read_document_exec,      _docs_read_document_disp),
+
+    # ── Web scrape (Chat/Agent Mode's built-in tool, not an MCP server) ──────
+    "web_scrape":             (_web_scrape_exec,              _web_scrape_disp),
+
+    # ── Persistent browser session (app.core.browser_session) — also not
+    #    MCP servers. browser_navigate and browser_extract_text reuse the
+    #    web_scrape shapers directly: chat.py's executor loop already
+    #    normalizes all three into the identical result shape.
+    "browser_navigate":       (_web_scrape_exec,              _web_scrape_disp),
+    "browser_extract_text":   (_web_scrape_exec,              _web_scrape_disp),
+    "browser_click":          (_browser_click_exec,           _browser_click_disp),
+    "browser_fill":           (_browser_fill_exec,            _browser_fill_disp),
+    "browser_scroll":         (_browser_scroll_exec,          _browser_scroll_disp),
+    "browser_wait_for_selector": (_browser_wait_exec,         _browser_wait_disp),
+    "browser_screenshot":     (_browser_screenshot_exec,      _browser_screenshot_disp),
+    "browser_go_back":        (_browser_nav_history_exec,     _browser_nav_history_disp),
+    "browser_go_forward":     (_browser_nav_history_exec,     _browser_nav_history_disp),
+    "browser_list_tabs":      (_browser_list_tabs_exec,       _browser_list_tabs_disp),
+    "browser_switch_tab":     (_browser_switch_tab_exec,      _browser_switch_tab_disp),
+    "browser_close":          (_browser_close_exec,           _browser_close_disp),
+
+    # ── Document export (app.core.exporter) — also not an MCP server ────────
+    "export_document":        (_export_document_exec,         _export_document_disp),
 }
 
 
@@ -813,6 +1023,7 @@ def shape_accumulated_response(
     tool_name: str,
     accumulated_items: list,
     pages_fetched: int,
+    raw_items: Optional[list] = None,
 ) -> str:
     """
     Produce a single user-facing markdown card after all pages of an exhaustive
@@ -823,6 +1034,13 @@ def shape_accumulated_response(
         tool_name:        The MCP tool that was called.
         accumulated_items: List of shape_for_executor outputs, one per page.
         pages_fetched:    How many pages were fetched (for the footer note).
+        raw_items:        True (unshaped) tool output, one per page — used only
+                           by the single-page fallback below. display_fn is
+                           written to consume the same raw shape executor_fn
+                           does (it re-derives its own view internally), so it
+                           must never be handed executor_fn's already-shaped
+                           output — that renames/prunes fields and produces an
+                           empty-looking card.
     """
     if not accumulated_items:
         return "_No results returned._"
@@ -834,7 +1052,7 @@ def shape_accumulated_response(
         commits = _merge_list_field(accumulated_items, "commits")
         total = len(commits)
         lines = [
-            f"### 📊  Total commits: **{_num(total)}**{page_note}",
+            f"### Total commits: **{_num(total)}**{page_note}",
             "",
         ]
         if commits:
@@ -853,7 +1071,7 @@ def shape_accumulated_response(
     if tool_name == "list_issues":
         issues = _merge_list_field(accumulated_items, "issues")
         total = len(issues)
-        lines = [f"### 🐛  Total issues: **{_num(total)}**{page_note}", ""]
+        lines = [f"### Total issues: **{_num(total)}**{page_note}", ""]
         for iss in issues[:12]:
             num = iss.get("number", "")
             title = _trunc(iss.get("title", ""), 72)
@@ -867,7 +1085,7 @@ def shape_accumulated_response(
     if tool_name in ("list_messages", "search_messages"):
         messages = _merge_list_field(accumulated_items, "messages")
         total = len(messages)
-        lines = [f"### 📧  Total emails: **{_num(total)}**{page_note}", ""]
+        lines = [f"### Total emails: **{_num(total)}**{page_note}", ""]
         for m in messages[:10]:
             subj = _trunc(m.get("subject", "(no subject)"), 60)
             sender = m.get("from", "")
@@ -881,19 +1099,20 @@ def shape_accumulated_response(
     if tool_name in ("list_files", "search_files"):
         files = _merge_list_field(accumulated_items, "files")
         total = len(files)
-        lines = [f"### 📁  Total files: **{_num(total)}**{page_note}", ""]
+        lines = [f"### Total files: **{_num(total)}**{page_note}", ""]
         for f in files[:12]:
             name = _trunc(f.get("name", ""), 60)
             mime = f.get("mimeType", "")
             modified = f.get("modifiedTime", "")
-            lines.append(f"- 📄 **{name}** — `{mime}` · {modified}")
+            lines.append(f"- **{name}** — `{mime}` · {modified}")
         if total > 12:
             lines.append(f"\n*…and {total - 12} more*")
         return "\n".join(lines)
 
     # ── Generic single-page fallback ──────────────────────────────────────────
     if len(accumulated_items) == 1:
-        return shape_for_display(tool_name, accumulated_items[0])
+        raw = raw_items[0] if raw_items else accumulated_items[0]
+        return shape_for_display(tool_name, raw)
 
     # ── Generic multi-page fallback: just count items ─────────────────────────
     # Try to find the first list field and count across pages
@@ -907,4 +1126,3 @@ def shape_accumulated_response(
     if total_items:
         return f"**{_num(total_items)} total items** fetched across {pages_fetched} pages."
     return f"**{pages_fetched} pages** of results fetched successfully."
-

@@ -67,43 +67,43 @@ export default function MemoryViewer({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <div className="fixed inset-y-0 right-0 w-96 bg-white shadow-2xl border-l border-gray-200 z-50 flex flex-col transform transition-transform duration-300">
-      <div className="h-16 px-6 border-b border-gray-100 flex items-center justify-between flex-shrink-0 bg-gray-50/50">
-        <h2 className="text-sm font-bold text-gray-900 tracking-tight flex items-center gap-2">
+    <div className="fixed inset-y-0 right-0 w-96 bg-aegis-raised shadow-2xl border-l border-aegis-border z-50 flex flex-col transform transition-transform duration-300">
+      <div className="h-16 px-6 border-b border-aegis-border flex items-center justify-between flex-shrink-0 bg-aegis-overlay/50">
+        <h2 className="text-sm font-bold text-aegis-text-primary tracking-tight flex items-center gap-2">
           Global Memory Store
         </h2>
-        <button onClick={onClose} className="p-2 hover:bg-gray-200 rounded-full text-gray-500 transition-colors">
+        <button onClick={onClose} className="p-2 hover:bg-aegis-overlay rounded-full text-aegis-text-secondary transition-colors">
           <X className="w-4 h-4" />
         </button>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-[#F8F9FA]">
+      <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-aegis-base">
         {loading ? (
           <div className="flex justify-center py-10">
-            <Loader2 className="w-6 h-6 animate-spin text-indigo-500" />
+            <Loader2 className="w-6 h-6 animate-spin text-aegis-primary-light" />
           </div>
         ) : memories.length === 0 ? (
-          <div className="text-center py-10 text-xs text-gray-400">
+          <div className="text-center py-10 text-xs text-aegis-text-muted">
             No memories saved yet.
           </div>
         ) : (
           memories.map((m) => (
-            <div key={m.id} className="bg-white border border-gray-200 rounded-xl p-4 shadow-sm flex flex-col gap-2 relative group">
+            <div key={m.id} className="bg-aegis-raised border border-aegis-border rounded-xl p-4 shadow-sm flex flex-col gap-2 relative group">
               {editingId === m.id ? (
                 <div className="space-y-2">
                   <input
                     value={editLabel}
                     onChange={(e) => setEditLabel(e.target.value)}
-                    className="w-full text-sm font-semibold border-b border-gray-300 focus:border-indigo-500 outline-none pb-1"
+                    className="w-full text-sm font-semibold border-b border-aegis-border focus:border-aegis-primary outline-none pb-1"
                   />
                   <textarea
                     value={editData}
                     onChange={(e) => setEditData(e.target.value)}
-                    className="w-full text-xs font-mono bg-gray-50 border border-gray-200 rounded p-2 h-24 outline-none focus:border-indigo-500"
+                    className="w-full text-xs font-mono bg-aegis-overlay border border-aegis-border rounded p-2 h-24 outline-none focus:border-aegis-primary"
                   />
                   <div className="flex justify-end gap-2">
-                    <button onClick={() => setEditingId(null)} className="text-xs text-gray-500 hover:text-gray-900">Cancel</button>
-                    <button onClick={() => saveEdit(m.id)} className="text-xs flex items-center gap-1 bg-indigo-600 text-white px-2 py-1 rounded hover:bg-indigo-700">
+                    <button onClick={() => setEditingId(null)} className="text-xs text-aegis-text-secondary hover:text-aegis-text-primary">Cancel</button>
+                    <button onClick={() => saveEdit(m.id)} className="text-xs flex items-center gap-1 bg-aegis-primary text-white px-2 py-1 rounded hover:bg-aegis-primary-dark">
                       <Save className="w-3 h-3" /> Save
                     </button>
                   </div>
@@ -112,24 +112,24 @@ export default function MemoryViewer({ onClose }: { onClose: () => void }) {
                 <>
                   <div className="flex items-start justify-between">
                     <div>
-                      <h3 className="text-sm font-semibold text-gray-900">{m.label}</h3>
-                      <span className="text-[10px] uppercase font-bold text-gray-400 tracking-wider">
+                      <h3 className="text-sm font-semibold text-aegis-text-primary">{m.label}</h3>
+                      <span className="text-[10px] uppercase font-bold text-aegis-text-muted tracking-wider">
                         {m.entity_type.replace('_', ' ')}
                       </span>
                     </div>
                     <div className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1">
-                      <button onClick={() => startEdit(m)} className="p-1.5 text-gray-400 hover:text-indigo-600 hover:bg-indigo-50 rounded">
+                      <button onClick={() => startEdit(m)} className="p-1.5 text-aegis-text-muted hover:text-aegis-primary-light hover:bg-aegis-primary/10 rounded">
                         <Edit2 className="w-3.5 h-3.5" />
                       </button>
-                      <button onClick={() => handleDelete(m.id)} className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded">
+                      <button onClick={() => handleDelete(m.id)} className="p-1.5 text-aegis-text-muted hover:text-aegis-error hover:bg-aegis-error/10 rounded">
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
                     </div>
                   </div>
-                  <pre className="text-[10px] text-gray-600 bg-gray-50 p-2 rounded border border-gray-100 overflow-x-auto whitespace-pre-wrap max-h-32">
+                  <pre className="text-[10px] text-aegis-text-secondary bg-aegis-overlay p-2 rounded border border-aegis-border overflow-x-auto whitespace-pre-wrap max-h-32">
                     {m.data_json}
                   </pre>
-                  <div className="text-[10px] text-gray-400 flex justify-between mt-1">
+                  <div className="text-[10px] text-aegis-text-muted flex justify-between mt-1">
                     <span>{new Date(m.created_at).toLocaleDateString()}</span>
                     <span className="truncate max-w-[120px]" title={m.conversation_id}>
                       Thread: {m.conversation_id.slice(0, 8)}...

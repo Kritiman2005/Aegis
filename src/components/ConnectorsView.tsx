@@ -151,18 +151,18 @@ function ApiKeyModal({ connector, onClose, onConnect }: ApiKeyModalProps) {
   };
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
-      <div className="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-sm mx-4">
+      <div className="bg-aegis-raised border border-aegis-border rounded-2xl shadow-2xl p-6 w-full max-w-sm mx-4">
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-gray-50 border border-gray-200 flex items-center justify-center">
+            <div className="w-10 h-10 rounded-xl bg-aegis-overlay border border-aegis-border flex items-center justify-center">
               {connector.icon}
             </div>
             <div>
-              <h3 className="text-sm font-bold text-gray-900">{connector.displayName}</h3>
-              <p className="text-xs text-gray-500">Enter your access token</p>
+              <h3 className="text-sm font-bold text-aegis-text-primary">{connector.displayName}</h3>
+              <p className="text-xs text-aegis-text-secondary">Enter your access token</p>
             </div>
           </div>
-          <button onClick={onClose} className="p-1 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors">
+          <button onClick={onClose} className="p-1 text-aegis-text-muted hover:text-aegis-text-primary rounded-lg hover:bg-aegis-overlay transition-colors">
             <X className="w-4 h-4" />
           </button>
         </div>
@@ -172,19 +172,19 @@ function ApiKeyModal({ connector, onClose, onConnect }: ApiKeyModalProps) {
             placeholder="figd_xxxxxxxxxxxxxxxxxxxx"
             value={value}
             onChange={e => { setValue(e.target.value); setError(''); }}
-            className="w-full px-3 py-2.5 text-sm border border-gray-200 rounded-xl focus:outline-none focus:border-[#5B50F0] focus:ring-2 focus:ring-[#5B50F0]/10 transition-all"
+            className="w-full px-3 py-2.5 text-sm bg-aegis-overlay text-aegis-text-primary border border-aegis-border rounded-xl focus:outline-none focus:border-aegis-primary focus:ring-2 focus:ring-aegis-primary/10 transition-all"
           />
-          {error && <p className="text-xs text-red-500">{error}</p>}
-          <p className="text-xs text-gray-400">
+          {error && <p className="text-xs text-aegis-error">{error}</p>}
+          <p className="text-xs text-aegis-text-muted">
             Get your token from{' '}
-            <a href="https://www.figma.com/settings" target="_blank" rel="noreferrer" className="text-[#5B50F0] hover:underline">
+            <a href="https://www.figma.com/settings" target="_blank" rel="noreferrer" className="text-aegis-primary-light hover:underline">
               figma.com/settings
             </a>
             {' '}→ Personal access tokens.
           </p>
           <button
             onClick={handleSubmit}
-            className="w-full py-2.5 bg-[#5B50F0] hover:bg-[#4A40E0] text-white text-sm font-semibold rounded-xl transition-colors"
+            className="w-full py-2.5 bg-aegis-primary hover:bg-aegis-primary-dark text-white text-sm font-semibold rounded-xl transition-colors"
           >
             Connect Figma
           </button>
@@ -268,24 +268,24 @@ export default function ConnectorsView() {
   const popularConnectors = CONNECTOR_DEFS.slice(0, 3);
 
   return (
-    <div className="flex-1 overflow-y-auto bg-[#F4F5F7] p-8">
+    <div className="flex-1 overflow-y-auto bg-aegis-base p-8">
       <div className="max-w-4xl">
         
         {/* Header */}
         <div className="mb-6">
-          <h1 className="text-2xl font-bold text-gray-900">Connectors</h1>
-          <p className="text-sm text-gray-500 mt-1">Connect your tools so Aegis can take action across your workspace.</p>
+          <h1 className="text-2xl font-bold text-aegis-text-primary">Connectors</h1>
+          <p className="text-sm text-aegis-text-secondary mt-1">Connect your tools so Aegis can take action across your workspace.</p>
         </div>
 
         {/* Search Bar */}
         <div className="relative mb-5">
-          <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+          <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-aegis-text-muted" />
           <input
             type="text"
             placeholder="Search connectors..."
             value={searchQuery}
             onChange={e => setSearchQuery(e.target.value)}
-            className="w-full pl-11 pr-4 py-3 bg-white border border-gray-200 rounded-2xl text-sm text-gray-900 placeholder:text-gray-400 focus:outline-none focus:border-[#5B50F0] focus:ring-2 focus:ring-[#5B50F0]/10 transition-all shadow-sm"
+            className="w-full pl-11 pr-4 py-3 bg-aegis-raised border border-aegis-border rounded-2xl text-sm text-aegis-text-primary placeholder:text-aegis-text-muted focus:outline-none focus:border-aegis-primary focus:ring-2 focus:ring-aegis-primary/10 transition-all"
           />
         </div>
 
@@ -296,8 +296,8 @@ export default function ConnectorsView() {
               onClick={() => setActiveTab('all')}
               className={`px-4 py-1.5 rounded-full text-sm font-semibold transition-colors ${
                 activeTab === 'all'
-                  ? 'bg-gray-900 text-white'
-                  : 'bg-white text-gray-700 border border-gray-200 hover:bg-gray-50'
+                  ? 'bg-aegis-primary text-white'
+                  : 'bg-aegis-raised text-aegis-text-secondary border border-aegis-border hover:bg-aegis-overlay'
               }`}
             >
               All connectors
@@ -306,18 +306,18 @@ export default function ConnectorsView() {
               onClick={() => setActiveTab('connected')}
               className={`px-4 py-1.5 rounded-full text-sm font-medium transition-colors ${
                 activeTab === 'connected'
-                  ? 'bg-gray-900 text-white font-semibold'
-                  : 'bg-white text-gray-700 border border-gray-200 hover:bg-gray-50'
+                  ? 'bg-aegis-primary text-white font-semibold'
+                  : 'bg-aegis-raised text-aegis-text-secondary border border-aegis-border hover:bg-aegis-overlay'
               }`}
             >
               Connected
             </button>
           </div>
           <div className="flex items-center gap-2">
-            <button className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-gray-200 rounded-full text-sm text-gray-600 hover:bg-gray-50 transition-colors">
+            <button className="flex items-center gap-1.5 px-3 py-1.5 bg-aegis-raised border border-aegis-border rounded-full text-sm text-aegis-text-secondary hover:bg-aegis-overlay transition-colors">
               Filter by <ChevronDown className="w-3.5 h-3.5" />
             </button>
-            <button className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-gray-200 rounded-full text-sm text-gray-600 hover:bg-gray-50 transition-colors">
+            <button className="flex items-center gap-1.5 px-3 py-1.5 bg-aegis-raised border border-aegis-border rounded-full text-sm text-aegis-text-secondary hover:bg-aegis-overlay transition-colors">
               Sort by <ChevronDown className="w-3.5 h-3.5" />
             </button>
           </div>
@@ -326,27 +326,27 @@ export default function ConnectorsView() {
         {/* Popular Section (only when showing all, no search) */}
         {activeTab === 'all' && !searchQuery && (
           <div className="mb-6">
-            <p className="text-xs font-bold uppercase tracking-widest text-gray-400 mb-3">Popular</p>
+            <p className="text-xs font-bold uppercase tracking-widest text-aegis-text-muted mb-3">Popular</p>
             <div className="grid grid-cols-3 gap-3">
               {popularConnectors.map(def => {
                 const connected = isConnected(def);
                 return (
                   <div
                     key={def.name + '-popular'}
-                    className="bg-white rounded-2xl border border-gray-200 p-4 flex items-center justify-between shadow-sm hover:shadow-md transition-shadow"
+                    className="bg-aegis-raised rounded-2xl border border-aegis-border p-4 flex items-center justify-between hover:border-aegis-primary/40 transition-colors"
                   >
                     <div className="flex items-center gap-3">
-                      <div className="w-8 h-8 rounded-xl bg-gray-50 border border-gray-100 flex items-center justify-center">
+                      <div className="w-8 h-8 rounded-xl bg-aegis-overlay border border-aegis-border flex items-center justify-center">
                         {def.icon}
                       </div>
-                      <span className="text-sm font-semibold text-gray-800">{def.displayName}</span>
+                      <span className="text-sm font-semibold text-aegis-text-primary">{def.displayName}</span>
                     </div>
                     {connected ? (
-                      <Settings className="w-4 h-4 text-gray-400 cursor-pointer hover:text-[#5B50F0] transition-colors" />
+                      <Settings className="w-4 h-4 text-aegis-text-muted cursor-pointer hover:text-aegis-primary-light transition-colors" />
                     ) : (
                       <button
                         onClick={() => handleConnect(def)}
-                        className="w-7 h-7 rounded-full bg-gray-100 hover:bg-[#5B50F0] hover:text-white text-gray-500 flex items-center justify-center transition-colors"
+                        className="w-7 h-7 rounded-full bg-aegis-overlay hover:bg-aegis-primary hover:text-white text-aegis-text-secondary flex items-center justify-center transition-colors"
                       >
                         <Plus className="w-3.5 h-3.5" />
                       </button>
@@ -365,33 +365,33 @@ export default function ConnectorsView() {
             return (
               <div
                 key={def.name}
-                className="bg-white rounded-2xl border border-gray-200 p-5 shadow-sm hover:shadow-md transition-all"
+                className="bg-aegis-raised rounded-2xl border border-aegis-border p-5 hover:border-aegis-primary/40 transition-all"
               >
                 {/* Card Header */}
                 <div className="flex items-start justify-between mb-3">
                   <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-xl bg-gray-50 border border-gray-100 flex items-center justify-center">
+                    <div className="w-10 h-10 rounded-xl bg-aegis-overlay border border-aegis-border flex items-center justify-center">
                       {def.icon}
                     </div>
                     <div>
                       <div className="flex items-center gap-1.5">
-                        <span className="text-sm font-bold text-gray-900">{def.displayName}</span>
+                        <span className="text-sm font-bold text-aegis-text-primary">{def.displayName}</span>
                         {connected && (
-                          <CheckCircle className="w-4 h-4 text-[#5B50F0]" />
+                          <CheckCircle className="w-4 h-4 text-aegis-primary-light" />
                         )}
                       </div>
-                      <p className="text-xs text-gray-400">{def.popularity}</p>
+                      <p className="text-xs text-aegis-text-muted">{def.popularity}</p>
                     </div>
                   </div>
 
                   {connected ? (
-                    <button className="p-1.5 text-gray-400 hover:text-[#5B50F0] hover:bg-indigo-50 rounded-lg transition-colors">
+                    <button className="p-1.5 text-aegis-text-muted hover:text-aegis-primary-light hover:bg-aegis-overlay rounded-lg transition-colors">
                       <Settings className="w-4 h-4" />
                     </button>
                   ) : (
                     <button
                       onClick={() => handleConnect(def)}
-                      className="w-7 h-7 rounded-full bg-gray-100 hover:bg-[#5B50F0] hover:text-white text-gray-500 flex items-center justify-center transition-colors"
+                      className="w-7 h-7 rounded-full bg-aegis-overlay hover:bg-aegis-primary hover:text-white text-aegis-text-secondary flex items-center justify-center transition-colors"
                     >
                       <Plus className="w-3.5 h-3.5" />
                     </button>
@@ -399,18 +399,18 @@ export default function ConnectorsView() {
                 </div>
 
                 {/* Description */}
-                <p className="text-xs text-gray-600 leading-relaxed mb-3">{def.description}</p>
+                <p className="text-xs text-aegis-text-secondary leading-relaxed mb-3">{def.description}</p>
 
                 {/* Status */}
                 {connected ? (
                   <div className="flex items-center gap-1.5">
                     <span className="w-1.5 h-1.5 rounded-full bg-green-500 inline-block" />
-                    <span className="text-xs font-semibold text-green-600">Connected</span>
+                    <span className="text-xs font-semibold text-aegis-success">Connected</span>
                   </div>
                 ) : (
                   <button
                     onClick={() => handleConnect(def)}
-                    className="text-xs font-semibold text-[#5B50F0] hover:underline"
+                    className="text-xs font-semibold text-aegis-primary-light hover:underline"
                   >
                     Connect →
                   </button>

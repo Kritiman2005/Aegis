@@ -39,6 +39,14 @@ dist-info/
 *.sqlite3
 qdrant_db/
 backend/qdrant_db/
+# Whisper model — downloaded by scripts/download_whisper_model.py at build
+# time (see app/core/transcription.py), not committed.
+backend/app/whisper_bundled/
+# Playwright's Chromium binary — downloaded on demand into AEGIS_DATA_DIR
+# normally (see app/core/scraper.py), but falls back to this repo-root path
+# when AEGIS_DATA_DIR isn't set (e.g. running the backend directly outside
+# Electron) — never committed either way.
+browsers/
 
 # ─── Environment Variables ───────────────────────────────
 .env
