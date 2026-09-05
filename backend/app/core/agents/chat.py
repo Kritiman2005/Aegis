@@ -1494,10 +1494,32 @@ Output valid JSON only. Example: {{"is_export": true, "format": "docx", "parts":
                     _db.close()
 
             loop = _asyncio.get_running_loop()
+            still_processing = True
             for _ in range(20):  # ~20s ceiling, then proceed best-effort
                 if await loop.run_in_executor(db_executor, _all_ready, attached_ids):
+                    still_processing = False
                     break
                 await _asyncio.sleep(1)
+
+            # Past the ceiling with ingestion still not done — this is the
+            # ONLY turn that knows that; every other RAG-search codepath
+            # below has no way to tell "no context because there's nothing
+            # to find" apart from "no context because it isn't ready yet",
+            # and left alone will produce exactly the confusing "I can't
+            # access files" reply instead of "give it a moment". A first
+            # document upload can genuinely take a while the very first
+            # time (embedding/reranker models finish loading in the
+            # background — see main.py's startup preload and the
+            # _model_init_lock note in rag/processor.py), so say so
+            # explicitly rather than silently pretending nothing is attached.
+            if still_processing:
+                return (
+                    "[SYSTEM NOTE]: The document(s) attached to this message are still being "
+                    "processed (this can take longer than usual the first time, while local "
+                    "search models finish loading) — their content is not available yet. Tell "
+                    "the user their document is still processing and to try their question "
+                    "again in a moment. Do NOT claim you have no way to access uploaded files."
+                )
 
         if status_callback:
             await status_callback("Searching your documents...")

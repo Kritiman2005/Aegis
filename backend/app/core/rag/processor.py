@@ -49,6 +49,19 @@ _ocr_reader     = None
 # touch it at the same instant.
 _qdrant_lock = threading.Lock()
 
+# Guards first-time initialization of the four lazy singletons below. Without
+# this, main.py's startup preload thread (_preload_embedding_models) and a
+# real ingestion/search request landing moments later can both see e.g.
+# _dense_model is None at the same time and both start downloading/loading
+# the same multi-hundred-MB model concurrently — doubling the network/disk
+# work (and risking two processes writing the same on-disk model cache at
+# once) instead of the second caller just waiting for the first's result.
+# This is the actual cause of "ingestion takes forever" on a fresh install:
+# not that a document is slow to process, but that two full model loads
+# were racing each other for it. Double-checked locking (check outside the
+# lock, re-check inside it) keeps the normal warm-model path lock-free.
+_model_init_lock = threading.Lock()
+
 
 def init_qdrant():
     """Called on FastAPI startup to bind QdrantClient to the main event loop thread."""
@@ -83,36 +96,44 @@ def get_qdrant_client():
 def get_dense_model():
     global _dense_model
     if _dense_model is None:
-        from fastembed import TextEmbedding  # lazy import — pulls torch
-        logger.info("Initializing Dense Embedding Model...")
-        _dense_model = TextEmbedding("BAAI/bge-small-en-v1.5")
+        with _model_init_lock:
+            if _dense_model is None:  # re-check: another thread may have just finished this
+                from fastembed import TextEmbedding  # lazy import — pulls torch
+                logger.info("Initializing Dense Embedding Model...")
+                _dense_model = TextEmbedding("BAAI/bge-small-en-v1.5")
     return _dense_model
 
 
 def get_sparse_model():
     global _sparse_model
     if _sparse_model is None:
-        from fastembed import SparseTextEmbedding  # lazy import — pulls torch
-        logger.info("Initializing Sparse Embedding Model...")
-        _sparse_model = SparseTextEmbedding("Qdrant/bm25")
+        with _model_init_lock:
+            if _sparse_model is None:
+                from fastembed import SparseTextEmbedding  # lazy import — pulls torch
+                logger.info("Initializing Sparse Embedding Model...")
+                _sparse_model = SparseTextEmbedding("Qdrant/bm25")
     return _sparse_model
 
 
 def get_reranker():
     global _reranker
     if _reranker is None:
-        from sentence_transformers import CrossEncoder  # lazy import — pulls torch
-        logger.info("Initializing CrossEncoder Reranker...")
-        _reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        with _model_init_lock:
+            if _reranker is None:
+                from sentence_transformers import CrossEncoder  # lazy import — pulls torch
+                logger.info("Initializing CrossEncoder Reranker...")
+                _reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
     return _reranker
 
 
 def get_ocr_reader():
     global _ocr_reader
     if _ocr_reader is None:
-        import easyocr  # lazy import — pulls torch
-        logger.info("Initializing EasyOCR reader (this might take a moment)...")
-        _ocr_reader = easyocr.Reader(['en'], gpu=False)
+        with _model_init_lock:
+            if _ocr_reader is None:
+                import easyocr  # lazy import — pulls torch
+                logger.info("Initializing EasyOCR reader (this might take a moment)...")
+                _ocr_reader = easyocr.Reader(['en'], gpu=False)
     return _ocr_reader
 
 
