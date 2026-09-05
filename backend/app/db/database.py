@@ -53,6 +53,19 @@ def init_db():
             conn.execute(text("ALTER TABLE chat_messages ADD COLUMN msg_type TEXT"))
             conn.commit()
 
+        # Vision support (see ModelRegistry's own comment): an existing
+        # install's models table predates these columns entirely.
+        existing_model_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(models)"))}
+        for col, ddl in (
+            ("is_vision", "ALTER TABLE models ADD COLUMN is_vision BOOLEAN DEFAULT 0"),
+            ("mmproj_filename", "ALTER TABLE models ADD COLUMN mmproj_filename TEXT"),
+            ("mmproj_path", "ALTER TABLE models ADD COLUMN mmproj_path TEXT"),
+            ("mmproj_status", "ALTER TABLE models ADD COLUMN mmproj_status TEXT"),
+        ):
+            if col not in existing_model_cols:
+                conn.execute(text(ddl))
+                conn.commit()
+
 
     # Setup FTS5 for MCP Tools
     from sqlalchemy import text

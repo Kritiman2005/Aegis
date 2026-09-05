@@ -38,6 +38,10 @@
       {
         "from": "out",
         "to": "out"
+      },
+      {
+        "from": "assets",
+        "to": "assets"
       }
     ],
     "mac": {

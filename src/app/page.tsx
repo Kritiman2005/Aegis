@@ -236,7 +236,18 @@ export default function Home() {
 
       {/* Main content */}
       <div className="flex-1 flex flex-col min-w-0 h-full overflow-hidden">
-        {activeTab === 'chat' && (
+        {/* Kept mounted and just hidden (rather than conditionally
+            rendered like every other tab below) when navigating away —
+            ChatView carries a lot of its own local state (the composer's
+            in-progress text, scroll position, pending attachments, the
+            doc-status polling effect) that a full unmount/remount would
+            silently wipe every time, plus the cost of re-rendering the
+            entire message history and re-running every mount effect from
+            scratch. That combination is what was showing up as "laggy,
+            and I can't type" when coming back to chat after visiting
+            another tab — display:none preserves all of it instead of
+            tearing the component down and rebuilding it. */}
+        <div className={activeTab === 'chat' ? 'contents' : 'hidden'}>
           <ChatView
             messages={messages}
             status={status}
@@ -254,7 +265,7 @@ export default function Home() {
             onOpenContextPanel={() => setActiveTab('context')}
             onOpenMarketplace={() => setActiveTab('marketplace')}
           />
-        )}
+        </div>
         {(activeTab === 'connectors' || activeTab === 'sync_detail') && (
           <ConnectorsView />
         )}

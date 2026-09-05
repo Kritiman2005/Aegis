@@ -120,17 +120,32 @@ async def upload_document(
     # app.api.websocket's message handler and app.core.agents.chat's
     # _handle_idle(attachments=...).
 
-    logger.info(f"Received document upload: {file.filename} -> starting background RAG ingestion.")
+    # An image is a special case when a vision model is active: it'll be
+    # sent to the model directly as real vision input at send-time (see
+    # BaseAgent._attach_vision_images), so running OCR/RAG on it here would
+    # be pure wasted latency and compute for content nothing will ever read.
+    # Skip ingestion entirely rather than just not waiting on it — this
+    # image's content is only ever available live in-context on the turn
+    # it's attached, not indexed for later search, which is the deliberate
+    # trade-off of going all-in on vision over OCR for these images.
+    from app.db.crud import get_active_vision_mmproj_path
+    skip_ocr = ext in ("png", "jpg", "jpeg") and get_active_vision_mmproj_path(db) is not None
 
-    # Process asynchronously via BackgroundTasks to immediately return HTTP 200
-    background_tasks.add_task(
-        async_process_upload_task,
-        doc_id=doc.id,
-        file_path=doc.file_path,
-        file_type=doc.file_type,
-        filename=doc.filename,
-        conversation_id=conversation_id
-    )
+    if skip_ocr:
+        doc.status = "ready"
+        db.commit()
+        logger.info(f"Skipping OCR for image upload '{file.filename}' — vision model active, will be sent as real image input instead.")
+    else:
+        logger.info(f"Received document upload: {file.filename} -> starting background RAG ingestion.")
+        # Process asynchronously via BackgroundTasks to immediately return HTTP 200
+        background_tasks.add_task(
+            async_process_upload_task,
+            doc_id=doc.id,
+            file_path=doc.file_path,
+            file_type=doc.file_type,
+            filename=doc.filename,
+            conversation_id=conversation_id
+        )
 
     return {
         "message": "Upload successful and processing started.",

@@ -10,15 +10,16 @@ logger = logging.getLogger(__name__)
 class ExecutorAgent(BaseAgent):
     """Responsible for generating exact JSON arguments for a single tool call."""
     
-    def generate_arguments(self, 
-                           tool_name: str, 
-                           tool_schema: dict, 
-                           overall_plan: list, 
-                           step_reason: str, 
-                           prior_results: dict, 
+    def generate_arguments(self,
+                           tool_name: str,
+                           tool_schema: dict,
+                           overall_plan: list,
+                           step_reason: str,
+                           prior_results: dict,
                            entity_context: str,
-                           user_request: str) -> dict:
-        
+                           user_request: str,
+                           retry_note: str = "") -> dict:
+
         llm = self.get_llm()
         if not llm:
             logger.error("LLM not loaded for ExecutorAgent.")
@@ -37,9 +38,13 @@ class ExecutorAgent(BaseAgent):
             entity_context=entity_context
         )
 
+        user_content = f"Chat History:\n{user_request}\n\nPlease generate the exact arguments for `{tool_name}`."
+        if retry_note:
+            user_content += retry_note
+
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Chat History:\n{user_request}\n\nPlease generate the exact arguments for `{tool_name}`."}
+            {"role": "user", "content": user_content}
         ]
         
         try:

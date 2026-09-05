@@ -444,7 +444,7 @@ export function useSocket() {
   // ── Public API ───────────────────────────────────────────────────────────────
 
   const sendMessage = useCallback(
-    (content: string, msgType: string = 'message', mode: string = 'chat', userPrompt?: string, attachments?: Attachment[]): boolean => {
+    (content: string, msgType: string = 'message', mode: string = 'chat', userPrompt?: string, attachments?: Attachment[], exportFormat?: string): boolean => {
       const trimmed = content.trim();
       // Claude-style: a message can be attachments alone with no typed text.
       if (!trimmed && !(attachments && attachments.length > 0)) return false;
@@ -488,7 +488,7 @@ export function useSocket() {
       }
 
       socketRef.current.send(
-        JSON.stringify({ type: msgType, content: trimmed, mode, user_prompt: userPrompt, attachments })
+        JSON.stringify({ type: msgType, content: trimmed, mode, user_prompt: userPrompt, attachments, export_format: exportFormat })
       );
       return true;
     },

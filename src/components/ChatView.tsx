@@ -21,6 +21,7 @@ import {
   ChevronRight,
   Mic,
   Square,
+  Download,
 } from 'lucide-react';
 import { type ChatMessage, type ConnectionStatus, type Attachment } from '@/hooks/useSocket';
 import { useAppSelector } from '@/hooks/useStore';
@@ -73,7 +74,7 @@ interface ChatViewProps {
   messages: ChatMessage[];
   status: ConnectionStatus;
   isStreaming: boolean;
-  onSendMessage: (msg: string, msgType?: string, mode?: string, userPrompt?: string, attachments?: Attachment[]) => boolean;
+  onSendMessage: (msg: string, msgType?: string, mode?: string, userPrompt?: string, attachments?: Attachment[], exportFormat?: string) => boolean;
   onCancelGeneration?: () => void;
   onClearMessages: () => void;
   activeConnectorName?: string;
@@ -134,10 +135,14 @@ export default function ChatView({
   // resolved by polling — attachment messages themselves never change once
   // created, so this is the only way a chip's spinner turns into a check/x.
   const [docStatuses, setDocStatuses] = useState<Record<number, DocStatus>>({});
+  // Uploaded-but-not-yet-sent attachments, shown as removable chips above
+  // the composer — Claude-style: attach, optionally type text, then send.
+  const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>([]);
 
   useEffect(() => {
     const pendingIds = messages
       .flatMap(m => m.attachments || [])
+      .concat(pendingAttachments)
       .map(a => a.document_id)
       .filter(id => docStatuses[id] === undefined || docStatuses[id] === 'processing');
     if (pendingIds.length === 0 || !sessionId) return;
@@ -263,9 +268,6 @@ export default function ChatView({
   // Document Upload State
   const [isUploading, setIsUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // Uploaded-but-not-yet-sent attachments, shown as removable chips above
-  // the composer — Claude-style: attach, optionally type text, then send.
-  const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>([]);
 
   // "+" attach menu: Upload Document / Tools / Skills
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
@@ -274,6 +276,12 @@ export default function ChatView({
   const [isScraping, setIsScraping] = useState(false);
   const skillFileInputRef = useRef<HTMLInputElement>(null);
   const [isUploadingSkill, setIsUploadingSkill] = useState(false);
+
+  // "+" > Export: picks the format up front instead of relying on the
+  // agent to guess export intent from free text. Chat Mode only — Agent
+  // Mode has no export tool at all (see backend chat.py's _get_local_tools
+  // docstring) and just nudges back to Chat Mode.
+  const [pendingExportFormat, setPendingExportFormat] = useState<'pdf' | 'docx' | 'xlsx' | null>(null);
 
   // Installed Tools/Skills for THIS conversation, with their per-chat
   // on/off state — the "+" menu's Claude-Desktop-style toggle list.
@@ -562,12 +570,24 @@ export default function ChatView({
     }
   }, [messages, streamingContent]);
 
+  const hasProcessingAttachment = pendingAttachments.some(
+    a => docStatuses[a.document_id] === undefined || docStatuses[a.document_id] === 'processing'
+  );
+
   const handleSend = () => {
-    if ((!inputVal.trim() && pendingAttachments.length === 0) || isStreaming || status !== 'connected') return;
-    const sent = onSendMessage(inputVal, 'message', chatMode, undefined, pendingAttachments.length > 0 ? pendingAttachments : undefined);
+    if ((!inputVal.trim() && pendingAttachments.length === 0) || isStreaming || status !== 'connected' || hasProcessingAttachment) return;
+    const sent = onSendMessage(
+      inputVal,
+      'message',
+      chatMode,
+      undefined,
+      pendingAttachments.length > 0 ? pendingAttachments : undefined,
+      pendingExportFormat || undefined
+    );
     if (sent) {
       setInputVal('');
       setPendingAttachments([]);
+      setPendingExportFormat(null);
       if (textareaRef.current) {
         textareaRef.current.style.height = 'auto';
       }
@@ -755,6 +775,7 @@ export default function ChatView({
               onClick={() => {
                 if (chatMode === 'chat') onSendMessage('__system_mode_switch__', 'system');
                 setChatMode('agent');
+                setPendingExportFormat(null);
               }}
               className={`relative z-10 flex-1 py-1.5 rounded-md text-xs font-semibold transition-colors ${
                 chatMode === 'agent' ? 'text-aegis-primary-light' : 'text-aegis-text-secondary'
@@ -765,6 +786,24 @@ export default function ChatView({
           </div>
         </div>
 
+        {pendingExportFormat && (
+          <div className="flex flex-wrap gap-2 mb-2">
+            <div className="flex items-center gap-2 bg-aegis-raised border border-aegis-border rounded-xl pl-3 pr-2 py-2">
+              <Download className="w-3.5 h-3.5 text-aegis-primary-light flex-shrink-0" />
+              <span className="text-[12px] text-aegis-text-primary">
+                Will export your next answer as {pendingExportFormat.toUpperCase()}
+              </span>
+              <button
+                onClick={() => setPendingExportFormat(null)}
+                className="text-aegis-text-muted hover:text-aegis-error p-0.5"
+                title="Cancel export"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+        )}
+
         {pendingAttachments.length > 0 && (
           <div className="flex flex-wrap gap-2 mb-2">
             {pendingAttachments.map(a => (
@@ -774,6 +813,13 @@ export default function ChatView({
               >
                 <FileText className="w-3.5 h-3.5 text-aegis-primary-light flex-shrink-0" />
                 <span className="text-[12px] text-aegis-text-primary truncate max-w-[160px]">{a.filename}</span>
+                {docStatuses[a.document_id] === 'failed' ? (
+                  <XCircle className="w-3.5 h-3.5 text-aegis-error flex-shrink-0" />
+                ) : docStatuses[a.document_id] === 'ready' ? (
+                  <CheckCircle2 className="w-3.5 h-3.5 text-aegis-success flex-shrink-0" />
+                ) : (
+                  <Loader2 className="w-3.5 h-3.5 text-aegis-text-muted animate-spin flex-shrink-0" />
+                )}
                 <button
                   onClick={() => setPendingAttachments(prev => prev.filter(p => p.document_id !== a.document_id))}
                   className="text-aegis-text-muted hover:text-aegis-error p-0.5"
@@ -830,7 +876,7 @@ export default function ChatView({
             }}
             onKeyDown={handleKeyDown}
             placeholder={status === 'connected' ? (chatMode === 'agent' ? 'Ask Agent to perform a task...' : 'Message Aegis...') : 'Connecting to backend...'}
-            disabled={status !== 'connected'}
+            disabled={status !== 'connected' || isStreaming}
             rows={1}
             className="w-full bg-transparent text-xs text-aegis-text-primary placeholder:text-aegis-text-muted resize-none px-4 pt-3.5 pb-12 focus:outline-none leading-relaxed"
             style={{ minHeight: '52px' }}
@@ -867,6 +913,30 @@ export default function ChatView({
                       <Paperclip className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
                       <span className="whitespace-nowrap">Upload Document / Audio / Video</span>
                     </button>
+
+                    {/* Export — Chat Mode only (Agent Mode has no export
+                        tool; see backend chat.py's _get_local_tools
+                        docstring). Picking a format here up front skips the
+                        agent having to guess export intent from free text —
+                        it's attached to the next message like a pending
+                        attachment and applies automatically once sent. */}
+                    {chatMode === 'chat' && (
+                      <>
+                        <div className="mt-1 pt-1.5 border-t border-aegis-border px-3.5 pb-1 text-[11px] font-semibold text-aegis-text-muted uppercase tracking-wide">
+                          Export
+                        </div>
+                        {(['pdf', 'docx', 'xlsx'] as const).map(fmt => (
+                          <button
+                            key={fmt}
+                            onClick={() => { setAttachMenuOpen(false); setPendingExportFormat(fmt); }}
+                            className="w-full flex items-center gap-2.5 px-3.5 py-2 text-[13px] text-aegis-text-primary hover:bg-aegis-overlay transition-colors"
+                          >
+                            <Download className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
+                            <span className="whitespace-nowrap">Export answer as {fmt.toUpperCase()}</span>
+                          </button>
+                        ))}
+                      </>
+                    )}
 
                     {/* Tools — installed once via the Marketplace, switched
                         on/off here per chat (the toggle controls whether the
@@ -1076,7 +1146,7 @@ export default function ChatView({
               ) : (
                 <button
                   onClick={handleSend}
-                  disabled={(!inputVal.trim() && pendingAttachments.length === 0) || status !== 'connected'}
+                  disabled={(!inputVal.trim() && pendingAttachments.length === 0) || status !== 'connected' || hasProcessingAttachment}
                   className="w-8 h-8 rounded-full bg-aegis-primary hover:bg-aegis-primary-dark text-white flex items-center justify-center transition-all shadow-sm disabled:opacity-30"
                 >
                   <Send className="w-3.5 h-3.5" />

@@ -18,6 +18,10 @@ class ModelConfig:
     # download time) — informational ceiling used by _load_model to pick a safe
     # n_ctx; NOT baked directly into kwargs, so large values still get capped.
     context_length: Optional[int] = None
+    # Path to this model's paired mmproj (CLIP-style vision tower) file, if
+    # it's a vision model whose companion download has finished — see
+    # _load_model, which uses this to build an MTMDChatHandler.
+    mmproj_path: Optional[str] = None
     # Add other llama_cpp parameters as needed (e.g., n_gpu_layers)
     kwargs: Optional[Dict[str, Any]] = None
 
@@ -50,6 +54,7 @@ class LLMManager:
                             model_path=m.file_path,
                             chat_format=m.chat_format,
                             context_length=m.context_length,
+                            mmproj_path=m.mmproj_path if m.mmproj_status == "downloaded" else None,
                             kwargs={"verbose": False}
                         )
                         self.register_model(cfg)
@@ -96,6 +101,7 @@ class LLMManager:
                         model_path=m.file_path,
                         chat_format=m.chat_format,
                         context_length=m.context_length,
+                        mmproj_path=m.mmproj_path if m.mmproj_status == "downloaded" else None,
                         kwargs={"verbose": False}
                     ))
         except Exception as e:
@@ -141,6 +147,16 @@ class LLMManager:
                 weight_gb = os.path.getsize(config.model_path) / GB
             except OSError:
                 weight_gb = 2.0  # conservative fallback if file not found yet
+
+        # A vision model's mmproj (CLIP vision tower) is loaded into RAM
+        # alongside the main weights, not instead of them — add its real
+        # on-disk size too, or the estimate silently undercounts a vision
+        # model's actual footprint.
+        if config.mmproj_path:
+            try:
+                weight_gb += os.path.getsize(config.mmproj_path) / GB
+            except OSError:
+                pass
 
         # KV cache estimate: 0.20 GB per 1024 context tokens.
         n_ctx = self._resolve_n_ctx(config)
@@ -235,11 +251,22 @@ class LLMManager:
         kwargs["n_ctx"] = self._resolve_n_ctx(config)
 
 
+        # A vision model's chat_handler (built from its mmproj/vision-tower
+        # file) takes over chat templating entirely — passing chat_format as
+        # well would be ambiguous about which one wins, so it's dropped in
+        # that case rather than passed alongside chat_handler.
+        chat_handler = None
+        if config.mmproj_path and os.path.exists(config.mmproj_path):
+            from llama_cpp.llama_chat_format import MTMDChatHandler
+            chat_handler = MTMDChatHandler(clip_model_path=config.mmproj_path, verbose=False)
+            logger.info(f"Loading '{model_name}' with vision support (mmproj: {config.mmproj_path})")
+
         if config.model_path and os.path.exists(config.model_path):
             # Load from local file (this uses the file we downloaded directly via httpx, avoiding hf-hub SSL issues)
             llm = Llama(
                 model_path=config.model_path,
-                chat_format=config.chat_format,
+                chat_format=None if chat_handler else config.chat_format,
+                chat_handler=chat_handler,
                 **kwargs
             )
         elif config.repo_id and config.filename:

@@ -5,8 +5,6 @@ from typing import Dict, List, Optional, AsyncGenerator, Any
 import anyio
 
 from app.core.llm_manager import LLMManager
-from app.core.feature_flags import CONNECTORS_ENABLED
-from app.mcp.registry import mcp_registry
 from app.db.database import SessionLocal
 from app.db.crud import save_entity, build_entity_context_block
 
@@ -59,6 +57,79 @@ def get_llm_manager():
     return _llm_manager
 
 
+# Detects a chat answer (_call_llm_text) that's degenerated into a bare JSON
+# object/array instead of prose — verified live against this app's own
+# bundled model: a grammar constraining just the first character wasn't
+# enough (the model spent that one character on a throwaway space, then
+# emitted the exact same JSON right after); forcing a longer non-brace
+# prefix just made it pad with incoherent filler *before* the same JSON,
+# which is worse, not better. Grammar constraints only mask which tokens
+# are legal — they can't make the model want to write prose instead. This
+# is a semantic check on the finished text instead: strict JSON.loads,
+# not just "starts with a brace", so prose that happens to mention one
+# (an inline code example) is never a false positive.
+def _looks_like_pure_json(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped or stripped[0] not in "{[":
+        return False
+    try:
+        parsed = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return isinstance(parsed, (dict, list))
+
+
+def _extract_text_from_json_leak(text: str) -> Optional[str]:
+    """
+    Last-resort salvage when a chat answer leaked as JSON even after one
+    corrective regeneration attempt (see _call_llm_text): recursively pull
+    the first reasonably long string value out of the structure rather
+    than showing the user raw braces. Returns None if nothing usable is
+    found, so the caller can fall back to a plain clarification message.
+    """
+    try:
+        parsed = json.loads(text.strip())
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    def _walk(node):
+        if isinstance(node, str):
+            return node if len(node.strip()) >= 15 else None
+        if isinstance(node, dict):
+            for value in node.values():
+                found = _walk(value)
+                if found:
+                    return found
+        elif isinstance(node, list):
+            for item in node:
+                found = _walk(item)
+                if found:
+                    return found
+        return None
+
+    return _walk(parsed)
+
+
+def _sanitize_one_shot_text(text: str, fallback: str) -> str:
+    """
+    Belt-and-suspenders cleanup for a single already-generated LLM text
+    field that reaches the user with no chance to regenerate — the
+    planner's "direct_response" and "clarifying_question" (chat.py's
+    _handle_idle, Agent Mode branch). Both are schema-typed as strings by
+    the plan grammar, so they can't literally BE a nested JSON object —
+    but nothing stops the model from writing a JSON-shaped blob AS the
+    string's content (the same shared-history-imitation failure mode
+    _call_llm_text guards against for Chat Mode, just narrower here).
+    Unlike _call_llm_text this never regenerates: a full plan-generation
+    call is too expensive to redo just to fix one string field, and this
+    path doesn't stream live, so there's no partial output to protect
+    either. Straight extract-or-fallback instead.
+    """
+    if not text or not _looks_like_pure_json(text):
+        return text
+    return _extract_text_from_json_leak(text) or fallback
+
+
 class AgentState:
     IDLE                        = "IDLE"
     WAITING_CONFIRMATION        = "WAITING_CONFIRMATION"        # User reviews plan
@@ -93,13 +164,15 @@ class ChatAgent(BaseAgent):
         # Cleared when the plan is confirmed, cancelled, or a new plan is built.
         self._pending_response: Optional[str] = None
 
-        # Pagination continuation state — persists across WAITING_LOOP_CONTINUATION await.
-        # Cleared when the user says "stop" or when the cursor is exhausted.
-        # Shape: {"step_index": int, "node_id": str, "tool_name": str, "cursor": str,
-        #         "inject_arg": str, "accumulated": list, "prior_results_map": dict,
-        #         "tool_results": list, "token_callback": callable|None}
-        self._pagination_state: Dict[str, Any] = {}
-
+        # Fingerprint of the last plan actually proposed to the user —
+        # compared against each freshly generated plan (see
+        # _plan_signature/the retry loop in _handle_idle) to catch a
+        # degraded small model anchoring on whatever tool call it just saw
+        # succeed and echoing it verbatim for an unrelated new request,
+        # instead of reasoning about the new message. Never cleared on
+        # cancel — a cancelled plan being immediately repeated is just as
+        # suspicious as an executed one being repeated.
+        self._last_proposed_plan_signature: Optional[tuple] = None
 
         import threading
         self.cancel_event = threading.Event()
@@ -250,86 +323,135 @@ class ChatAgent(BaseAgent):
 
         return "\n".join(lines)
 
-    @staticmethod
-    def _build_metadata_context() -> str:
-        """
-        Reads per-server account_context_json from the DB for all connected servers.
-        Builds a human-readable block injected into the planner prompt so the LLM
-        uses real authenticated values (e.g. GitHub username) instead of placeholders.
-        Survives server restarts because the data lives in SQLite, not in memory.
-        """
-        try:
-            from app.db.crud import get_all_server_account_contexts
-            db = SessionLocal()
-            all_ctx = get_all_server_account_contexts(db)
-            db.close()
-        except Exception:
-            return ""
-        if not all_ctx:
-            return ""
-        lines = ["\nCONNECTED ACCOUNT CONTEXT (use these real values when constructing arguments):"]
-        for server, meta in all_ctx.items():
-            for key, value in meta.items():
-                lines.append(f"  {server} {key.replace('_', ' ')}: {value}")
-        return "\n".join(lines)
-
     def _get_local_tools(self) -> List[Dict]:
         """
-        Tools that aren't MCP servers. Two families:
-          - export_document: pure-Python (app.core.exporter), needs no
-            native install, so it's always offered — no Marketplace/
-            capability gate.
-          - Playwright-based web tooling (app.core.scraper /
-            app.core.browser_session): only offered when it's both
-            installed (via the Marketplace) and not toggled off for this
-            specific conversation via the '+' menu's Tools switch — both
-            share the one 'playwright_scraper' capability, since they're
-            the same underlying Chromium install.
+        Tools that aren't MCP servers: Playwright-based web tooling
+        (app.core.scraper / app.core.browser_session — only offered when
+        it's both installed via the Marketplace and not toggled off for
+        this conversation via the '+' menu's Tools switch, both sharing the
+        one 'playwright_scraper' capability since they're the same
+        underlying Chromium install) plus sandboxed local-filesystem tools
+        (app.core.filesystem_tools — always offered, no install step, since
+        they're pure-Python stdlib and confined to the user's home
+        directory by construction rather than needing a native download).
+
+        Export-to-file used to live here too (export_document), but Agent
+        Mode's planner proved unreliable at it on small local models — it
+        would hallucinate a redundant fetch step (a fake URL for a document
+        that was already sitting in context) before the real export step,
+        breaking the whole plan. It's handled deterministically in Chat Mode
+        instead now (see _handle_idle's mode == "chat" branch and
+        _classify_export_intent/_execute_export_document) — no planner, no
+        tool call, so nothing for the model to get wrong.
         """
-        tools = [self._export_document_tool_def()]
-        tools.extend(self._get_scraper_tools())
-        return tools
+        return self._get_scraper_tools() + self._get_filesystem_tool_defs()
 
     @staticmethod
-    def _export_document_tool_def() -> Dict:
-        return {
-            "name": "export_document",
-            "description": (
-                "Converts markdown content into a downloadable PDF, DOCX, or XLSX "
-                "file and returns a download link that appears directly in the chat "
-                "for the user to click. Use when the user asks to export, download, "
-                "save, or convert something — a prior response, a summary, a table — "
-                "to one of these formats. Put the ACTUAL content to export in full in "
-                "`content` (copy it from the relevant part of the conversation; don't "
-                "just describe it) — this tool does not know what 'that' or 'it' "
-                "refers to on its own. For anything row/column-shaped — especially "
-                "when the target format is xlsx, or the user describes data with "
-                "columns/fields — write it as a markdown table "
-                "(`| col1 | col2 |` header, `|---|---|` separator, one data row per "
-                "line), not a bulleted list or plain paragraph: only real markdown "
-                "tables become an actual spreadsheet grid or a bordered table in the "
-                "output, everything else becomes one line of plain text per item."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "content": {
-                        "type": "string",
-                        "description": "The full markdown content to export (headings, lists, tables, etc. are all preserved).",
+    def _get_filesystem_tool_defs() -> List[Dict]:
+        """
+        Sandboxed local-filesystem tools — see app.core.filesystem_tools'
+        module docstring for the exact sandbox model (confined to the
+        user's home directory, denylisted sensitive paths/filenames, size
+        caps). Read tools (search_local_files, read_file, list_folder) and
+        the one write tool (write_file) are deliberately separate tools
+        rather than one do-everything "filesystem" tool, so the
+        plan-confirmation card shows the user exactly which kind of access
+        each step is before they approve it. Named "search_local_files"
+        rather than "search_files" specifically to avoid colliding with
+        app.mcp.response_shapers' pre-existing Google-Drive-specific
+        "search_files" entry (a different tool, a different result shape
+        entirely — sharing the name would silently corrupt this tool's
+        displayed results through that shaper).
+        """
+        return [
+            {
+                "name": "search_local_files",
+                "description": (
+                    "Searches the user's own laptop (confined to their home "
+                    "directory — nothing outside it, and sensitive paths like "
+                    ".ssh, Library, node_modules, and credential-shaped filenames "
+                    "are automatically skipped) for files whose NAME contains a "
+                    "given substring. Does not read file contents — use read_file "
+                    "on a specific match afterward for that. Use when the user "
+                    "asks to find, locate, or look for a file by name, extension, "
+                    "date, or size, without already knowing its exact path."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Substring to match against filenames, case-insensitive."},
+                        "root": {"type": "string", "description": "Optional subfolder to scope the search to (relative to the home directory, e.g. 'Documents'). Omit to search the whole home directory."},
+                        "extension": {"type": "string", "description": "Optional file extension filter, without the dot (e.g. 'pdf')."},
+                        "modified_after": {"type": "string", "description": "Optional ISO date (YYYY-MM-DD) — only files modified after this date."},
+                        "modified_before": {"type": "string", "description": "Optional ISO date (YYYY-MM-DD) — only files modified before this date."},
+                        "min_size_kb": {"type": "number", "description": "Optional minimum file size in KB."},
+                        "max_size_kb": {"type": "number", "description": "Optional maximum file size in KB."},
                     },
-                    "format": {
-                        "type": "string",
-                        "enum": ["pdf", "docx", "xlsx"],
-                        "description": "The file format to export to.",
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "Optional title used as the document heading and in the filename.",
+                    "required": ["query"],
+                },
+            },
+            {
+                "name": "list_folder",
+                "description": (
+                    "Lists the immediate contents (files and subfolders, not "
+                    "recursive) of a folder on the user's laptop, confined to "
+                    "their home directory. Use to orient yourself in a directory "
+                    "before searching or reading — e.g. the user says 'check my "
+                    "Downloads folder' with no specific filename in mind."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Folder path, relative to the home directory (e.g. 'Downloads') or absolute. Omit to list the home directory itself."},
                     },
                 },
-                "required": ["content", "format"],
             },
-        }
+            {
+                "name": "read_file",
+                "description": (
+                    "Reads and extracts the text content of a specific file on "
+                    "the user's laptop by its exact path (get the path from "
+                    "search_local_files or list_folder first if you don't already "
+                    "have it) — confined to their home directory, credential-shaped "
+                    "files refused. Supports PDF, DOCX, XLSX, PPTX, CSV, plain "
+                    "text/markdown, and images (via OCR) — the same extraction "
+                    "used for files the user uploads to chat, so a file already "
+                    "on disk doesn't need to be manually uploaded first. Long "
+                    "files come back in chunks — if the result reports "
+                    "`has_more`, call this again with the same path and `offset` "
+                    "set to the reported `next_offset` to keep reading."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Exact file path, relative to the home directory or absolute."},
+                        "offset": {"type": "integer", "description": "Character offset to resume from — see `next_offset` in a prior result. Omit or 0 to start from the beginning."},
+                    },
+                    "required": ["path"],
+                },
+            },
+            {
+                "name": "write_file",
+                "description": (
+                    "Writes plain-text content to a file on the user's laptop, "
+                    "confined to their home directory. Fails if the file already "
+                    "exists unless `overwrite` is explicitly set true — never "
+                    "silently replaces an existing file. Use when the user asks "
+                    "you to save something (a summary, a list, generated text) "
+                    "to a real file on disk, as opposed to Chat Mode's "
+                    "export-to-download-link for a PDF/DOCX/XLSX."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Destination file path, relative to the home directory or absolute. Parent folders are created if needed."},
+                        "content": {"type": "string", "description": "The exact plain-text content to write."},
+                        "overwrite": {"type": "boolean", "description": "Set true to replace an existing file at that path. Defaults to false (fails instead of clobbering)."},
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+        ]
 
     def _get_scraper_tools(self) -> List[Dict]:
         try:
@@ -568,177 +690,17 @@ class ChatAgent(BaseAgent):
 
     def _all_available_tools(self) -> List[Dict]:
         """
-        Single source of truth for "every tool that exists" — MCP-connected
-        servers plus local tools (e.g. web_scrape). EVERY consumer that needs
-        the full tool list (plan validation, execution, prompt building, the
+        Single source of truth for "every tool that exists" — currently just
+        local tools (e.g. web_scrape). EVERY consumer that needs the full
+        tool list (plan validation, execution, prompt building, the
         query-rewrite pass) MUST call this rather than reconstructing the
-        union by hand.
-
-        This exists because three separate call sites independently forgot
-        `+ self._get_local_tools()` when web_scrape was added: plan
-        validation rejected any plan selecting it as a "hallucinated tool",
-        execute_plan hard-failed with "no MCP servers found" for anyone with
-        zero MCP connectors, and the query-rewrite pass silently couldn't
-        mention it in its own keyword expansion. Routing everything through
-        one method makes that specific class of bug structurally impossible
-        to repeat for the next local tool.
+        list by hand. Used to also merge in MCP-connected servers' tools
+        (mcp_registry.list_all_tools()) — removed along with the rest of
+        this class's MCP integration; app/mcp/ itself is untouched, this
+        just no longer calls into it.
         """
-        return mcp_registry.list_all_tools() + self._get_local_tools()
+        return self._get_local_tools()
 
-    def _search_available_tools(self, query: str, top_k: int = 10) -> List[Dict]:
-        """
-        Search-scoped variant of _all_available_tools: MCP tools ranked by
-        relevance to `query` via FTS5, with local tools always included
-        (there are few enough — currently one — that relevance-ranking them
-        isn't worth the complexity, and the local-tools list is itself
-        already gated by installed+active state).
-        """
-        return mcp_registry.search_tools(query, top_k=top_k) + self._get_local_tools()
-
-    # Catalog keys/words too generic to reliably signal "the user meant this
-    # specific connector" — common English words that show up in ordinary
-    # requests having nothing to do with the connector of the same name.
-    _GENERIC_CATALOG_KEYS = {"time", "memory", "git", "fetch", "filesystem", "sequential_thinking"}
-
-    @staticmethod
-    def _catalog_name_candidates(key: str, entry: dict) -> set:
-        """Lowercased name variants worth matching for a catalog entry: its
-        key, the key without a 'google_' prefix, and its display name with
-        spaces stripped."""
-        return {
-            key.lower(),
-            key.lower().replace("google_", ""),
-            str(entry.get("display_name", "")).lower().replace(" ", ""),
-        }
-
-    def _suggest_connector_for_tool(self, tool_name: str) -> Optional[dict]:
-        """
-        Best-effort match for a hallucinated tool name against the connector
-        catalog. Local models routinely hallucinate plausible-looking tool
-        names for services they've seen in training data but were never
-        actually given — since the planner prompt only ever lists tools from
-        *connected* servers (see _all_available_tools), it has no way to know
-        e.g. Notion's real tool names, so it guesses something like
-        'notion_search_pages'. Matching that guess back to the "notion" catalog
-        entry lets the failure message say "connect Notion" instead of the
-        much less useful "hallucinated invalid tool".
-        """
-        if not CONNECTORS_ENABLED:
-            return None
-        from app.mcp.catalog import CONNECTORS_CATALOG
-
-        name_lower = (tool_name or "").lower()
-        if not name_lower:
-            return None
-
-        connected = {
-            server.lower() for server, info in mcp_registry.get_status().items()
-            if info.get("running")
-        }
-
-        for key, entry in CONNECTORS_CATALOG.items():
-            if key.lower() in connected:
-                continue  # already connected — not the gap we're explaining
-            candidates = self._catalog_name_candidates(key, entry)
-            if any(c and len(c) > 2 and c in name_lower for c in candidates):
-                return entry
-        return None
-
-    def _mentioned_catalog_services(self, user_message: str) -> Dict[str, dict]:
-        """
-        Scans the user's own message (never the model's output — see callers)
-        for specific, recognizable connector names from the catalog, e.g.
-        "notion" or "slack". Deliberately conservative: skips generic-English
-        catalog keys (see _GENERIC_CATALOG_KEYS) and requires a whole-word
-        match on a name longer than 3 characters, so ordinary loosely-worded
-        requests don't produce false hits. Returns {catalog_key: entry} for
-        every match, regardless of connection status — callers decide what
-        connection state means for them.
-        """
-        from app.mcp.catalog import CONNECTORS_CATALOG
-        import re
-
-        msg_lower = user_message.lower()
-        mentioned: Dict[str, dict] = {}
-        for key, entry in CONNECTORS_CATALOG.items():
-            if key in self._GENERIC_CATALOG_KEYS:
-                continue
-            for candidate in self._catalog_name_candidates(key, entry):
-                if candidate and len(candidate) > 3 and re.search(rf"\b{re.escape(candidate)}\b", msg_lower):
-                    mentioned[key] = entry
-                    break
-        return mentioned
-
-    def _find_missing_connector_for_request(self, user_message: str) -> Optional[dict]:
-        """
-        Pre-flight check — run BEFORE any plan is generated, so a request for
-        a service that's obviously not connected never burns a query-rewrite
-        LLM pass *and* a planner LLM pass (each a real cost on a local model)
-        just to fail validation afterward. If the user's own message names a
-        specific, real connector that isn't currently connected, there's
-        nothing a plan could accomplish — tell them directly.
-
-        Same conservative matching as _mentioned_catalog_services — only
-        fires on an explicit, unambiguous connector name.
-        """
-        if not CONNECTORS_ENABLED:
-            return None
-        connected = {
-            server.lower() for server, info in mcp_registry.get_status().items()
-            if info.get("running")
-        }
-        for key, entry in self._mentioned_catalog_services(user_message).items():
-            if key.lower() not in connected:
-                return entry
-        return None
-
-    def _check_cross_service_mismatch(self, user_message: str, plan: List[Dict]) -> List[str]:
-        """
-        Catches the *other* half of tool hallucination: the planner picking a
-        real, connected tool that's simply the wrong one — e.g. reaching for
-        a GitHub tool when the user explicitly asked about Notion, even
-        though Notion is connected. Grammar constraints (see planner.py) make
-        an invented tool name structurally impossible, but they can't stop
-        the model from validly using the wrong real tool; that's a relevance
-        mistake, not a vocabulary one.
-
-        Doesn't overlap with _find_missing_connector_for_request: that
-        pre-flight check already blocks any request naming a service that
-        ISN'T connected, before a plan is even generated — so by the time
-        this runs, every mentioned service here is necessarily connected.
-        This check exists purely for "named, connected, but the wrong one
-        got used anyway".
-
-        Deliberately conservative to avoid false positives on ordinary
-        loosely-worded requests: only fires when the user's own message names
-        a specific, recognizable connector (e.g. "notion", "slack") that is
-        NOT the connector the chosen tool actually belongs to. It checks the
-        user's original words, never the model's own step "reason" text —
-        that's generated by the same model that might be making the mistake,
-        so it isn't independent evidence.
-        """
-        from app.mcp.catalog import CONNECTORS_CATALOG
-
-        mentioned = self._mentioned_catalog_services(user_message)
-        if not mentioned:
-            return []
-
-        warnings = []
-        for step in plan:
-            tool_name = step.get("tool")
-            owning_server = mcp_registry.get_server_for_tool(tool_name)
-            if not owning_server:
-                continue  # local tool (e.g. web_scrape) — no catalog service to compare against
-            if owning_server not in mentioned:
-                # The user named a specific service, and it isn't this one.
-                named = ", ".join(e["display_name"] for e in mentioned.values())
-                owning_entry = CONNECTORS_CATALOG.get(owning_server, {})
-                owning_display = owning_entry.get("display_name", owning_server)
-                warnings.append(
-                    f"You mentioned {named}, but step using `{tool_name}` is a "
-                    f"{owning_display} tool — double-check this is actually the right one."
-                )
-        return warnings
 
     # The only bound on how much of a scraped page reaches the LLM per call
     # — response_shapers.py's web_scrape shaper forwards text_preview
@@ -781,20 +743,21 @@ class ChatAgent(BaseAgent):
     def _continuation_note(tool_name: str, outcome: Dict) -> str:
         """
         Builds the note appended to a successful web_scrape / browser_navigate
-        / browser_extract_text result, telling the model how to read further
-        into a page that didn't fit in one chunk, and/or that the page needs
-        login and can't be accessed (public sites only — see
-        app.core.scraper's module docstring). Only these three tool names
-        ever set has_more/needs_auth on their outcome — every other
-        browser_* action never calls this.
+        / browser_extract_text / read_file result, telling the model how to
+        read further into content that didn't fit in one chunk, and/or (web
+        tools only) that the page needs login and can't be accessed (public
+        sites only — see app.core.scraper's module docstring). Only these
+        four tool names ever set has_more/needs_auth on their outcome —
+        every other browser_*/filesystem tool never calls this.
         """
         parts = []
         if outcome.get("has_more"):
-            call_hint = (
-                f"Call web_scrape again with the same url and offset={outcome['next_offset']}"
-                if tool_name == "web_scrape"
-                else f"Call browser_extract_text with offset={outcome['next_offset']}"
-            )
+            if tool_name == "web_scrape":
+                call_hint = f"Call web_scrape again with the same url and offset={outcome['next_offset']}"
+            elif tool_name == "read_file":
+                call_hint = f"Call read_file again with the same path and offset={outcome['next_offset']}"
+            else:
+                call_hint = f"Call browser_extract_text with offset={outcome['next_offset']}"
             parts.append(
                 f"Showing characters {outcome['offset']}-{outcome['offset'] + len(outcome['text'])} "
                 f"of {outcome['total_length']}. {call_hint} to keep reading."
@@ -848,6 +811,68 @@ class ChatAgent(BaseAgent):
             "needs_auth": result.needs_auth,
             "error": result.error,
         }
+
+    _FILESYSTEM_TOOL_NAMES = {"search_local_files", "list_folder", "read_file", "write_file"}
+    # Every filesystem tool except write_file only ever looks at the disk —
+    # used for the plan-confirmation card's [read-only]/[writes] badge.
+    _READ_ONLY_TOOL_NAMES = {"web_scrape", "search_local_files", "list_folder", "read_file"}
+
+    async def _execute_filesystem_tool(self, tool_name: str, arguments: Dict) -> Dict:
+        """
+        Dispatch for the sandboxed local-filesystem tools (see
+        _get_filesystem_tool_defs and app.core.filesystem_tools' module
+        docstring for the sandbox model). Each underlying function is
+        synchronous, blocking I/O (os.walk, file reads, and — for read_file
+        — potentially OCR/transcription via extract_text), so it's run off
+        the event loop the same way _execute_browser_action's session calls
+        are. Every SandboxError (path outside the sandbox, denied dir/file)
+        is caught here and turned into a normal {"success": False, "error":
+        ...} outcome instead of propagating — the executor's generic
+        exception handler further up would otherwise report it as an
+        "Internal bug" rather than the plain refusal it actually is.
+        """
+        from app.core.filesystem_tools import (
+            search_files, list_folder, read_file_text, write_file, SandboxError,
+        )
+
+        try:
+            if tool_name == "search_local_files":
+                return await anyio.to_thread.run_sync(lambda: search_files(
+                    query=arguments.get("query", ""),
+                    root=arguments.get("root"),
+                    extension=arguments.get("extension"),
+                    modified_after=arguments.get("modified_after"),
+                    modified_before=arguments.get("modified_before"),
+                    min_size_kb=arguments.get("min_size_kb"),
+                    max_size_kb=arguments.get("max_size_kb"),
+                ))
+
+            if tool_name == "list_folder":
+                return await anyio.to_thread.run_sync(lambda: list_folder(arguments.get("path")))
+
+            if tool_name == "read_file":
+                offset = self._parse_offset(arguments)
+                outcome = await anyio.to_thread.run_sync(lambda: read_file_text(arguments.get("path", "")))
+                if not outcome["success"]:
+                    return outcome
+                chunked = self._chunk_text(outcome["text"], offset)
+                return {
+                    "success": True,
+                    "path": outcome["path"],
+                    "file_type": outcome["file_type"],
+                    **chunked,
+                }
+
+            if tool_name == "write_file":
+                return await anyio.to_thread.run_sync(lambda: write_file(
+                    path=arguments.get("path", ""),
+                    content=arguments.get("content", ""),
+                    overwrite=bool(arguments.get("overwrite", False)),
+                ))
+
+            return {"success": False, "error": f"Unknown filesystem tool '{tool_name}'."}
+        except SandboxError as e:
+            return {"success": False, "error": str(e)}
 
     async def _execute_browser_action(self, tool_name: str, arguments: Dict) -> Dict:
         """
@@ -918,16 +943,19 @@ class ChatAgent(BaseAgent):
 
     async def _execute_export_document(self, arguments: Dict) -> Dict:
         """
-        Dispatch for the export_document local tool. Converts markdown to a
-        file (app.core.exporter.export_markdown — the exact same converter
-        the manual "+" Export menu uses) and stores it under a short-lived
-        ID (app.api.export.store_export) instead of returning the bytes
-        themselves — this runs inside the agent's tool-calling loop, not an
-        HTTP handler, so there's no request/response cycle to hand raw
-        file bytes back through. The returned download_url is what actually
-        lets the user get the file: an absolute link to this backend's own
-        /api/export/download/{id} route, rendered as a normal markdown link
-        in the chat message.
+        Converts markdown to a file (app.core.exporter.export_markdown) and
+        stores it under a short-lived ID (app.api.export.store_export)
+        instead of returning the bytes themselves — the caller (Chat Mode's
+        deterministic export-intent check in _handle_idle; see that
+        method's mode == "chat" branch) isn't an HTTP handler, so there's no
+        request/response cycle to hand raw file bytes back through. The
+        returned download_url is what actually lets the user get the file:
+        an absolute link to this backend's own /api/export/download/{id}
+        route, rendered as a normal markdown link in the chat message.
+
+        Not offered as an Agent Mode tool anymore (see _get_local_tools'
+        docstring for why) — called directly as a plain function instead of
+        through the planner/tool-call machinery.
         """
         from app.core.exporter import export_markdown, CONTENT_TYPES
         from app.api.export import store_export, BACKEND_BASE_URL, _safe_filename
@@ -962,6 +990,282 @@ class ChatAgent(BaseAgent):
         m = cls._URL_RE.search(message)
         return m.group(0).rstrip('.,;:!?') if m else None
 
+    # Two deliberately-narrow shapes, to keep false positives (ordinary
+    # prose with a stray slash — "and/or", "9/5", "his/her") out: either an
+    # unambiguous path prefix (/, ~/, ./, ../) at a word boundary followed
+    # by non-space chars — the (?<!\w) lookbehind is what excludes a
+    # mid-word slash like the "/or" in "and/or" — or any non-space run
+    # containing a "/" whose final segment ends in a recognizable file
+    # extension (e.g. "aegis_agent_test_dir/review.txt").
+    _PATH_RE = re.compile(
+        r'(?<!\w)(?:~|\.{1,2})?/[^\s"\')\]]+'
+        r'|[^\s"\')\]]+/[^\s"\')\]]*\.[A-Za-z0-9]{1,8}\b'
+    )
+
+    @classmethod
+    def _extract_path_like(cls, message: str) -> Optional[str]:
+        m = cls._PATH_RE.search(message)
+        return m.group(0).rstrip('.,;:!?') if m else None
+
+    @staticmethod
+    def _plan_signature(plan_steps: List[Dict]) -> tuple:
+        """Order-independent fingerprint of a plan's (tool, arguments) pairs
+        — used to detect a freshly generated plan that's identical to the
+        last one actually proposed, regardless of step_id/depends_on, which
+        legitimately differ turn to turn."""
+        return tuple(sorted(
+            (step.get("tool"), json.dumps(step.get("arguments", {}), sort_keys=True))
+            for step in plan_steps
+        ))
+
+    # Deliberately loose — this only gates whether the LLM classification
+    # call below runs at all, not whether export actually fires. A single
+    # hint word is enough to spend one small LLM call finding out; the
+    # overwhelming majority of messages (greetings, questions, coding asks)
+    # match none of these and skip the call entirely, at zero cost.
+    _EXPORT_HINT_RE = re.compile(
+        r'\b(export|download|save|convert|pdf|docx?|xlsx|excel|word|spreadsheet|file)\b',
+        re.IGNORECASE,
+    )
+
+    _FAKE_TOOL_NARRATION_RE = re.compile(
+        r'\n\s*\**\s*Step\s*1\s*[:.]|\bweb_scrape\b|\bexport_document\b|\n```json'
+        r'|\[Download [^\]]*\]\(https?://[^)]*\)'
+        # Self-denial commentary: despite being told the export happens
+        # automatically, the model sometimes still claims it *can't* and
+        # suggests an external tool instead — none of that belongs in the
+        # actual exported file, just the real answer/content above it.
+        r"|\bI (?:don't|do not|can't|cannot|'m not able to) (?:have the capability to |directly )?"
+        r'(?:create|generate|export|produce|make) (?:a |an )?(?:PDF|DOCX|XLSX|Word|Excel)\b'
+        r'|\bAdobe Acrobat\b|\byou would need to use\b|\bPDF creation tool\b',
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _clean_export_content(cls, text: str) -> str:
+        """
+        Truncates at the first sign of hallucinated tool-call narration or
+        self-denial commentary ("I can't create a PDF, try Adobe Acrobat").
+        Chat Mode has no real tools and is explicitly told the export
+        happens automatically, but a small/degraded local model sometimes
+        ignores that anyway — exporting its confused commentary verbatim
+        would bake it into the downloaded file instead of just the actual
+        answer/content the user asked for.
+
+        Trims back to the last paragraph break before the match rather than
+        the exact match offset — the match itself typically lands mid-line
+        (e.g. on the tool name inside "- Step 1: `web_scrape`"), and cutting
+        there would leave a dangling markdown fragment in the export instead
+        of cleanly dropping the whole hallucinated section.
+        """
+        m = cls._FAKE_TOOL_NARRATION_RE.search(text)
+        if not m:
+            return text
+        cutoff = text.rfind("\n\n", 0, m.start())
+        if cutoff == -1:
+            cutoff = text.rfind("\n", 0, m.start())
+        if cutoff == -1:
+            cutoff = 0
+        return text[:cutoff].rstrip()
+
+    def _extract_export_content_via_llm(self, raw_response: str, export_fmt: str) -> str:
+        """
+        Fallback for when the model didn't use the ```export fence at all —
+        a second, small LLM call whose only job is extracting the clean
+        final content that should go into the exported file, instead of
+        denylisting our way through every possible way it could have
+        phrased narration/self-doubt/filler around the real answer.
+        _clean_export_content is a fixed set of known-bad patterns; this
+        can recognize and strip ANY kind of surrounding noise, including
+        phrasing never seen before (e.g. observed once: a clean tagline
+        followed by "Export the exact tagline as a PDF: <tagline again>" —
+        not false, just redundant filler the denylist has no pattern for).
+
+        Only spent when the fast path (the model actually used the fence)
+        fails, so the common compliant case costs nothing extra.
+        """
+        llm = self.get_llm()
+        if not llm:
+            return self._clean_export_content(raw_response)
+
+        prompt = f"""Below is an assistant's response to a user. Extract ONLY the final content that should be saved into a {export_fmt.upper()} file — the actual answer, summary, or data, nothing else.
+
+Response:
+\"\"\"
+{raw_response}
+\"\"\"
+
+Rules:
+- Strip any meta-commentary, mentions of tools/modes/capabilities, apologies, or claims about what the assistant can or can't do.
+- Strip any narration about steps, plans, or exporting itself, and any redundant restatement of the content that follows it.
+- Keep the actual substantive content exactly as written, including markdown formatting (headings, lists, tables).
+- If truly nothing usable remains, output nothing.
+
+Output ONLY the extracted content — no preamble, no surrounding quotes, no explanation of what you did."""
+
+        try:
+            response = llm.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=1024,
+            )
+            extracted = response["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            logger.warning(f"Export content extraction failed: {e}")
+            return self._clean_export_content(raw_response)
+
+        # Belt-and-suspenders: still run the denylist pass in case the
+        # extractor itself left some narration in, or returned nothing.
+        return self._clean_export_content(extracted) if extracted else self._clean_export_content(raw_response)
+
+    def _classify_export_intent(self, message: str) -> Optional[str]:
+        """
+        Light LLM classification pass for "does this message ask to export/
+        download/save/convert the answer into a file, and which format" —
+        same cheap-regex-gate-then-LLM pattern used throughout this class.
+        Replaces an earlier rigid regex (required an exact action word like
+        "export" AND an exact format word like "pdf" in the same message) that missed
+        anything phrased differently — "can I get this as a file I can
+        keep", "turn that into something I can send someone" — since intent
+        is what actually matters here, not which synonyms were used.
+
+        Runs off the event loop via llm_executor by callers, same as every
+        other LLM call in this class — this is a sync method.
+        """
+        if not self._EXPORT_HINT_RE.search(message):
+            return None
+
+        llm = self.get_llm()
+        if not llm:
+            return None
+
+        prompt = f"""Does this message ask to export, download, save, or convert the assistant's answer into a downloadable file?
+
+Message: "{message}"
+
+Output a JSON object with two keys:
+- "is_export": true only if the user wants a FILE created from this conversation's content — not just a question that happens to mention a file/document, and not a request to read or open something that already exists.
+- "format": one of "pdf", "docx", "xlsx" if is_export is true (closest match — e.g. "word document" -> "docx", "spreadsheet"/"excel" -> "xlsx", anything else -> "pdf"), otherwise null.
+
+Output valid JSON only. Example: {{"is_export": true, "format": "docx"}}"""
+
+        try:
+            response = llm.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=30,
+                response_format={"type": "json_object"},
+            )
+            content = response["choices"][0]["message"]["content"].strip()
+            data = json.loads(content)
+            fmt = data.get("format")
+            if data.get("is_export") and fmt in ("pdf", "docx", "xlsx"):
+                return fmt
+            return None
+        except Exception as e:
+            logger.warning(f"Export-intent classification failed: {e}")
+            return None
+
+    # Same cost-control idea as _EXPORT_HINT_RE: cheap gate on whether it's
+    # even worth the classification call below. Requires BOTH a question
+    # mark and a connector word — a single "?" alone (the overwhelming
+    # majority of messages) skips the call entirely.
+    _COMPOUND_QUESTION_MARK_RE = re.compile(r'\?')
+    _COMPOUND_CONNECTOR_RE = re.compile(r'\b(and|also|as well as|additionally)\b', re.IGNORECASE)
+
+    def _decompose_compound_question(self, message: str) -> Optional[List[str]]:
+        """
+        Light LLM pass: does this message actually contain multiple
+        distinct questions/requests bundled into one, e.g. "which items
+        are out of stock, and what is the unit price of the Mechanical
+        Keyboard?" — reproduced dropping the first half and only answering
+        the second. Returns the parts as a list (2+) if so, else None.
+
+        Chat Mode only (see its call site) — the failure mode observed was
+        a document-Q&A answer silently addressing only the last clause of a
+        two-part question; injecting the parts explicitly into the prompt
+        gives the model an itemized checklist instead of one run-on ask it
+        can partially skim.
+        """
+        if not (self._COMPOUND_QUESTION_MARK_RE.search(message) and self._COMPOUND_CONNECTOR_RE.search(message)):
+            return None
+
+        llm = self.get_llm()
+        if not llm:
+            return None
+
+        prompt = f"""Does this message contain MULTIPLE distinct questions or requests that each need their own separate answer — not just one question with extra detail or a single compound noun phrase?
+
+Message: "{message}"
+
+Output a JSON object with one key:
+- "parts": a list of the distinct questions/requests as short strings, in order, ONLY if there are 2 or more genuinely separate asks. Otherwise an empty list.
+
+Output valid JSON only. Example: {{"parts": ["which items are out of stock", "what is the unit price of the Mechanical Keyboard"]}}"""
+
+        try:
+            response = llm.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=200,
+                response_format={"type": "json_object"},
+            )
+            content = response["choices"][0]["message"]["content"].strip()
+            data = json.loads(content)
+            parts = data.get("parts")
+            if isinstance(parts, list) and len(parts) >= 2:
+                return [str(p) for p in parts if str(p).strip()]
+            return None
+        except Exception as e:
+            logger.warning(f"Compound-question decomposition failed: {e}")
+            return None
+
+    def _classify_export_and_compound(self, message: str) -> tuple[Optional[str], Optional[List[str]]]:
+        """
+        Combined variant of _classify_export_intent + _decompose_compound_
+        question — one LLM prefill answering both questions instead of two
+        serialized ones. Only used at the call site when BOTH cheap gates
+        (_EXPORT_HINT_RE and the compound-question pair) fire on the same
+        message; when only one fires, calling that single-purpose method
+        directly stays cheaper AND more reliable for a small model than
+        asking a combined prompt it didn't need to answer.
+        """
+        llm = self.get_llm()
+        if not llm:
+            return None, None
+
+        prompt = f"""Analyze this message and answer two independent questions about it.
+
+Message: "{message}"
+
+Output a JSON object with three keys:
+- "is_export": true only if the user wants a FILE created from this conversation's content — not just a question that happens to mention a file/document, and not a request to read or open something that already exists.
+- "format": one of "pdf", "docx", "xlsx" if is_export is true (closest match — e.g. "word document" -> "docx", "spreadsheet"/"excel" -> "xlsx", anything else -> "pdf"), otherwise null.
+- "parts": a list of the distinct questions/requests as short strings, in order, ONLY if the message bundles 2 or more genuinely separate asks that each need their own answer. Otherwise an empty list.
+
+Output valid JSON only. Example: {{"is_export": true, "format": "docx", "parts": []}}"""
+
+        try:
+            response = llm.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=200,
+                response_format={"type": "json_object"},
+            )
+            content = response["choices"][0]["message"]["content"].strip()
+            data = json.loads(content)
+            fmt = data.get("format")
+            export_fmt = fmt if data.get("is_export") and fmt in ("pdf", "docx", "xlsx") else None
+            parts = data.get("parts")
+            compound_parts = (
+                [str(p) for p in parts if str(p).strip()]
+                if isinstance(parts, list) and len(parts) >= 2 else None
+            )
+            return export_fmt, compound_parts
+        except Exception as e:
+            logger.warning(f"Combined export/compound classification failed: {e}")
+            return None, None
+
     @staticmethod
     def _matches_any_keyword(message: str, keywords) -> bool:
         """
@@ -977,84 +1281,40 @@ class ChatAgent(BaseAgent):
         return any(re.search(rf"\b{re.escape(kw)}\b", low) for kw in keywords)
 
     def get_available_tools(self) -> str:
-        """Fetches all available tools from all connected MCP servers, plus local tools like web_scrape."""
+        """Fetches all available local tools (e.g. web_scrape)."""
         tools = self._all_available_tools()
         if not tools:
-            return "No active MCP servers connected. Please authenticate with Google or connect a server first."
-        tools_str = "\n".join(self._format_tool_for_planner(t) for t in tools)
-        return tools_str + self._build_metadata_context()
+            return "No local tools are currently active."
+        return "\n".join(self._format_tool_for_planner(t) for t in tools)
 
-    def _rewrite_query_for_search(self, query: str) -> tuple[str, bool]:
-        """Uses a fast LLM pass to expand the user's query with keywords likely to hit the FTS5 tool index. Also flags if query is counting."""
-        llm = self.get_llm()
-        if not llm:
-            return query, False
-            
-        all_tools = self._all_available_tools()
-        if not all_tools:
-            return query, False
-
-        tool_names = ", ".join([t["name"] for t in all_tools])
-        
-        prompt = f"""You are a fast tool selector for an AI agent.
-The user's query is: "{query}"
-
-Available tools in the registry: [{tool_names}]
-
-Analyze the user's query and output a JSON object with two keys:
-- "tools": either the exact string "ALL_TOOLS" (if they ask a general question about what tools are available), OR a list of the 1 to 5 most relevant tool names from the registry.
-- "is_counting": boolean true if the user query implies needing a total, count, or completeness (e.g. "how many", "count of", "all of", "list all"). Otherwise false.
-
-Do NOT invent new tool names. Output valid JSON only.
-Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counting": false}}"""
-
-        try:
-            response = llm.create_chat_completion(
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=60,
-                response_format={"type": "json_object"}
-            )
-            content = response["choices"][0]["message"]["content"].strip()
-            import json
-            data = json.loads(content)
-            tools_val = data.get("tools", [])
-            is_counting = bool(data.get("is_counting", False))
-            
-            if tools_val == "ALL_TOOLS" or (isinstance(tools_val, list) and "ALL_TOOLS" in tools_val):
-                expanded_keywords = "ALL_TOOLS"
-            elif isinstance(tools_val, list):
-                expanded_keywords = ", ".join(tools_val)
-            else:
-                expanded_keywords = str(tools_val)
-                
-            logger.info(f"Query rewritten for tool search: '{query}' -> '{expanded_keywords}' (counting: {is_counting})")
-            return expanded_keywords, is_counting
-        except Exception as e:
-            logger.error(f"Query rewrite failed: {e}")
-            return query, False
+    # Cheap gate replacing an LLM call: back when the registry mixed local
+    # tools with many MCP-connected ones, an LLM pass ranked the 1-5 most
+    # relevant before handing them to the planner. With MCP tools removed
+    # (see _all_available_tools' docstring), the registry is just a
+    # handful of local tools — nothing left to rank — so get_searched_tools
+    # below hands the planner all of them directly. is_counting still
+    # needs detecting (it flips list/search steps to fetch_scope
+    # "exhaustive"), just via regex instead of a now-pointless LLM call.
+    _COUNTING_HINT_RE = re.compile(
+        r'\b(how many|how much|count of|total number|number of|list all|all of the|every file|everything in|complete list)\b',
+        re.IGNORECASE,
+    )
 
     def get_searched_tools(self, query: str) -> tuple[str, bool, List[str]]:
         """
-        Fetches top-k relevant tools from registry using keyword expansion and
-        SQLite FTS5. Also returns the plain list of tool names shown — this is
-        the exact set the planner's grammar gets constrained to, so the model
-        is structurally unable to name a tool it wasn't actually offered.
+        Returns every local tool directly, plus a cheap regex-based
+        is_counting flag — see _COUNTING_HINT_RE's comment for why this no
+        longer needs an LLM call. Kept as its own method (rather than
+        inlining at call sites) since callers still expect this three-item
+        shape, and _all_available_tools() is the single source of truth
+        for "every tool that exists".
         """
-        optimized_query, is_counting = self._rewrite_query_for_search(query)
-
-        if "ALL_TOOLS" in optimized_query:
-            all_tools = self._all_available_tools()
-            tools_str = "\n".join(self._format_tool_for_planner(t) for t in all_tools)
-            if not tools_str:
-                return "", False, []
-            return tools_str + self._build_metadata_context(), is_counting, [t["name"] for t in all_tools]
-
-        tools = self._search_available_tools(optimized_query, top_k=10)
-        if not tools:
+        all_tools = self._all_available_tools()
+        if not all_tools:
             return "", False, []
-        tools_str = "\n".join(self._format_tool_for_planner(t) for t in tools)
-        return tools_str + self._build_metadata_context(), is_counting, [t["name"] for t in tools]
+        tools_str = "\n".join(self._format_tool_for_planner(t) for t in all_tools)
+        is_counting = bool(self._COUNTING_HINT_RE.search(query))
+        return tools_str, is_counting, [t["name"] for t in all_tools]
 
     def _get_entity_context(self) -> str:
         """Loads confirmed session entities from SQLite and returns the context block."""
@@ -1097,24 +1357,84 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
         llm = self.get_llm()
         if not llm:
             return ""
-        try:
-            response = llm.create_chat_completion(
-                messages=messages,
-                temperature=0.7,
-                stream=True
-            )
-            full_response = ""
+
+        def _generate(msgs, forward_live: bool):
+            """
+            Runs one streamed completion, always buffering the full text.
+            When forward_live is True, also pushes tokens to token_callback
+            as they arrive — UNTIL the very first non-whitespace character
+            reveals the response has degenerated into a bare JSON object/
+            array, at which point it stops forwarding and abandons the
+            generation early (breaking this loop halts further decode
+            steps, since llama-cpp-python's streaming is pull-based) rather
+            than let more of a leak reach the user or waste compute on a
+            response about to be discarded anyway. The normal case — the
+            overwhelming majority of turns — is a pure pass-through with
+            zero added latency; a leak is caught before more than a
+            character or two could ever be shown.
+            """
+            response = llm.create_chat_completion(messages=msgs, temperature=0.7, stream=True)
+            buf = ""
+            checked_start = False
+            leaking = False
             for chunk in response:
                 if getattr(self, "cancel_event", None) and self.cancel_event.is_set():
                     logger.info("Text generation cancelled.")
                     break
-                if "choices" in chunk and len(chunk["choices"]) > 0:
-                    delta = chunk["choices"][0].get("delta", {})
-                    if "content" in delta:
-                        token = delta["content"]
-                        full_response += token
-                        if token_callback:
-                            token_callback(token)
+                if "choices" not in chunk or not chunk["choices"]:
+                    continue
+                token = chunk["choices"][0].get("delta", {}).get("content")
+                if not token:
+                    continue
+                buf += token
+                if not forward_live:
+                    continue
+                if not checked_start and buf.strip():
+                    checked_start = True
+                    if buf.lstrip()[:1] in ("{", "["):
+                        leaking = True
+                if leaking:
+                    break
+                if token_callback:
+                    token_callback(token)
+            return buf, leaking
+
+        try:
+            full_response, leaking = _generate(messages, forward_live=True)
+
+            # Verified live against this app's own bundled model: a small
+            # local model sharing history with Agent Mode's plan/tool-
+            # result JSON blocks (see build_chat_prompt's rule 3) sometimes
+            # imitates that shape and replies with a bare JSON object
+            # instead of prose, despite the prompt's explicit "NEVER output
+            # JSON" instruction. _looks_like_pure_json is a strict
+            # json.loads check on the finished text, not just "starts with
+            # a brace" — prose that happens to mention one isn't a false
+            # positive. One corrective regeneration, non-streamed so a
+            # second leak is never shown mid-stream either, then a
+            # best-effort text extraction — never the raw JSON itself —
+            # as the last resort.
+            if leaking or _looks_like_pure_json(full_response):
+                logger.warning("Chat answer degenerated into raw JSON — regenerating with a corrective instruction.")
+                reinforced = messages + [{
+                    "role": "system",
+                    "content": (
+                        "Your previous reply was a raw JSON object instead of a real answer. "
+                        "Respond in plain natural-language sentences only — no JSON, no braces, "
+                        "no code fence wrapping the whole reply."
+                    ),
+                }]
+                full_response, _ = _generate(reinforced, forward_live=False)
+
+                if _looks_like_pure_json(full_response):
+                    full_response = (
+                        _extract_text_from_json_leak(full_response)
+                        or "Sorry, I had trouble putting that into words — could you rephrase your question?"
+                    )
+
+                if token_callback:
+                    token_callback(full_response)
+
             self._log_token_usage(llm, messages, full_response, "chat", self.connection_id)
             return full_response
         except Exception as e:
@@ -1125,21 +1445,18 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
     # State machine
     # ─────────────────────────────────────────────────────────────────────────
 
-    async def handle_message(self, message: str, mode: str = "chat", token_callback=None, status_callback=None, attachments: Optional[List[Dict]] = None) -> str:
+    async def handle_message(self, message: str, mode: str = "chat", token_callback=None, status_callback=None, attachments: Optional[List[Dict]] = None, export_format: Optional[str] = None) -> str:
         """Main state machine dispatcher."""
 
         if message == "__system_mode_switch__":
-            if self.state in [
-                AgentState.WAITING_CONFIRMATION, AgentState.WAITING_LOOP_CONTINUATION,
-            ]:
+            if self.state == AgentState.WAITING_CONFIRMATION:
                 self.state = AgentState.IDLE
                 self.plan = None
-                self._pagination_state = {}
                 return "__system_toast__:Pending action discarded."
             return ""
 
         if self.state == AgentState.IDLE:
-            return await self._handle_idle(message, mode, token_callback, status_callback, attachments)
+            return await self._handle_idle(message, mode, token_callback, status_callback, attachments, export_format)
 
         elif self.state == AgentState.WAITING_CONFIRMATION:
             return await self._handle_confirmation(message, token_callback)
@@ -1147,12 +1464,70 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
         elif self.state == AgentState.EXECUTING:
             return "I am currently executing the tasks. Please wait..."
 
-        elif self.state == AgentState.WAITING_LOOP_CONTINUATION:
-            return await self._handle_loop_continuation(message)
-
         return "Unknown state."
 
-    async def _handle_idle(self, message: str, mode: str = "chat", token_callback=None, status_callback=None, attachments: Optional[List[Dict]] = None) -> str:
+    async def _get_document_context(self, message: str, attachments: Optional[List[Dict]], status_callback=None) -> str:
+        """
+        Waits for any documents attached to *this* message to finish
+        ingesting, then runs RAG retrieval scoped to this conversation and
+        returns a "Relevant excerpts from your uploaded documents" block
+        (empty string if none). Shared by Chat Mode's answer generation and
+        Agent Mode's plan generation — Agent Mode needs this context too,
+        otherwise it has no way to know an uploaded document even exists and
+        will hallucinate a URL/tool for "the report I uploaded earlier"
+        instead of just reading it.
+        """
+        attached_ids = [a["document_id"] for a in (attachments or []) if a.get("document_id") is not None]
+        if attached_ids:
+            if status_callback:
+                await status_callback("Processing your document...")
+
+            import asyncio as _asyncio
+
+            def _all_ready(ids: List[int]) -> bool:
+                from app.db.models import UserDocument
+                _db = SessionLocal()
+                try:
+                    rows = _db.query(UserDocument).filter(UserDocument.id.in_(ids)).all()
+                    return all(r.status in ("ready", "failed") for r in rows) and len(rows) == len(ids)
+                finally:
+                    _db.close()
+
+            loop = _asyncio.get_running_loop()
+            for _ in range(20):  # ~20s ceiling, then proceed best-effort
+                if await loop.run_in_executor(db_executor, _all_ready, attached_ids):
+                    break
+                await _asyncio.sleep(1)
+
+        if status_callback:
+            await status_callback("Searching your documents...")
+
+        from app.core import context_config as ctx_cfg
+        max_rag_chunks = ctx_cfg.get("chat").get("max_rag_chunks", 5)
+
+        try:
+            import asyncio
+            loop = asyncio.get_running_loop()
+            from app.core.rag.processor import hybrid_search
+            relevant_chunks = await loop.run_in_executor(
+                db_executor,
+                lambda: hybrid_search(query=message, conversation_id=self.connection_id, top_k=max_rag_chunks)
+            )
+        except Exception as e:
+            logger.warning(f"RAG search failed: {e}")
+            relevant_chunks = []
+
+        if not relevant_chunks:
+            logger.info(f"RAG retrieved 0 chunks for query: {message}")
+            return ""
+
+        logger.info(f"RAG retrieved {len(relevant_chunks)} chunks for query: {message}")
+        document_context = "Relevant excerpts from your uploaded documents:\n\n"
+        for chunk in relevant_chunks:
+            document_context += f"--- Source: {chunk.get('filename')} ---\n{chunk.get('content')}\n\n"
+        return document_context
+
+    async def _handle_idle(self, message: str, mode: str = "chat", token_callback=None, status_callback=None, attachments: Optional[List[Dict]] = None, export_format: Optional[str] = None) -> str:
         """IDLE → generate plan → WAITING_CONFIRMATION."""
         await self._append_history("user", message, attachments=attachments)
         
@@ -1181,7 +1556,6 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
         _MAX_RESULT_SNIPPET   = _planner_cfg.get("max_result_snippet", 2000)
         _MAX_CHAT_HISTORY     = _chat_cfg.get("max_history_messages", 20)
         _MAX_CHAT_MSG_CHARS   = _chat_cfg.get("max_msg_chars", 4000)
-        _MAX_RAG_CHUNKS       = _chat_cfg.get("max_rag_chunks", 5)
 
         full_history = await self._get_history()
         raw_history = full_history[:-1] if full_history else []
@@ -1201,14 +1575,23 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
 
         # ── Mode Branching ─────────────────────────────
         if mode == "chat":
-            # Chat Mode does no tool calling at all — that's Agent Mode's job
-            # exclusively now (a deliberate product decision: one clear place
-            # tools execute, with the plan/confirm/execute ceremony and the
-            # grounding checks that come with it, rather than two divergent
-            # tool paths of different rigor). A URL is still detected — same
-            # cheap deterministic regex check as before — but instead of
-            # fetching it, Chat Mode nudges the user to Agent Mode rather
-            # than silently ignoring an obvious intent.
+            # Chat Mode does no LLM-driven tool calling at all — that's Agent
+            # Mode's job exclusively (a deliberate product decision: one
+            # clear place tools execute, with the plan/confirm/execute
+            # ceremony and the grounding checks that come with it, rather
+            # than two divergent tool paths of different rigor). A URL is
+            # still detected — a cheap deterministic regex check, not the
+            # LLM choosing to call a tool — but instead of fetching it, Chat
+            # Mode nudges the user to Agent Mode rather than silently
+            # ignoring an obvious intent. Export-to-file gets the same
+            # deterministic treatment below, but is actually executed here
+            # instead of just nudged: Agent Mode's planner has proven
+            # unreliable specifically for "convert what I just read to a
+            # file" (it tends to invent a redundant fetch step even when the
+            # content is already in front of it), while Chat Mode already
+            # has the document content and just wrote the answer/summary —
+            # exporting it is a fixed, no-choices-to-hallucinate function
+            # call, not a plan the LLM has to design.
             url = self._extract_url(message)
             if url:
                 nudge = (
@@ -1218,33 +1601,11 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
                 await self._append_history("assistant", nudge)
                 return nudge
 
-            if status_callback:
-                await status_callback("Searching your documents...")
-
             # 1. RAG Retrieval for Uploaded Documents
-            try:
-                import asyncio
-                loop = asyncio.get_running_loop()
-                from app.core.rag.processor import hybrid_search
-                relevant_chunks = await loop.run_in_executor(
-                    db_executor,
-                    lambda: hybrid_search(query=message, conversation_id=self.connection_id, top_k=_MAX_RAG_CHUNKS)
-                )
-            except Exception as e:
-                logger.warning(f"RAG search failed: {e}")
-                relevant_chunks = []
-                
+            document_context = await self._get_document_context(message, attachments, status_callback)
+
             if status_callback:
                 await status_callback("Generating...")
-                
-            document_context = ""
-            if relevant_chunks:
-                logger.info(f"RAG retrieved {len(relevant_chunks)} chunks for query: {message}")
-                document_context = "Relevant excerpts from your uploaded documents:\n\n"
-                for chunk in relevant_chunks:
-                    document_context += f"--- Source: {chunk.get('filename')} ---\n{chunk.get('content')}\n\n"
-            else:
-                logger.info(f"RAG retrieved 0 chunks for query: {message}")
 
             # 2. Skills — Chat Mode only (see app/core/skills.py for why: no
             # tool loop here to hang script execution off, so skills stay
@@ -1273,7 +1634,55 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
                 skills_metadata = ""
                 triggered_skills_block = ""
 
-            from app.prompts.chat import build_chat_prompt
+            # Detected before generation (not after, like everything else
+            # here) so that when it's a hit, the model can be told — for
+            # *this* turn only — to fence the exact exportable content
+            # instead of us trying to regex-clean whatever it freely wrote
+            # after the fact. Denylisting bad phrasing (self-doubt, fake
+            # tool narration) is inherently a losing game against a small
+            # model that can phrase either in unbounded ways; a positive,
+            # structural instruction ("put the exact content in this
+            # fence") only needs the model to get the good case right once,
+            # and _clean_export_content still runs as a fallback/second
+            # pass below either way.
+            import asyncio
+            loop = asyncio.get_running_loop()
+            # An explicit format picked from the composer's "+" > Export menu
+            # skips export classification entirely — the user already told
+            # us the intent, so there's nothing left to infer there. Compound-
+            # question detection is independent of that, so when BOTH cheap
+            # gates fire (still need to classify export AND the message looks
+            # like a bundled multi-part question), one combined LLM call
+            # answers both instead of two serialized ones — see
+            # _classify_export_and_compound's docstring for why this only
+            # applies when both are actually in play.
+            need_export_classification = (
+                export_format not in ("pdf", "docx", "xlsx") and bool(self._EXPORT_HINT_RE.search(message))
+            )
+            need_compound_classification = bool(
+                self._COMPOUND_QUESTION_MARK_RE.search(message) and self._COMPOUND_CONNECTOR_RE.search(message)
+            )
+
+            if export_format in ("pdf", "docx", "xlsx"):
+                export_fmt = export_format
+                compound_parts = (
+                    await loop.run_in_executor(llm_executor, self._decompose_compound_question, message)
+                    if need_compound_classification else None
+                )
+            elif need_export_classification and need_compound_classification:
+                export_fmt, compound_parts = await loop.run_in_executor(
+                    llm_executor, self._classify_export_and_compound, message
+                )
+            elif need_export_classification:
+                export_fmt = await loop.run_in_executor(llm_executor, self._classify_export_intent, message)
+                compound_parts = None
+            elif need_compound_classification:
+                export_fmt = None
+                compound_parts = await loop.run_in_executor(llm_executor, self._decompose_compound_question, message)
+            else:
+                export_fmt = None
+                compound_parts = None
+
             # Append document context to the base entity context
             full_context = entity_context
             if document_context:
@@ -1282,6 +1691,26 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
                 full_context += "\n\n" + skills_metadata
             if triggered_skills_block:
                 full_context += "\n\n" + triggered_skills_block
+            if compound_parts:
+                full_context += (
+                    "\n\n[MULTI-PART QUESTION]: The user asked multiple distinct things in "
+                    "one message. Address EACH of the following separately and completely "
+                    "in your answer — do not skip any:\n"
+                    + "\n".join(f"{i+1}. {p}" for i, p in enumerate(compound_parts))
+                )
+            if export_fmt:
+                full_context += (
+                    f"\n\n[EXPORT INSTRUCTION]: The user also wants this turn's content "
+                    f"exported as a {export_fmt.upper()} file — that happens automatically "
+                    f"right after you answer, no tool call needed from you. Write your "
+                    f"answer as usual, and additionally wrap ONLY the exact final content "
+                    f"that should go into the exported file in a fenced block tagged "
+                    f"\"export\", e.g.:\n```export\n<the exact content to export, nothing "
+                    f"else>\n```\nPut just the clean final content there — no meta-commentary, "
+                    f"no mention of tools, modes, or capabilities, no apologies. If your "
+                    f"answer already IS the exportable content (a summary, a tagline, a "
+                    f"table), the fence can just repeat that same text."
+                )
 
             all_tools_str = self.get_available_tools()
             chat_prompt = build_chat_prompt(full_context, all_tools_str)
@@ -1307,6 +1736,7 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
                 sanitized_history.append({"role": msg["role"], "content": content})
                 
             messages.extend(sanitized_history)
+            self._attach_vision_images(messages, attachments)
 
             # In chat mode, we expect pure raw text, no JSON.
             import asyncio
@@ -1315,30 +1745,94 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
                 llm_executor,
                 lambda: self._call_llm_text(messages, token_callback)
             )
-            
+
+            if export_fmt:
+                # Prefer the structural fence the prompt above asked for —
+                # free (no extra LLM call) when the model actually complies.
+                # When it doesn't, fall back to a second small LLM call
+                # (_extract_export_content_via_llm) whose only job is
+                # extracting the clean content, rather than just the
+                # denylist alone — that call can strip ANY kind of
+                # surrounding noise (narration, self-doubt, redundant
+                # restatement), not just phrasings that happen to match a
+                # known-bad pattern. Either way this replaces chat_response
+                # itself (not just a copy for the export payload) — a
+                # degraded small model sometimes tacks on hallucinated tool
+                # narration or a fake "[Download ...]" link of its own
+                # after the real answer, and while we can't un-stream
+                # tokens already sent live for *this* turn, this keeps
+                # persisted history (and future turns' context — otherwise
+                # the model starts imitating its own fake link pattern)
+                # clean, and prevents a bogus second link from sitting next
+                # to the one real link we're about to add.
+                fence_match = re.search(r'```export\s*\n(.*?)```', chat_response, re.DOTALL | re.IGNORECASE)
+                if fence_match:
+                    export_content = self._clean_export_content(fence_match.group(1).strip())
+                    chat_response = (
+                        chat_response[:fence_match.start()] + export_content + chat_response[fence_match.end():]
+                    ).strip()
+                else:
+                    export_content = await loop.run_in_executor(
+                        llm_executor,
+                        lambda: self._extract_export_content_via_llm(chat_response, export_fmt)
+                    )
+                    chat_response = export_content
+                export_result = await self._execute_export_document({
+                    "content": export_content,
+                    "format": export_fmt,
+                })
+                if export_result.get("success"):
+                    extra = f"\n\n[Download {export_result['filename']}]({export_result['download_url']})"
+                else:
+                    extra = f"\n\n*(Couldn't export that as {export_fmt}: {export_result.get('error')})*"
+                chat_response += extra
+                # The response above this point was already streamed
+                # token-by-token; the caller only resends the full return
+                # value when nothing was streamed. Push the appended link
+                # through the same live channel so it isn't silently dropped.
+                if token_callback:
+                    token_callback(extra)
+
             await self._append_history("assistant", chat_response)
 
             return chat_response
 
         # If mode == "agent", we skip the Chat LLM and go straight to Plan Generation.
-        # First, a zero-cost pre-flight check: if the request names a specific
-        # connector that plainly isn't connected, there's no plan worth
-        # generating — skip straight to telling the user, before spending a
-        # query-rewrite LLM pass *and* a full planner LLM pass on something
-        # already known to fail. (Doesn't try to catch "no tool fits at all"
-        # in general — only this precise, cheap, high-confidence case.)
-        missing_connector = self._find_missing_connector_for_request(message)
-        if missing_connector:
-            response = (
-                f"I'd need **{missing_connector['display_name']}** connected to do that — "
-                "head to **Connectors** to add it, then ask me again."
+        # Export-to-file no longer has a tool here at all (see
+        # _get_local_tools' docstring) — it moved to Chat Mode's
+        # deterministic handling because Agent Mode's planner proved
+        # unreliable at it. Mirrors Chat Mode's own URL-detection nudge
+        # above, just in the opposite direction: a light LLM classification
+        # pass (see _classify_export_intent), not the planner discovering
+        # mid-plan that no tool fits.
+        import asyncio
+        loop = asyncio.get_running_loop()
+        if export_format in ("pdf", "docx", "xlsx"):
+            export_fmt = export_format
+        else:
+            export_fmt = await loop.run_in_executor(llm_executor, self._classify_export_intent, message)
+        if export_fmt:
+            nudge = (
+                "Exporting to a file is handled in **Chat Mode** — switch to it "
+                "(the toggle below) and ask me again there."
             )
-            await self._append_history("assistant", response)
-            return response
+            await self._append_history("assistant", nudge)
+            return nudge
+
+        # RAG context on already-uploaded documents — without this the
+        # planner has no way to know a document exists at all and will
+        # hallucinate a URL/tool for "the report I uploaded earlier" instead
+        # of just using its content (e.g. to feed a Gmail/Slack send tool).
+        document_context = await self._get_document_context(message, attachments, status_callback)
+        planner_context = entity_context + ("\n\n" + document_context if document_context else "")
 
         import asyncio
         loop = asyncio.get_running_loop()
-        tools_str, is_counting, offered_tool_names = await loop.run_in_executor(llm_executor, self.get_searched_tools, message)
+        # db_executor, not llm_executor — get_searched_tools does no LLM
+        # work anymore (see its docstring), so routing it through the
+        # single-worker LLM queue would just make it wait behind unrelated
+        # generation calls for no reason.
+        tools_str, is_counting, offered_tool_names = await loop.run_in_executor(db_executor, self.get_searched_tools, message)
         if not tools_str:
             return (
                 "I don't have any connected tools relevant to that request. "
@@ -1356,21 +1850,155 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
 
         import asyncio
         loop = asyncio.get_running_loop()
-        plan_json_str = await loop.run_in_executor(
-            llm_executor,
-            lambda: self.planner.generate_plan(
-                message, tools_str, entity_context, history_for_planner,
-                token_callback=None, is_counting=is_counting, tool_names=offered_tool_names,
-            )
-        )
 
-        try:
-            plan_data = json.loads(plan_json_str, strict=False)
-        except json.JSONDecodeError:
+        # Up to one retry, with a reinforced instruction, before giving up —
+        # covers three distinct small-model failure modes seen in practice,
+        # all previously either a hard immediate failure or a silently
+        # accepted bad result:
+        #   1. Invalid JSON (often a runaway plan that overflowed max_tokens
+        #      mid-generation — e.g. a degenerate "browser_extract_text at
+        #      offset 0, 1000, 2000, ..." pattern with 15+ steps).
+        #   2. A plan that DID parse but is absurdly long — this app's
+        #      tools never legitimately need more than a handful of steps,
+        #      so anything over _MAX_RAW_PLAN_STEPS is almost certainly the
+        #      same runaway pattern, just short enough to fit in the token
+        #      budget this time.
+        #   3. Neither a plan nor a direct_response/clarifying_question —
+        #      the planner prompt explicitly forbids this (see its
+        #      capability-question rule) but a degraded local model can
+        #      still produce it.
+        # _MAX_PLAN_ATTEMPTS=2 keeps the added latency bounded to a single
+        # extra generation call, and only for the attempts that actually
+        # need it — a normal, well-formed plan exits the loop on try 1.
+        _MAX_PLAN_ATTEMPTS = 2
+        _MAX_RAW_PLAN_STEPS = 8
+
+        # Held back for the repetition-guard retry below, used INSTEAD of
+        # history_for_planner on that one retry — not just the "RECENT TOOL
+        # RESULTS" block, but empty entirely. Verified empirically that the
+        # weaker version of this fix (stripping only that one system block,
+        # keeping the actual conversation turns) still reproduced the
+        # IDENTICAL wrong plan byte-for-byte: the model's own prior
+        # "Proposed Execution Plan" text sitting in ordinary history is
+        # apparently just as strong an anchor as the synthetic tool-results
+        # block was. The point of this retry is specifically "reconsider
+        # this request independently of whatever just happened" — so for
+        # this one attempt, "independently" means genuinely no prior
+        # turns, not a lighter version of the same contaminated context.
+        plan_data = None
+        retry_note = ""
+        use_stripped_history = False
+        for attempt in range(_MAX_PLAN_ATTEMPTS):
+            augmented_message = message + retry_note
+            attempt_history = [] if use_stripped_history else history_for_planner
+            # Diagnostic: planner_context (entity memory + RAG document
+            # context) is the one input NOT yet cleared on the repetition
+            # retry — history-clearing alone didn't stop the repeat, so
+            # this checks whether entity memory is the real anchor instead.
+            attempt_context = "" if use_stripped_history else planner_context
+            plan_json_str = await loop.run_in_executor(
+                llm_executor,
+                lambda am=augmented_message, ah=attempt_history, ac=attempt_context: self.planner.generate_plan(
+                    am, tools_str, ac, ah,
+                    token_callback=None, is_counting=is_counting, tool_names=offered_tool_names,
+                    attachments=attachments,
+                )
+            )
+            last_attempt = attempt == _MAX_PLAN_ATTEMPTS - 1
+
+            try:
+                candidate_data = json.loads(plan_json_str, strict=False)
+            except json.JSONDecodeError:
+                if last_attempt:
+                    break
+                retry_note = (
+                    "\n\n[SYSTEM]: Your previous response could not be parsed as JSON. "
+                    "Respond with ONLY a single valid JSON object — no text before or "
+                    "after it — and keep the plan to at most "
+                    f"{_MAX_RAW_PLAN_STEPS} steps."
+                )
+                continue
+
+            candidate_raw = candidate_data if isinstance(candidate_data, list) else candidate_data.get("plan", [])
+            candidate_raw = [
+                s for s in candidate_raw
+                if isinstance(s, dict) and s.get("tool")
+                and str(s.get("tool")).lower() not in ("none", "none_available", "null", "n/a", "unknown")
+            ]
+
+            if len(candidate_raw) > _MAX_RAW_PLAN_STEPS and not last_attempt:
+                logger.warning(f"[PlannerAgent] Oversized plan ({len(candidate_raw)} steps) — retrying with a shorter-plan instruction.")
+                retry_note = (
+                    f"\n\n[SYSTEM]: Your previous plan had {len(candidate_raw)} steps, which "
+                    "is far too many — you likely got stuck repeating a pattern. This app's "
+                    f"tools never legitimately need more than {_MAX_RAW_PLAN_STEPS}. Generate "
+                    "a SHORT plan that directly accomplishes the request, or return an empty "
+                    "plan with a clarifying_question if the request is unclear."
+                )
+                continue
+
+            has_direct_response = isinstance(candidate_data, dict) and bool(candidate_data.get("direct_response"))
+            has_clarifying_question = isinstance(candidate_data, dict) and bool(candidate_data.get("clarifying_question"))
+            if not candidate_raw and not has_direct_response and not has_clarifying_question and not last_attempt:
+                retry_note = (
+                    "\n\n[SYSTEM]: Your previous response had neither a \"plan\" nor a "
+                    "\"direct_response\". You MUST provide one of the two — if no tool call "
+                    "is needed, answer the user directly in \"direct_response\" instead of "
+                    "leaving everything empty."
+                )
+                continue
+
+            # 4. Suspicious repetition: this exact (tool, arguments) set was
+            # already proposed last turn, but nothing in the CURRENT
+            # message references any of its argument values — a degraded
+            # small model anchoring on whatever tool call it just saw
+            # succeed and echoing it verbatim, rather than reasoning about
+            # a genuinely different new request (reproduced: after a
+            # successful search_local_files(query="budget"), "what's
+            # inside this folder?" got the identical search_local_files
+            # plan back instead of list_folder). Argument-value overlap is
+            # the escape hatch for a real "do that again" follow-up, which
+            # should NOT be blocked.
+            if (
+                candidate_raw
+                and self._last_proposed_plan_signature is not None
+                and self._plan_signature(candidate_raw) == self._last_proposed_plan_signature
+                and not last_attempt
+            ):
+                msg_lower = message.lower()
+                arg_values = [
+                    str(v).lower() for step in candidate_raw
+                    for v in (step.get("arguments") or {}).values()
+                    if isinstance(v, (str, int, float)) and len(str(v)) > 2
+                ]
+                if not any(v in msg_lower for v in arg_values):
+                    logger.warning("[PlannerAgent] Plan identical to the last one proposed, with no argument overlap in the new message — retrying with the recent-tool-results anchor removed.")
+                    retry_note = (
+                        "\n\n[SYSTEM]: The plan you just generated is IDENTICAL to the one "
+                        "you already proposed for a DIFFERENT, previous request — you appear "
+                        "to be repeating it instead of addressing what's being asked now. "
+                        "Re-read the user's CURRENT message above carefully and generate a "
+                        "plan that specifically addresses THAT request. If it genuinely needs "
+                        "no tool, return an empty plan with a direct_response instead."
+                    )
+                    use_stripped_history = True
+                    continue
+
+            plan_data = candidate_data
+            break
+
+        if plan_data is None:
+            # Exhausted every attempt without ever getting parseable JSON —
+            # distinct from the "parsed fine but still degenerate" case
+            # below, which at least has a plan_data to fall back on.
             self.state = AgentState.IDLE
             self.plan = None
-            return "Planner generated invalid JSON. Please try your request again."
-        
+            return (
+                "I couldn't put together a plan for that after a couple of tries — the "
+                "request might be more complex than I can currently handle, or ambiguous. "
+                "Try breaking it into a simpler, more specific request."
+            )
+
         if isinstance(plan_data, list):
             raw_plan = plan_data
         else:
@@ -1387,7 +2015,10 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
 
         # Handle clarification escape hatch ONLY if no valid plan steps were generated
         if not raw_plan and isinstance(plan_data, dict) and plan_data.get("clarifying_question"):
-            question = plan_data.get("clarifying_question")
+            question = _sanitize_one_shot_text(
+                plan_data.get("clarifying_question"),
+                fallback="Could you clarify what you'd like me to do?",
+            )
             self.state = AgentState.IDLE
             await self._append_history("assistant", question)
 
@@ -1403,17 +2034,10 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
 
         if validation_errors:
             self.state = AgentState.IDLE
-            suggestion = self._suggest_connector_for_tool(bad_tool_name)
-            if suggestion:
-                return (
-                    f"I tried to use a **{suggestion['display_name']}** tool (`{bad_tool_name}`), "
-                    f"but {suggestion['display_name']} isn't connected — head to **Connectors** "
-                    "to add it, then ask me again."
-                )
             return (
-                f"I don't have a tool for that (`{bad_tool_name}`) — either the connector it "
-                "needs isn't set up, or it's not something I can do yet. Check **Connectors** or "
-                "**Marketplace** for what's available, or try rephrasing your request."
+                f"I don't have a tool for that (`{bad_tool_name}`) — it's not something I "
+                "can do yet. Check **Marketplace** for what's available, or try rephrasing "
+                "your request."
             )
         
         # 2. Metadata Validation (Dependencies, IDs)
@@ -1426,14 +2050,6 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
             
         if isinstance(warnings, str):
             warnings = [warnings]
-
-        # Catches a real, connected tool being the *wrong* one for what the
-        # user actually asked for (grammar constraints only stop invented
-        # tool names — see planner.py — not a valid tool used for the wrong
-        # service). Never overlaps with the pre-flight connector check: that
-        # one already blocks a request naming a disconnected service before
-        # a plan exists at all.
-        warnings.extend(self._check_cross_service_mismatch(message, raw_plan))
 
         # Fix 1: Increment the session-wide turn counter and rewrite all step IDs
         # from the LLM (e.g. "step_1") to globally unique IDs (e.g. "t3_step_1").
@@ -1502,28 +2118,47 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
             self.state = AgentState.IDLE
             direct_response = plan_data.get("direct_response") if isinstance(plan_data, dict) else None
             if direct_response:
-                response = direct_response
+                response = _sanitize_one_shot_text(
+                    direct_response,
+                    fallback="I'm not sure how to answer that directly — could you rephrase it?",
+                )
             elif warnings:
                 response = "**Note:**\n" + "\n".join([f"- {w}" for w in warnings])
             else:
-                # The model returned neither a plan nor a direct_response — a
-                # degenerate output the planner prompt explicitly tells it not
-                # to produce (see the capability-question rule), but a small
-                # local model can still miss it occasionally. Rather than
-                # dumping the full tool list with every argument and
-                # description, name just the tools themselves and ask what to
-                # do — short and readable instead of overwhelming.
-                tool_names = sorted({t["name"] for t in self._all_available_tools()})
-                names_str = ", ".join(f"`{n}`" for n in tool_names) if tool_names else "no tools"
-                response = f"I have access to: {names_str}. What would you like me to do?"
+                # The model returned neither a plan nor a direct_response on
+                # ANY attempt (the generation loop above already gave it one
+                # reinforced retry) — a degenerate output the planner prompt
+                # explicitly forbids, but a sufficiently degraded local
+                # model can still produce it twice in a row. Rather than
+                # showing a bare tool-list dump that doesn't answer what was
+                # actually asked, fall back to a plain-text answer the same
+                # way Chat Mode would — the user gets a real response
+                # instead of "what would you like me to do?" to a question
+                # they already asked clearly. The tool-list dump is kept
+                # only as the last-resort fallback if even this fails.
+                fallback_messages = [{"role": "system", "content": build_chat_prompt(entity_context)}]
+                fallback_messages.extend(history_for_planner)
+                fallback_messages.append({"role": "user", "content": message})
+                self._attach_vision_images(fallback_messages, attachments)
+                response = await loop.run_in_executor(
+                    llm_executor,
+                    lambda: self._call_llm_text(fallback_messages, None)
+                )
+                if not response or not response.strip():
+                    tool_names = sorted({t["name"] for t in self._all_available_tools()})
+                    names_str = ", ".join(f"`{n}`" for n in tool_names) if tool_names else "no tools"
+                    response = f"I have access to: {names_str}. What would you like me to do?"
 
             await self._append_history("assistant", response)
                 
             return response
 
         self.state = AgentState.WAITING_CONFIRMATION
-
-        from app.mcp.pagination_registry import is_write_tool
+        # Recorded for the NEXT turn's repetition guard (see the retry loop
+        # above) — deliberately not cleared on cancel, since a cancelled
+        # plan being immediately repeated verbatim is just as suspicious as
+        # an executed one being repeated.
+        self._last_proposed_plan_signature = self._plan_signature(self.plan)
 
         response = "**Proposed Execution Plan:**\n\n"
         for i, step in enumerate(self.plan):
@@ -1531,12 +2166,15 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
             scope = step.get("fetch_scope", "single")
             # Tells the user, at a glance, which steps only look at data and
             # which ones actually change something, before they hand out one
-            # blanket "yes" for the whole plan.
-            is_write = is_write_tool(tool_name, tool_schemas.get(tool_name, {}))
-            action_badge = "writes" if is_write else "read-only"
+            # blanket "yes" for the whole plan. A small hardcoded set
+            # (_READ_ONLY_TOOL_NAMES) replaces the old generic
+            # MCP-tool-registry classifier — everything else (browser_*,
+            # write_file) is treated as a write.
+            action_badge = "read-only" if tool_name in self._READ_ONLY_TOOL_NAMES else "writes"
             response += f"**Step {i+1}: `{tool_name}`** `[{action_badge}]` `[scope: {scope}]`\n"
-            if step.get("reason"):
-                response += f"> {step.get('reason')}\n"
+            reason = _sanitize_one_shot_text(step.get("reason") or "", fallback="")
+            if reason:
+                response += f"> {reason}\n"
 
             arguments = step.get("arguments")
             if arguments:
@@ -1577,8 +2215,9 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
             tool_name = r["tool"]
             display = r.get("display")
             if not display:
-                # Fallback for entries that never went through the pagination
-                # loop (e.g. a cap-hit continuation) — best-effort readable text.
+                # Fallback for entries built without a "display" key (e.g.
+                # the skipped-step / exception branches) — best-effort
+                # readable text.
                 try:
                     parsed = json.loads(r["result"])
                     display = json.dumps(parsed, indent=2)[:800]
@@ -1589,6 +2228,25 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
 
     async def _handle_confirmation(self, message: str, token_callback=None) -> str:
         """WAITING_CONFIRMATION → confirm → EXECUTING  or  refine plan."""
+        # New-task pivot — checked BEFORE appending to history, so a genuine
+        # pivot can cleanly hand off to _handle_idle (which does its own
+        # append) without double-recording the user's message. A user who
+        # ignores a pending plan and asks about a clearly different URL or
+        # file path than anything already in that plan has moved on to a
+        # new task, not editing this one — previously that got force-fit
+        # through the "refine the plan" path below, mixing stale plan
+        # context with the new request and sometimes producing raw,
+        # unformatted JSON instead of a real answer (reproduced with e.g. a
+        # pending web_scrape plan, then "save X to notes/review.txt" —  no
+        # URL, so only a path-aware check catches it).
+        new_resource = self._extract_url(message) or self._extract_path_like(message)
+        if new_resource and not any(
+            new_resource in json.dumps(step.get("arguments", {})) for step in (self.plan or [])
+        ):
+            self.plan = []
+            self.state = AgentState.IDLE
+            return await self._handle_idle(message, mode="agent", token_callback=token_callback)
+
         # Plan was seen and acted on by the user — clear the reconnect cache.
         self._pending_response = None
         await self._append_history("user", message)
@@ -1657,7 +2315,7 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
             )
             try:
                 plan_data = json.loads(plan_json_str)
-                raw_refined = plan_data.get("plan", [])
+                raw_refined = plan_data if isinstance(plan_data, list) else plan_data.get("plan", [])
 
                 # Apply the same turn-prefix rewriting as the main plan path so that
                 # step IDs are globally unique and cross-turn depends_on refs are stripped.
@@ -1687,241 +2345,27 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
 
                 response = "I have refined the execution plan:\n\n"
                 for i, step in enumerate(self.plan):
-                    response += f"{i+1}. **{step.get('tool')}**: {step.get('reason')}\n"
+                    reason = _sanitize_one_shot_text(step.get("reason") or "", fallback="")
+                    response += f"{i+1}. **{step.get('tool')}**: {reason}\n"
                 response += "\nIs this better? (Reply 'yes' to proceed)"
                 
                 await self._append_history("assistant", response)
                     
                 return response
-            except json.JSONDecodeError:
-                return "Error parsing refined plan from LLM."
-
-    async def _handle_loop_continuation(self, message: str) -> str:
-        """WAITING_LOOP_CONTINUATION → user says keep going or stop."""
-        await self._append_history("user", message)
-
-        positive_keywords = ["yes", "continue", "keep going", "more", "go ahead", "proceed"]
-        is_continue = self._matches_any_keyword(message, positive_keywords)
-
-        ps = self._pagination_state
-        if not ps:
-            self.state = AgentState.IDLE
-            return "No pagination state found. What would you like to do next?"
-
-        tool_results: list = ps.get("tool_results", [])
-
-        if not is_continue:
-            # User said stop — finalize with whatever was collected, the same
-            # way a normal execute_plan completion does (no separate LLM
-            # synthesis pass — the step_result cards already streamed live
-            # during the original run show the data directly).
-            self._pagination_state = {}
-            self.state = AgentState.IDLE
-            self.plan = None
-
-            if tool_results:
-                content = self._format_tool_results_markdown("Execution Results:", tool_results)
-                await self._append_history("assistant", content, msg_type="tool_call")
-                self._last_tool_results = [{"tool": r["tool"], "result": r["result"]} for r in tool_results]
-
-            response = "Got it — proceeding with the data collected so far. Execution complete!"
-            await self._append_history("assistant", response)
-            return response
-
-        # User said continue — hand off to _continue_pagination via
-        # execute_plan (see its delegation at the top), which resumes the
-        # capped/stalled step from current_arguments (already advanced to
-        # the next page/cursor) rather than restarting the plan.
-        self.state = AgentState.EXECUTING
-        response = f"Continuing to fetch more pages for `{ps.get('tool_name', 'the tool')}`..."
-        await self._append_history("assistant", response)
-        return response
-
-    async def _continue_pagination(self) -> AsyncGenerator[Dict[str, Any], None]:
-        """
-        Resumes exactly one step that previously hit its pagination cap or a
-        cursor stall (see WAITING_LOOP_CONTINUATION), picking up from
-        `current_arguments` — already advanced to the next page/cursor at
-        the moment it paused — instead of restarting the whole plan from
-        step 1. Only this one step is touched: every other already-completed
-        entry in tool_results/prior_results_map is carried through untouched,
-        so an earlier write-capable step (e.g. create_issue) never fires
-        twice just because a later read step needed more pages.
-
-        Not a full re-run of the plan-execution machinery — no Executor LLM
-        call, no schema/grounding checks — because none of that applies to
-        continuing a tool call that already passed them once.
-        """
-        ps = self._pagination_state
-        self._pagination_state = {}
-        if not ps:
-            self.state = AgentState.IDLE
-            yield {"text": "No pagination state to resume — nothing to continue.", "node_id": None}
-            return
-
-        from app.mcp.pagination_registry import get_next_cursor, is_tool_safe_to_autoloop
-        from app.mcp.response_shapers import shape_for_executor, shape_accumulated_response
-
-        tool_results: List[Dict] = ps["tool_results"]
-        prior_results_map: Dict[str, Any] = ps["prior_results_map"]
-        tool_name = ps["tool_name"]
-        node_id = ps["node_id"]
-        current_arguments = dict(ps["current_arguments"])
-        accumulated_items: List[Any] = list(ps["accumulated_items"])
-        accumulated_raw: List[Any] = list(ps["accumulated_raw"])
-        auto_paginated = ps.get("auto_paginated", True)
-        fetch_scope = ps.get("fetch_scope", "exhaustive")
-        schema = ps.get("schema", {})
-        prev_cursor_value = ps.get("prev_cursor_value")
-
-        _PAGE_CAP = 20
-        _SAMPLE_CAP = 3
-        page_cap = _PAGE_CAP if fetch_scope == "exhaustive" else _SAMPLE_CAP
-        safe_to_loop = is_tool_safe_to_autoloop(tool_name, schema)
-
-        cap_hit = False
-        loop_stop_reason = "cap"
-
-        yield {"text": f"\nContinuing `{tool_name}`…\n", "node_id": node_id, "status": "running"}
-
-        for page_num in range(page_cap):
-            if page_num > 0:
-                yield {"text": f"  ↳ Page {page_num + 1}…\n", "node_id": node_id, "status": "running"}
-                auto_paginated = True
-
-            result = await anyio.to_thread.run_sync(
-                lambda t=tool_name, a=dict(current_arguments): mcp_registry.call_tool(t, a)
-            )
-            try:
-                raw_parsed = json.loads(str(result)) if isinstance(result, str) else result
-            except (json.JSONDecodeError, TypeError):
-                raw_parsed = result
-
-            accumulated_items.append(shape_for_executor(tool_name, raw_parsed))
-            accumulated_raw.append(raw_parsed)
-
-            if not safe_to_loop:
-                loop_stop_reason = "safety"
-                break
-
-            if isinstance(raw_parsed, list):
-                per_page_default = int(current_arguments.get("per_page", 30))
-                if len(raw_parsed) >= per_page_default:
-                    current_arguments["page"] = current_arguments.get("page", 1) + 1
-                    continue
-                loop_stop_reason = "last_page"
-                break
-
-            cursor_info = get_next_cursor(tool_name, raw_parsed if isinstance(raw_parsed, dict) else {})
-            if cursor_info is None:
-                loop_stop_reason = "last_page"
-                break
-            new_cursor = cursor_info["cursor_value"]
-            if new_cursor == prev_cursor_value:
-                loop_stop_reason = "stall"
-                break
-            prev_cursor_value = new_cursor
-            current_arguments[cursor_info["inject_arg"]] = new_cursor
-        else:
-            cap_hit = True
-            loop_stop_reason = "cap"
-
-        final_display = shape_accumulated_response(
-            tool_name, accumulated_items, len(accumulated_items), raw_items=accumulated_raw
-        )
-        yield {"type": "step_result", "text": final_display, "node_id": node_id, "status": "completed", "tool": tool_name}
-
-        final_exec_output = (
-            accumulated_items[0] if len(accumulated_items) == 1
-            else {
-                "pages": accumulated_items,
-                "total_pages_fetched": len(accumulated_items),
-                "auto_paginated": auto_paginated,
-                "cap_hit": cap_hit,
-            }
-        )
-
-        # Patch this one step's entry in place — find it by node_id so a
-        # duplicate tool name elsewhere in the plan is never mismatched.
-        prior_results_map[node_id] = {"tool": tool_name, "output": final_exec_output}
-        patched_entry = {
-            "tool": tool_name,
-            "arguments": current_arguments,
-            "result": json.dumps(final_exec_output, ensure_ascii=False),
-            "display": final_display,
-            "auto_paginated": auto_paginated,
-            "cap_hit": cap_hit,
-            "node_id": node_id,
-        }
-        for idx, r in enumerate(tool_results):
-            if r.get("node_id") == node_id:
-                tool_results[idx] = patched_entry
-                break
-        else:
-            tool_results.append(patched_entry)
-
-        if loop_stop_reason == "stall":
-            self._pagination_state = {
-                "tool_results": tool_results,
-                "prior_results_map": prior_results_map,
-                "tool_name": tool_name,
-                "node_id": node_id,
-                "current_arguments": current_arguments,
-                "accumulated_items": accumulated_items,
-                "accumulated_raw": accumulated_raw,
-                "auto_paginated": auto_paginated,
-                "fetch_scope": fetch_scope,
-                "schema": schema,
-                "prev_cursor_value": prev_cursor_value,
-            }
-            self.state = AgentState.WAITING_LOOP_CONTINUATION
-            yield {
-                "text": (
-                    f"\n\n**Pagination Stalled Again** for `{tool_name}`\n\n"
-                    f"Still stuck after {len(accumulated_items)} page(s) — this API's cursor "
-                    "genuinely isn't advancing. Reply **'yes'** to try once more or **'no'** to "
-                    "proceed with what was collected."
-                ),
-                "node_id": None,
-                "status": "waiting",
-            }
-            return
-
-        if cap_hit:
-            self._pagination_state = {
-                "tool_results": tool_results,
-                "prior_results_map": prior_results_map,
-                "tool_name": tool_name,
-                "node_id": node_id,
-                "current_arguments": current_arguments,
-                "accumulated_items": accumulated_items,
-                "accumulated_raw": accumulated_raw,
-                "auto_paginated": auto_paginated,
-                "fetch_scope": fetch_scope,
-                "schema": schema,
-                "prev_cursor_value": prev_cursor_value,
-            }
-            self.state = AgentState.WAITING_LOOP_CONTINUATION
-            yield {
-                "text": (
-                    f"\n\n**Pagination cap reached again** for `{tool_name}`. "
-                    f"{len(accumulated_items)} pages fetched so far.\n\n"
-                    "**Continue fetching more pages?** Reply **'yes'** to fetch another batch "
-                    "or **'no'** to proceed with what I have."
-                ),
-                "node_id": None,
-                "status": "waiting",
-            }
-            return
-
-        yield {"text": "\nExecution complete!", "node_id": None}
-
-        content = self._format_tool_results_markdown("Execution Results:", tool_results)
-        await self._append_history("assistant", content, msg_type="tool_call")
-        self._last_tool_results = [{"tool": r["tool"], "result": r["result"]} for r in tool_results]
-
-        self.state = AgentState.IDLE
-        self.plan = None
+            except Exception as e:
+                # Broadened from json.JSONDecodeError: a malformed/unexpected
+                # shape here (e.g. plan_data.get on something that isn't a
+                # dict) previously propagated out as a raw, unformatted
+                # error or — worse — let the model's raw JSON text leak
+                # straight through as the "response". Whatever the cause,
+                # the pending plan is still intact — never worse than
+                # telling the user that and letting them retry.
+                logger.warning(f"Plan refinement failed: {e}")
+                return (
+                    "I couldn't refine the plan from that. The original plan is still "
+                    "pending — reply 'yes' to run it, 'cancel' to discard it, or try "
+                    "describing your edit differently."
+                )
 
     # ─────────────────────────────────────────────────────────────────────────
     # Plan execution
@@ -1933,20 +2377,9 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
             yield {"text": "No plan to execute.", "node_id": None}
             return
 
-        # Resuming after WAITING_LOOP_CONTINUATION ("continue fetching more
-        # pages?") is a completely different operation from running the plan
-        # — every step already ran once; only the capped/stalled step needs
-        # revisiting. Delegate entirely rather than falling into the normal
-        # step loop below, which would silently re-run every step from
-        # scratch (including write-capable ones a second time).
-        if self._pagination_state:
-            async for progress in self._continue_pagination():
-                yield progress
-            return
-
         all_tools = self._all_available_tools()
         if not all_tools:
-            yield {"text": "Error: No connected MCP servers or active local tools found.", "node_id": None}
+            yield {"text": "Error: No active local tools found.", "node_id": None}
             self.state = AgentState.IDLE
             return
 
@@ -1967,21 +2400,12 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
         full_chat_history = json.dumps(trimmed_history, indent=2)
         entity_context = self._get_entity_context()
 
-        from app.mcp.pagination_registry import get_next_cursor, is_tool_safe_to_autoloop
-
-        # Pagination constants
-        _PAGE_CAP = 20         # max pages per step for exhaustive scope
-        _SAMPLE_CAP = 3        # max pages for sample scope
-
         # Run each tool step and collect raw results
         tool_results: List[Dict] = []
         # Stores structured output per step_id for the Executor — avoids prose-parsing for IDs.
         # Format: {node_id: {"tool": tool_name, "output": <parsed JSON or raw string>}}
         prior_results_map: Dict[str, Any] = {}
         total_steps = len(self.plan)
-        # Captures exactly what a cap-hit step needs to genuinely continue
-        # from (next page/cursor, pages gathered so far) — see _continue_pagination.
-        step_resume_snapshots: Dict[str, Dict] = {}
         # step_ids skipped because a step they (transitively) depend on
         # failed — populated by the exception handler below. A failure no
         # longer aborts the whole plan; only the failed step and whatever
@@ -2034,46 +2458,73 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
                 for sid, v in prior_results_map.items()
             ]
 
-            # Generate arguments live using the deterministic Executor Agent
+            # Generate arguments live using the deterministic Executor Agent.
+            # Up to one retry with a reinforced instruction on invalid
+            # output before aborting the plan — mirrors the planner's own
+            # retry loop above (_MAX_PLAN_ATTEMPTS): a degraded local model
+            # producing one malformed arguments object is exactly as
+            # recoverable-with-a-nudge as it producing one malformed plan,
+            # so there's no reason the planner gets a second try and the
+            # executor doesn't. Bounded to 2 attempts total, same as the
+            # planner, so the added latency only hits the (rare) attempts
+            # that actually need it.
             import asyncio
             loop = asyncio.get_running_loop()
-            arguments = await loop.run_in_executor(
-                llm_executor,
-                lambda: self.executor.generate_arguments(
-                    tool_name=tool_name,
-                    tool_schema=schema,
-                    overall_plan=self.plan,
-                    step_reason=step_reason,
-                    prior_results=prior_results_for_executor,
-                    entity_context=entity_context,
-                    user_request=full_chat_history
+            _MAX_ARG_ATTEMPTS = 2
+            arguments = None
+            validation_error = None
+            for arg_attempt in range(_MAX_ARG_ATTEMPTS):
+                retry_note = ""
+                if validation_error is not None:
+                    retry_note = (
+                        f"\n\n[SYSTEM]: Your previous attempt was invalid: {validation_error}. "
+                        "Re-read the schema and output ONLY a JSON object matching it exactly."
+                    )
+                candidate = await loop.run_in_executor(
+                    llm_executor,
+                    lambda rn=retry_note: self.executor.generate_arguments(
+                        tool_name=tool_name,
+                        tool_schema=schema,
+                        overall_plan=self.plan,
+                        step_reason=step_reason,
+                        prior_results=prior_results_for_executor,
+                        entity_context=entity_context,
+                        user_request=full_chat_history,
+                        retry_note=rn,
+                    )
                 )
-            )
+                last_attempt = arg_attempt == _MAX_ARG_ATTEMPTS - 1
 
-            # Handle Executor Escape Hatch
-            if isinstance(arguments, dict) and "error" in arguments:
-                err_msg = arguments["error"]
-                logger.error(f"Executor aborted for {tool_name}: {err_msg}")
-                yield {"text": f"Plan aborted: {err_msg}\n", "node_id": node_id, "status": "failed"}
-                self.state = AgentState.IDLE
-                self.plan = None
-                return
+                if isinstance(candidate, dict) and "error" in candidate:
+                    validation_error = candidate["error"]
+                    if last_attempt:
+                        logger.error(f"Executor aborted for {tool_name}: {validation_error}")
+                        yield {"text": f"Plan aborted: {validation_error}\n", "node_id": node_id, "status": "failed"}
+                        self.state = AgentState.IDLE
+                        self.plan = None
+                        return
+                    continue
 
-            # Clean up known LLM hallucinations before validation
-            if isinstance(arguments, dict):
-                # Small models often bleed the 'fetch_scope' step parameter into the arguments dict
-                if "fetch_scope" in arguments and "fetch_scope" not in schema.get("properties", {}):
-                    del arguments["fetch_scope"]
+                # Clean up known LLM hallucinations before validation
+                if isinstance(candidate, dict):
+                    # Small models often bleed the 'fetch_scope' step parameter into the arguments dict
+                    if "fetch_scope" in candidate and "fetch_scope" not in schema.get("properties", {}):
+                        del candidate["fetch_scope"]
 
-            # Single strict check to catch catastrophic failure
-            try:
-                jsonschema.validate(instance=arguments, schema=schema)
-            except jsonschema.exceptions.ValidationError as e:
-                logger.error(f"Executor failed schema validation for {tool_name}: {e.message}")
-                yield {"text": f"Plan aborted: Executor generated invalid arguments for `{tool_name}`: {e.message}\n", "node_id": node_id, "status": "failed"}
-                self.state = AgentState.IDLE
-                self.plan = None
-                return
+                try:
+                    jsonschema.validate(instance=candidate, schema=schema)
+                except jsonschema.exceptions.ValidationError as e:
+                    validation_error = e.message
+                    if last_attempt:
+                        logger.error(f"Executor failed schema validation for {tool_name}: {e.message}")
+                        yield {"text": f"Plan aborted: Executor generated invalid arguments for `{tool_name}`: {e.message}\n", "node_id": node_id, "status": "failed"}
+                        self.state = AgentState.IDLE
+                        self.plan = None
+                        return
+                    continue
+
+                arguments = candidate
+                break
 
             # Semantic Grounding Check: Catch schema-valid but hallucinated IDs
             # Only validate ID-shaped arguments for steps that explicitly depend on previous outputs.
@@ -2126,182 +2577,70 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
                     return
 
             try:
-                from app.mcp.response_shapers import shape_for_executor, shape_for_display
+                from app.mcp.response_shapers import shape_for_executor, shape_accumulated_response
 
-                # ── Pagination-aware execution loop ────────────────────────────
-                fetch_scope = step.get("fetch_scope", "single")
+                # Every remaining tool is local (web_scrape / browser_* /
+                # the sandboxed filesystem tools) — one action against one
+                # page/session/path, no pagination loop needed (that whole
+                # apparatus, cursor-following and all, existed purely for
+                # MCP-connected list tools like Gmail/Notion/Drive/Slack,
+                # none of which exist here anymore).
+                yield {"text": f"Fetching `{tool_name}`…\n", "node_id": node_id, "status": "running"}
 
-                is_local_web_tool = (
-                    tool_name == "web_scrape"
-                    or tool_name.startswith("browser_")
-                    or tool_name == "export_document"
-                )
+                if tool_name == "web_scrape":
+                    outcome = await self._execute_web_scrape(arguments)
+                elif tool_name in self._FILESYSTEM_TOOL_NAMES:
+                    outcome = await self._execute_filesystem_tool(tool_name, arguments)
+                else:
+                    outcome = await self._execute_browser_action(tool_name, arguments)
 
-                # Determine page cap and safety based on scope
-                if is_local_web_tool:
-                    # A single action against one page/session/export, never
-                    # paginated the MCP way — ignore whatever fetch_scope
-                    # the planner assigned. (browser_extract_text has its
-                    # own, different pagination — see offset/next_offset.)
-                    page_cap = 1
-                    safe_to_loop = True
-                elif fetch_scope == "exhaustive":
-                    page_cap = _PAGE_CAP
-                    safe_to_loop = is_tool_safe_to_autoloop(tool_name, schema)
-                elif fetch_scope == "sample":
-                    page_cap = _SAMPLE_CAP
-                    safe_to_loop = is_tool_safe_to_autoloop(tool_name, schema)
-                else:  # "single" or unrecognized
-                    page_cap = 1
-                    safe_to_loop = True  # single page — gate irrelevant
-
-                accumulated_items: List[Any] = []
-                # Parallel list of true, unshaped tool output — kept only so the
-                # single-page display fallback can show the real thing instead of
-                # the executor-shaped (renamed/pruned) version. See
-                # shape_accumulated_response's single-page fallback.
-                accumulated_raw: List[Any] = []
-                current_arguments = dict(arguments)
-                # Inject page=1 for paginated tools if not already present
-                if "page" not in current_arguments and fetch_scope in ("exhaustive", "sample"):
-                    current_arguments["page"] = 1
-                prev_cursor_value = None
-                cap_hit = False
-                auto_paginated = False
-                loop_stop_reason = "single"  # single | last_page | safety | stall | cap
-
-                for page_num in range(page_cap):
-                    if page_num == 0:
-                        verb = "Fetching" if page_cap == 1 else "Fetching all pages of"
-                        yield {"text": f"{verb} `{tool_name}`…\n", "node_id": node_id, "status": "running"}
+                # A login-walled/private page still usually loads fine
+                # (success=True with a partial/logged-out view, or a
+                # generic "not found") — needs_auth is the real signal,
+                # independent of success. Only web_scrape and
+                # browser_navigate ever set it (every other browser_*
+                # action's outcome simply won't have this key). No
+                # retry path — public pages only, see
+                # app.core.scraper's module docstring — so this just
+                # becomes a note telling the model to say so, same as
+                # any other tool outcome.
+                if outcome["success"]:
+                    if "text" in outcome:
+                        # web_scrape / browser_navigate / browser_extract_text /
+                        # read_file — all chunked identically via _chunk_text,
+                        # capped there, so has_more/next_offset stay in sync
+                        # with what text_preview actually holds. Keeps
+                        # whatever extra metadata each tool's outcome carries
+                        # (title+warnings for the web tools, path+file_type
+                        # for read_file) generically rather than hardcoding
+                        # one tool family's field names; drops the raw
+                        # pagination bookkeeping in favor of the human-
+                        # readable "note" below.
+                        result = {
+                            k: v for k, v in outcome.items()
+                            if k not in ("success", "text", "offset", "next_offset", "has_more", "total_length")
+                        }
+                        result["text_preview"] = outcome["text"]
+                        note = self._continuation_note(tool_name, outcome)
+                        if note:
+                            result["note"] = note
                     else:
-                        yield {"text": f"  ↳ Page {page_num + 1}…\n", "node_id": node_id, "status": "running"}
-                        auto_paginated = True
-
-                    if is_local_web_tool:
-                        # Not an MCP server — routed through the same shared,
-                        # deliberately ephemeral dispatch Chat Mode's own
-                        # tool-calling uses (_execute_web_scrape /
-                        # _execute_browser_action): no persistence, no
-                        # Qdrant embedding, nothing saved beyond this turn's
-                        # result. If a later question needs this content
-                        # again, the model must call the tool again — for
-                        # web_scrape that means a fresh fetch; for the
-                        # browser_* tools, the session (and whatever page
-                        # is loaded) is still there to read further.
-                        if tool_name == "web_scrape":
-                            outcome = await self._execute_web_scrape(current_arguments)
-                        elif tool_name == "export_document":
-                            outcome = await self._execute_export_document(current_arguments)
-                        else:
-                            outcome = await self._execute_browser_action(tool_name, current_arguments)
-
-                        # A login-walled/private page still usually loads fine
-                        # (success=True with a partial/logged-out view, or a
-                        # generic "not found") — needs_auth is the real signal,
-                        # independent of success. Only web_scrape and
-                        # browser_navigate ever set it (every other browser_*
-                        # action's outcome simply won't have this key). No
-                        # retry path — public pages only, see
-                        # app.core.scraper's module docstring — so this just
-                        # becomes a note telling the model to say so, same as
-                        # any other tool outcome.
-                        if outcome["success"]:
-                            if "text" in outcome:
-                                # web_scrape / browser_navigate / browser_extract_text
-                                # — all chunked identically via _chunk_text, capped
-                                # there (not here), so has_more/next_offset stay in
-                                # sync with what text_preview actually holds.
-                                result = {
-                                    "title": outcome.get("title"),
-                                    "text_preview": outcome["text"],
-                                    "warnings": outcome.get("warnings"),
-                                }
-                                note = self._continuation_note(tool_name, outcome)
-                                if note:
-                                    result["note"] = note
-                            else:
-                                # Every other browser_* action (click, fill, scroll,
-                                # wait_for, screenshot, go_back, go_forward,
-                                # list_tabs, switch_tab, close) — pass its own
-                                # fields straight through.
-                                result = {k: v for k, v in outcome.items() if k != "success"}
-                        else:
-                            result = {"error": outcome.get("error")}
-                            if outcome.get("needs_auth"):
-                                result["note"] = (
-                                    "This page requires signing in or is private — this "
-                                    "tool only accesses public pages. Tell the user "
-                                    "directly that you can't access it."
-                                )
-                    else:
-                        result = await anyio.to_thread.run_sync(
-                            lambda t=tool_name, a=dict(current_arguments): mcp_registry.call_tool(t, a)
+                        # Every other browser_* action (click, fill, scroll,
+                        # wait_for, screenshot, go_back, go_forward,
+                        # list_tabs, switch_tab, close) — pass its own
+                        # fields straight through.
+                        result = {k: v for k, v in outcome.items() if k != "success"}
+                else:
+                    result = {"error": outcome.get("error")}
+                    if outcome.get("needs_auth"):
+                        result["note"] = (
+                            "This page requires signing in or is private — this "
+                            "tool only accesses public pages. Tell the user "
+                            "directly that you can't access it."
                         )
 
-                    # Parse raw result
-                    try:
-                        raw_parsed = json.loads(str(result)) if isinstance(result, str) else result
-                    except (json.JSONDecodeError, TypeError):
-                        raw_parsed = result
-
-                    shaped_for_exec = shape_for_executor(tool_name, raw_parsed)
-                    accumulated_items.append(shaped_for_exec)
-                    accumulated_raw.append(raw_parsed)
-                    # ↑ Do NOT yield a step_result here. Hold everything until all
-                    #   pages are done, then emit one smart summary card below.
-
-                    # ── Decide next action ─────────────────────────────────────
-                    if page_cap == 1:
-                        loop_stop_reason = "single"
-                        break
-
-                    if not safe_to_loop:
-                        loop_stop_reason = "safety"
-                        break
-
-                    # GitHub-style: plain list → infer more pages from count
-                    if isinstance(raw_parsed, list):
-                        per_page_default = int(current_arguments.get("per_page", 30))
-                        if len(raw_parsed) >= per_page_default:
-                            current_arguments["page"] = current_arguments.get("page", 1) + 1
-                            logger.info(
-                                f"[Pagination] Full page ({len(raw_parsed)} items) — fetching page {current_arguments['page']}"
-                            )
-                            continue
-                        else:
-                            loop_stop_reason = "last_page"
-                            logger.info(
-                                f"[Pagination] Partial page ({len(raw_parsed)}/{per_page_default}) — done"
-                            )
-                            break
-
-                    # Cursor-based tools (Gmail, Notion, Drive, Slack, …)
-                    cursor_info = get_next_cursor(
-                        tool_name, raw_parsed if isinstance(raw_parsed, dict) else {}
-                    )
-                    if cursor_info is None:
-                        loop_stop_reason = "last_page"
-                        break
-
-                    new_cursor = cursor_info["cursor_value"]
-                    if new_cursor == prev_cursor_value:
-                        loop_stop_reason = "stall"
-                        logger.warning(f"[Pagination] Cursor stall for '{tool_name}'")
-                        break
-
-                    prev_cursor_value = new_cursor
-                    current_arguments = dict(arguments)
-                    current_arguments[cursor_info["inject_arg"]] = new_cursor
-                else:
-                    cap_hit = True
-                    loop_stop_reason = "cap"
-
-                # ── Emit ONE final result card ─────────────────────────────────
-                from app.mcp.response_shapers import shape_accumulated_response
-                final_display = shape_accumulated_response(
-                    tool_name, accumulated_items, len(accumulated_items), raw_items=accumulated_raw
-                )
+                shaped_for_exec = shape_for_executor(tool_name, result)
+                final_display = shape_accumulated_response(tool_name, [shaped_for_exec], 1, raw_items=[result])
                 yield {
                     "type": "step_result",
                     "text": final_display,
@@ -2310,91 +2649,17 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
                     "tool": tool_name,
                 }
 
-                # ── Warn user for non-goal-reaching stops ─────────────────────
-                if loop_stop_reason == "safety":
-                    yield {
-                        "text": (
-                            f"\n> **Note:** `{tool_name}` is a write-capable or unreviewed tool "
-                            "and cannot be auto-paginated for safety. Only the first page was fetched. "
-                            "Ask me to fetch the next page explicitly if you need more.\n"
-                        ),
-                        "node_id": node_id,
-                        "status": "completed",
-                    }
-                elif loop_stop_reason == "stall":
-                    # Cursor didn't advance — treat like a cap hit and ask user.
-                    # "Retry" here just means trying the same (stalled) cursor
-                    # once more — a real API hiccup is the only thing that
-                    # would make that succeed; a genuine stall will stall
-                    # again, which _continue_pagination handles the same way.
-                    self._pagination_state = {
-                        "tool_results": tool_results,
-                        "prior_results_map": prior_results_map,
-                        "tool_name": tool_name,
-                        "node_id": node_id,
-                        "current_arguments": current_arguments,
-                        "accumulated_items": accumulated_items,
-                        "accumulated_raw": accumulated_raw,
-                        "auto_paginated": auto_paginated,
-                        "fetch_scope": fetch_scope,
-                        "schema": schema,
-                        "prev_cursor_value": prev_cursor_value,
-                    }
-                    self.state = AgentState.WAITING_LOOP_CONTINUATION
-                    yield {
-                        "text": (
-                            f"\n\n**Pagination Stalled** for `{tool_name}`\n\n"
-                            f"The cursor stopped advancing after {len(accumulated_items)} page(s). "
-                            "This may mean the API returned the same page twice, or all results have been collected.\n\n"
-                            "__PAGINATION_CAP__\n\n"
-                            "**Would you like to stop here or retry?** Reply **'yes'** to retry from the next page or **'no'** to proceed with what was collected."
-                        ),
-                        "node_id": None,
-                        "status": "waiting",
-                    }
-                    return
-
-                # Build the merged exec output for subsequent plan steps and history
-                final_exec_output = (
-                    accumulated_items[0] if len(accumulated_items) == 1
-                    else {
-                        "pages": accumulated_items,
-                        "total_pages_fetched": len(accumulated_items),
-                        "auto_paginated": auto_paginated,
-                        "cap_hit": cap_hit,
-                    }
-                )
-
                 # Store shaped executor output for subsequent steps and planner context.
-                prior_results_map[node_id] = {"tool": tool_name, "output": final_exec_output}
+                prior_results_map[node_id] = {"tool": tool_name, "output": shaped_for_exec}
                 tool_results.append({
                     "tool": tool_name,
                     "arguments": arguments,
-                    "result": json.dumps(final_exec_output, ensure_ascii=False),
+                    "result": json.dumps(shaped_for_exec, ensure_ascii=False),
                     "display": final_display,
-                    "auto_paginated": auto_paginated,
-                    "cap_hit": cap_hit,
+                    "auto_paginated": False,
+                    "cap_hit": False,
                     "node_id": node_id,
                 })
-
-                if cap_hit:
-                    # Snapshot everything needed to genuinely continue this
-                    # exact step later — current_arguments already holds the
-                    # next page number / cursor (it's advanced at the end of
-                    # each successful page before the loop re-checks its
-                    # budget), so resuming from here picks up new pages
-                    # instead of re-fetching from page 1.
-                    step_resume_snapshots[node_id] = {
-                        "tool_name": tool_name,
-                        "node_id": node_id,
-                        "current_arguments": current_arguments,
-                        "accumulated_items": accumulated_items,
-                        "accumulated_raw": accumulated_raw,
-                        "auto_paginated": auto_paginated,
-                        "fetch_scope": fetch_scope,
-                        "schema": schema,
-                        "prev_cursor_value": prev_cursor_value,
-                    }
             except Exception as e:
                 logger.error(f"Tool execution failed at step {i+1}: {e}\n{traceback.format_exc()}")
 
@@ -2441,31 +2706,6 @@ Example: {{"tools": ["slack_send_message", "google_drive_find_file"], "is_counti
                 yield {"text": f"{msg}\n{progress_msg}", "node_id": node_id, "status": "failed"}
                 # Fall through to the next iteration of the step loop instead
                 # of aborting — independent steps still get a chance to run.
-
-        # Check if any step hit the pagination cap — if so, offer to continue.
-        # Only the first cap-hit step is resumable per continuation round (a
-        # plan with more than one exhaustive-scope step capping in the same
-        # turn is rare); any others just keep whatever they'd already
-        # fetched, same as before.
-        cap_hit_steps = [r for r in tool_results if r.get("cap_hit")]
-        if cap_hit_steps:
-            resume_node_id = cap_hit_steps[0]["node_id"]
-            snapshot = step_resume_snapshots.get(resume_node_id)
-            if snapshot:
-                self._pagination_state = {
-                    "tool_results": tool_results,
-                    "prior_results_map": prior_results_map,
-                    **snapshot,
-                }
-                self.state = AgentState.WAITING_LOOP_CONTINUATION
-                cap_tool_names = ", ".join(f"`{r['tool']}`" for r in cap_hit_steps)
-                prompt = (
-                    f"\n\n**Pagination cap reached** for {cap_tool_names}. "
-                    "I've fetched as many pages as allowed but may not have the full picture yet.\n\n"
-                    "**Continue fetching more pages?** Reply **'yes'** to fetch another batch or **'no'** to proceed with what I have."
-                )
-                yield {"text": prompt, "node_id": None, "status": "waiting"}
-                return
 
         yield {"text": "\nExecution complete!", "node_id": None}
 

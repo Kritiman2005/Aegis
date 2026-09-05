@@ -28,23 +28,21 @@ async def watch_timeouts():
     """
     Background task to cancel pending states that sit idle for > 5 minutes.
     Covers every state that blocks the dispatcher on a specific reply —
-    WAITING_TOOL_INPUT and WAITING_LOOP_CONTINUATION included, since missing
-    either here means a user who abandons a cookie prompt or a "continue
-    fetching?" prompt leaves that session stuck forever: every future
-    message, even an unrelated new request, keeps getting swallowed into
-    that stale handler with no way out.
+    WAITING_LOOP_CONTINUATION included, since missing it means a user who
+    abandons a "continue fetching?" prompt leaves that session stuck
+    forever: every future message, even an unrelated new request, keeps
+    getting swallowed into that stale handler with no way out.
     """
     while True:
         await asyncio.sleep(10)
         now = time.time()
         for cid, session in list(agent_sessions.items()):
             if session.state in [
-                AgentState.WAITING_CONFIRMATION, AgentState.WAITING_TOOL_INPUT, AgentState.WAITING_LOOP_CONTINUATION,
+                AgentState.WAITING_CONFIRMATION, AgentState.WAITING_LOOP_CONTINUATION,
             ]:
                 if now - session.state_entered_at > 300: # 5 minutes
                     session.state = AgentState.IDLE
                     session.plan = None
-                    session._tool_input_state = None
                     session._pagination_state = {}
                     try:
                         await manager.send_json(cid, {
@@ -142,6 +140,7 @@ async def websocket_endpoint(
             content = payload.get("content", "")
             mode = payload.get("mode", "chat")
             attachments = payload.get("attachments") or None
+            export_format = payload.get("export_format") or None
 
             if msg_type == "ping":
                 await manager.send_json(connection_id, {"type": "pong"})
@@ -195,7 +194,7 @@ async def websocket_endpoint(
                 if hasattr(session, "cancel_event"):
                     session.cancel_event.clear()
 
-                async def process_message_task(msg_content: str, msg_mode: str, msg_attachments=attachments):
+                async def process_message_task(msg_content: str, msg_mode: str, msg_attachments=attachments, msg_export_format=export_format):
                     def superseded() -> bool:
                         # True once a cancel (or a newer message) has moved
                         # the session on from this task — its eventual
@@ -251,6 +250,7 @@ async def websocket_endpoint(
                             token_callback=send_token_sync,
                             status_callback=send_status,
                             attachments=msg_attachments,
+                            export_format=msg_export_format,
                         )
 
                         # Stop the token sender task

@@ -59,6 +59,16 @@ const BACKEND_ROOT = IS_DEV
   ? path.join(PROJECT_ROOT, 'backend')
   : path.join(process.resourcesPath, 'backend');
 
+const ASSETS_ROOT = IS_DEV
+  ? path.join(PROJECT_ROOT, 'assets')
+  : path.join(process.resourcesPath, 'assets');
+
+// .ico on Windows so the title bar/taskbar get the multi-resolution icon;
+// a plain PNG works fine as BrowserWindow's icon on macOS/Linux (and as the
+// dev-mode dock icon below) — the packaged .app/.icns is what actually
+// brands the Dock/Finder icon on mac, this is just the in-window one.
+const APP_ICON_PATH = path.join(ASSETS_ROOT, process.platform === 'win32' ? 'icon.ico' : 'icon.png');
+
 // ─── State ───────────────────────────────────────────────────────────────────
 
 let mainWindow: BrowserWindow | null = null;
@@ -243,6 +253,7 @@ function createWindow(): BrowserWindow {
     height: 800,
     minWidth: 900,
     minHeight: 600,
+    icon: APP_ICON_PATH,
     show: false, // Hidden until content is ready (prevents flash)
     titleBarStyle: 'hiddenInset', // Native traffic lights, no default title bar
     backgroundColor: '#F4F4F5',   // Match Aegis's light theme to prevent a dark flash
@@ -351,6 +362,12 @@ app.whenReady().then(async () => {
   Menu.setApplicationMenu(buildAppMenu());
   configureCSP();
   registerIpcHandlers();
+
+  // macOS dock icon: only needed in dev — a packaged .app already carries
+  // its icon from build.mac.icon (assets/icon.icns) via electron-builder.
+  if (IS_DEV && process.platform === 'darwin' && app.dock) {
+    app.dock.setIcon(APP_ICON_PATH);
+  }
 
   // 1. Spawn the Python sidecar
   spawnSidecar();

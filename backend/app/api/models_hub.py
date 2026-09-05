@@ -45,6 +45,9 @@ def read_gguf_context_length(file_path: Path) -> Optional[int]:
 class DownloadRequest(BaseModel):
     repo_id: str
     filename: str
+    # The paired mmproj (vision tower) filename from the same repo, if the
+    # user is downloading a vision model — see get_repo_files' mmproj_files.
+    mmproj_filename: Optional[str] = None
 
 def get_db_session():
     db = next(get_db())
@@ -139,28 +142,45 @@ def search_models(q: str = "", limit: int = 20):
 def get_repo_files(repo_id: str):
     """
     Get the list of .gguf files and their sizes for a specific repository.
+
+    Separates out any "mmproj" file (the CLIP-style vision tower a vision
+    model needs alongside its main weights — see llm_manager.py's
+    MTMDChatHandler wiring) into its own list rather than the main quant
+    list — it's a required companion file, not a normal quantization choice,
+    so it shouldn't be offered next to the model's own quants as if picking
+    one excludes the others.
     """
     try:
         info = hf_api.model_info(repo_id=repo_id, files_metadata=True)
         gguf_files = []
+        mmproj_files = []
         for file in info.siblings:
-            if file.rfilename.endswith(".gguf"):
-                gguf_files.append({
-                    "filename": file.rfilename,
-                    "size": file.size,
-                })
-                
+            if not file.rfilename.endswith(".gguf"):
+                continue
+            entry = {"filename": file.rfilename, "size": file.size}
+            if "mmproj" in file.rfilename.lower():
+                mmproj_files.append(entry)
+            else:
+                gguf_files.append(entry)
+
         # Sort by size ascending (typically smaller quants first)
         gguf_files.sort(key=lambda x: x["size"] if x.get("size") else 0)
-        return {"repo_id": repo_id, "files": gguf_files}
+        mmproj_files.sort(key=lambda x: x["size"] if x.get("size") else 0)
+        return {"repo_id": repo_id, "files": gguf_files, "mmproj_files": mmproj_files}
     except Exception as e:
         logger.error(f"Error fetching repo files: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def download_file_task(repo_id: str, filename: str, file_path: Path, model_id: int):
+async def download_file_task(repo_id: str, filename: str, file_path: Path, model_id: int, kind: str = "main"):
     """
     Background task to stream a file download, broadcast progress, and update the DB.
+
+    `kind` distinguishes a model's main weights file from its paired mmproj
+    (vision tower) file — both are downloaded via this same streaming loop,
+    but they update different columns on the same ModelRegistry row on
+    completion/failure (see start_download, which schedules a "mmproj" kind
+    task alongside the "main" one for a vision download).
     """
     url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
     downloaded_bytes = 0
@@ -210,27 +230,32 @@ async def download_file_task(repo_id: str, filename: str, file_path: Path, model
         db = SessionLocal()
         model_entry = db.query(ModelRegistry).filter(ModelRegistry.id == model_id).first()
         if model_entry:
-            model_entry.status = "downloaded"
-            model_entry.file_size_bytes = downloaded_bytes
-
-            real_context_length = read_gguf_context_length(file_path)
-            if real_context_length:
-                model_entry.context_length = real_context_length
-                logger.info(f"Read real context length from GGUF metadata: {real_context_length}")
+            if kind == "mmproj":
+                model_entry.mmproj_path = str(file_path)
+                model_entry.mmproj_status = "downloaded"
             else:
-                logger.warning(
-                    f"Could not determine real context length for {filename} — "
-                    f"keeping the default of {model_entry.context_length}."
-                )
+                model_entry.status = "downloaded"
+                model_entry.file_size_bytes = downloaded_bytes
+
+                real_context_length = read_gguf_context_length(file_path)
+                if real_context_length:
+                    model_entry.context_length = real_context_length
+                    logger.info(f"Read real context length from GGUF metadata: {real_context_length}")
+                else:
+                    logger.warning(
+                        f"Could not determine real context length for {filename} — "
+                        f"keeping the default of {model_entry.context_length}."
+                    )
 
             db.commit()
         db.close()
-        
+
         await manager.broadcast_json({
             "type": "download_complete",
             "repo_id": repo_id,
             "filename": filename,
-            "file_path": str(file_path)
+            "file_path": str(file_path),
+            "kind": kind,
         })
         logger.info(f"Successfully downloaded {filename} to {file_path}")
 
@@ -239,20 +264,24 @@ async def download_file_task(repo_id: str, filename: str, file_path: Path, model
         # Clean up partial file
         if file_path.exists():
             file_path.unlink()
-            
+
         from app.db.database import SessionLocal
         db = SessionLocal()
         model_entry = db.query(ModelRegistry).filter(ModelRegistry.id == model_id).first()
         if model_entry:
-            model_entry.status = "failed"
+            if kind == "mmproj":
+                model_entry.mmproj_status = "failed"
+            else:
+                model_entry.status = "failed"
             db.commit()
         db.close()
-        
+
         await manager.broadcast_json({
             "type": "download_failed",
             "repo_id": repo_id,
             "filename": filename,
-            "error": str(e)
+            "error": str(e),
+            "kind": kind,
         })
 
 
@@ -272,7 +301,7 @@ async def start_download(req: DownloadRequest, background_tasks: BackgroundTasks
             
     # Create or update DB entry
     model_name = req.repo_id.split("/")[-1] + "-" + req.filename.replace(".gguf", "")
-    
+
     model_entry = db.query(ModelRegistry).filter(ModelRegistry.filename == req.filename).first()
     if not model_entry:
         model_entry = ModelRegistry(
@@ -283,7 +312,10 @@ async def start_download(req: DownloadRequest, background_tasks: BackgroundTasks
             file_path=str(file_path),
             status="downloading",
             chat_format="chatml", # Default guess
-            context_length=4096
+            context_length=4096,
+            is_vision=bool(req.mmproj_filename),
+            mmproj_filename=req.mmproj_filename,
+            mmproj_status="downloading" if req.mmproj_filename else None,
         )
         db.add(model_entry)
         db.commit()
@@ -291,17 +323,33 @@ async def start_download(req: DownloadRequest, background_tasks: BackgroundTasks
     else:
         model_entry.status = "downloading"
         model_entry.file_path = str(file_path)
+        if req.mmproj_filename:
+            model_entry.is_vision = True
+            model_entry.mmproj_filename = req.mmproj_filename
+            model_entry.mmproj_status = "downloading"
         db.commit()
-        
-    # Launch background task
+
+    # Launch background task(s) — the main weights file, plus its paired
+    # mmproj (vision tower) file when this is a vision download. Both write
+    # to the same ModelRegistry row (see download_file_task's `kind` param).
     background_tasks.add_task(
-        download_file_task, 
-        req.repo_id, 
-        req.filename, 
-        file_path, 
-        model_entry.id
+        download_file_task,
+        req.repo_id,
+        req.filename,
+        file_path,
+        model_entry.id,
     )
-    
+    if req.mmproj_filename:
+        mmproj_path = MODELS_DIR / req.mmproj_filename
+        background_tasks.add_task(
+            download_file_task,
+            req.repo_id,
+            req.mmproj_filename,
+            mmproj_path,
+            model_entry.id,
+            "mmproj",
+        )
+
     return {"status": "download_started", "model_id": model_entry.id}
 
 @router.get("/downloaded")
@@ -317,5 +365,8 @@ def list_downloaded_models(db: Session = Depends(get_db_session)):
         "status": m.status,
         "file_size_bytes": m.file_size_bytes,
         "is_active": m.is_active,
-        "context_length": m.context_length
+        "context_length": m.context_length,
+        "is_vision": m.is_vision,
+        "mmproj_filename": m.mmproj_filename,
+        "mmproj_status": m.mmproj_status,
     } for m in models]}

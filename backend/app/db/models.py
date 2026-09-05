@@ -37,6 +37,14 @@ class ModelRegistry(Base):
     is_active = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+    # Vision support: a model is multimodal only once its paired mmproj (CLIP
+    # vision tower) file has also finished downloading — see llm_manager.py's
+    # MTMDChatHandler wiring, which needs mmproj_path to build a chat_handler.
+    is_vision = Column(Boolean, default=False)
+    mmproj_filename = Column(String, nullable=True)
+    mmproj_path = Column(String, nullable=True)
+    mmproj_status = Column(String, nullable=True)  # 'downloading', 'downloaded', 'failed'
+
 
 class MCPServer(Base):
     """Tracks connected and disconnected MCP servers per user."""

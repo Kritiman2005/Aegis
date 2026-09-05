@@ -1,14 +1,18 @@
 """
-Aegis — Serves files the export_document agent tool generates (/api/export)
+Aegis — Serves files Chat Mode's export flow generates (/api/export)
 
-Export is agent-only now: the user asks in chat ("give me this as a PDF",
-"convert that to docx") and the export_document tool (app/core/agents/chat.py's
-_execute_export_document) converts the relevant content via
+The user asks in chat ("give me this as a PDF", "convert that to docx") and
+app/core/agents/chat.py's deterministic export-intent regex in _handle_idle
+(mode == "chat" branch — no planner/tool-call involved) calls
+_execute_export_document, which converts the relevant content via
 app/core/exporter.py, stores the bytes here under a short-lived ID, and
-returns a download link that appears directly in the chat message. This
-module just serves that link — there used to also be a POST /api/export for
-a manual per-message "Export ▾" button (ExportMenu.tsx), removed along with
-that button now that the tool covers the same need conversationally.
+returns a download link that appears directly in the chat message. Agent
+Mode used to have this as a planner-driven tool too; removed because the
+planner proved unreliable at it on small local models (see
+ChatAgent._get_local_tools' docstring). This module just serves that
+link — there used to also be a POST /api/export for a manual per-message
+"Export ▾" button (ExportMenu.tsx), removed along with that button once
+the chat flow covered the same need conversationally.
 """
 
 import re
@@ -42,8 +46,7 @@ BACKEND_BASE_URL = "http://127.0.0.1:8000"
 
 def store_export(data: bytes, content_type: str, filename: str) -> str:
     """Stores generated file bytes, returning an opaque ID for the download
-    URL. Called by the export_document agent tool — see this module's
-    docstring."""
+    URL. Called by Chat Mode's export flow — see this module's docstring."""
     export_id = uuid.uuid4().hex
     with _exports_lock:
         _exports[export_id] = {
@@ -79,7 +82,7 @@ def _safe_filename(title: str, fmt: str) -> str:
 
 @router.get("/download/{export_id}")
 def download_export(export_id: str):
-    """Serves a file the export_document agent tool generated — see
+    """Serves a file Chat Mode's export flow generated — see
     store_export/this module's docstring. One export_id can be downloaded
     more than once (a user might click the chat link twice); it just
     expires after _EXPORT_TTL_SECONDS regardless."""

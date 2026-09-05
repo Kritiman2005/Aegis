@@ -184,8 +184,15 @@ export default function SplashScreen({ onReady, onGoToLLMPanel, onBackendReachab
             this phase is pure initialization status (DBs, models), so it
             deliberately doesn't repeat the mark or wordmark here. */}
 
-        {/* Progress bar */}
-        <div className="w-full space-y-2 animate-fade-in-up">
+        {/* Progress bar — delayed to start exactly when the intro overlay
+            begins fading (see INTRO_HOLD_MS below), not at mount. It used
+            to fire immediately: at 0.25s per fade-in-up, it (and the rest
+            of this real content) had always finished and gone fully
+            static well before the 2.6s overlay hold ended, so the overlay
+            fading away just revealed an already-settled screen instead of
+            a second thing animating in — reads as one continuous handoff
+            now instead of a flat "curtain drop". */}
+        <div className="w-full space-y-2 animate-fade-in-up" style={{ animationDelay: `${INTRO_HOLD_MS}ms`, animationFillMode: 'backwards' }}>
           <div className="h-1 w-full bg-aegis-overlay rounded-full overflow-hidden">
             <div
               className="h-full rounded-full bg-gradient-to-r from-aegis-primary to-aegis-accent transition-all duration-700 ease-out"
@@ -198,13 +205,14 @@ export default function SplashScreen({ onReady, onGoToLLMPanel, onBackendReachab
           </div>
         </div>
 
-        {/* Status checklist */}
+        {/* Status checklist — same re-sync: staggered off INTRO_HOLD_MS
+            instead of 0, so the stagger plays out as the logo fades away. */}
         <div className="w-full space-y-3">
           {checks.map(({ key, label, done }, i) => (
             <div
               key={key}
               className="flex items-center gap-3 animate-fade-in-up"
-              style={{ animationDelay: `${i * 80}ms`, animationFillMode: 'backwards' }}
+              style={{ animationDelay: `${INTRO_HOLD_MS + i * 80}ms`, animationFillMode: 'backwards' }}
             >
               <div className="flex-shrink-0 w-4 h-4 relative">
                 {done ? (

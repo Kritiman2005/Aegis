@@ -1,6 +1,6 @@
 import pytest
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from app.core.agents.chat import ChatAgent, AgentState
 
 @pytest.mark.asyncio
@@ -19,46 +19,6 @@ async def test_mode_switch_cancels_pending_plan():
     assert agent.plan is None
     # Verify the fallback explicitly notifies the user
     assert "Pending action discarded." in res
-
-@pytest.mark.asyncio
-async def test_mode_switch_cancels_pending_memory():
-    """Edge Case 2: Switching to Chat Mode while memory is pending cancels it."""
-    agent = ChatAgent(connection_id="test_conn_2")
-    
-    # Simulate Extractor outputting a memory
-    agent.state = AgentState.WAITING_MEMORY_CONFIRMATION
-    agent._pending_entities = [{"label": "test"}]
-    
-    # Process mode switch to chat
-    res = await agent.handle_message("__system_mode_switch__", mode="chat")
-        
-    assert agent.state == AgentState.IDLE
-    assert agent._pending_entities == []
-    assert "Pending action discarded." in res
-
-@pytest.mark.asyncio
-async def test_timeout_policy():
-    """Edge Case 3: Waiting > 5 mins at a confirmation gate auto-expires the state."""
-    agent = ChatAgent(connection_id="test_conn_3")
-    
-    # Simulate pending plan from 6 minutes ago
-    agent.state = AgentState.WAITING_CONFIRMATION
-    agent.plan = [{"tool": "test", "arguments": {}}]
-    agent.state_entered_at = datetime.utcnow() - timedelta(minutes=6)
-    
-    # Simulate the websocket.py watch_timeouts() logic
-    now = datetime.utcnow()
-    timeout_triggered = False
-    if agent.state in [AgentState.WAITING_CONFIRMATION, AgentState.WAITING_MEMORY_CONFIRMATION]:
-        if (now - agent.state_entered_at).total_seconds() > 300:
-            agent.state = AgentState.IDLE
-            agent.plan = None
-            timeout_triggered = True
-
-    # Should revert to IDLE
-    assert agent.state == AgentState.IDLE
-    assert agent.plan is None
-    assert timeout_triggered is True
 
 @pytest.mark.asyncio
 async def test_refinement_loop_question():

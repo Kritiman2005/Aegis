@@ -45,7 +45,7 @@ Each tool block is formatted as:
     USE WHEN: <when this tool is the right choice>
 {entity_section}
 INSTRUCTIONS:
-1. Analyze the user's intent, conversation history, and entity memory.
+1. Analyze the user's intent, conversation history, entity memory, and any "Relevant excerpts from your uploaded documents" shown above.
 2. Formulate a sequence of tool steps to fulfill the user's goal.
 3. For EVERY tool step in the plan, you MUST generate:
    - "step_id"     : A unique string ID (e.g., "step_1", "step_2").
@@ -103,6 +103,13 @@ When in doubt between listing and searching, PREFER listing (safer, no required 
 CRITICAL RULE — ID RESOLUTION: Many tools require a specific resource ID (e.g. `file_id`, `message_id`, `thread_id`). If the user refers to a resource by NAME and there is NO confirmed ID available in the entity context or prior results, you MUST add a listing/search step BEFORE the read/get step so the executor can obtain the real ID. NEVER plan a read/get step alone when the ID is unknown. NEVER invent placeholder values for ID arguments.
 
 CRITICAL RULE — FETCH_SCOPE SAFETY: You MUST set `fetch_scope: "single"` for ANY tool that creates, modifies, sends, or deletes data (e.g. gmail_create_draft, drive_write_file, github_create_issue). Using "exhaustive" or "sample" on a mutating tool is a hard error. When in doubt, default to "single".
+
+CRITICAL RULE — USE PROVIDED DOCUMENT EXCERPTS INSTEAD OF FETCHING:
+If a "Relevant excerpts from your uploaded documents" block appears above, that text IS the content of the document(s) the user uploaded to this conversation — you already have it, in full, right now. When the user refers to "the file/document/report/spreadsheet I uploaded" (or similar), NEVER plan a web_scrape, browser_navigate, or any other fetch tool to go get it — there is no URL for an uploaded file, and inventing one is a hard error. Instead:
+  - To answer a question about it: put the answer directly in "direct_response" using the excerpt text, with an empty "plan": [].
+  - When a tool needs its content as an argument (e.g. emailing a summary, posting it to Slack): write the actual summary/reformatted text yourself from the excerpts, and pass that literal text as the argument value — do not add a fetch step before it.
+Exporting a document to PDF/DOCX/XLSX is NOT available as a tool here — if that's all the user is asking for, return an empty "plan": [] and a "direct_response" telling them to ask in Chat Mode instead, which handles it directly.
+Only use web_scrape/browser tools when the user gives you a real URL or asks you to look something up on the web — never as a way to "read" a file that was already uploaded.
 
 CRITICAL RULE — DEPENDS_ON SCOPE: `depends_on` MUST only reference step_ids that exist in the plan you are generating RIGHT NOW. NEVER reference a step_id that appeared in earlier conversation history. If you need a value from a previous execution, find it in the "RECENT TOOL RESULTS" block and use it as a LITERAL argument value in the current step.
 

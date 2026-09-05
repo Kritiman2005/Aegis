@@ -597,6 +597,28 @@ def get_active_model_display_name(db: Session) -> str:
     return active.display_name if active else "unknown"
 
 
+def get_active_vision_mmproj_path(db: Session) -> Optional[str]:
+    """
+    Resolve the active model's mmproj (vision tower) path, if it's a vision
+    model whose companion file has actually finished downloading. Mirrors
+    get_active_model_display_name's own active-model fallback logic — shared
+    by BaseAgent.get_active_vision_mmproj_path (agents deciding whether to
+    attach an image as real vision input) and the documents upload endpoint
+    (deciding whether to skip OCR for an image entirely, since vision will
+    handle it instead).
+    """
+    import os
+    active = db.query(ModelRegistry).filter(
+        ModelRegistry.status == "downloaded",
+        ModelRegistry.is_active == True
+    ).first()
+    if not active:
+        active = db.query(ModelRegistry).filter(ModelRegistry.status == "downloaded").first()
+    if not active or active.mmproj_status != "downloaded" or not active.mmproj_path:
+        return None
+    return active.mmproj_path if os.path.exists(active.mmproj_path) else None
+
+
 def log_token_usage(
     db: Session,
     conversation_id: Optional[str],

@@ -743,6 +743,143 @@ def _web_scrape_disp(raw: Any) -> str:
     return f"### {title}\n\n{preview}{warn_txt}{note}"
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Local filesystem tools (search_local_files/list_folder/read_file/write_file —
+# app.core.filesystem_tools). Unregistered tools fall back to a raw JSON code
+# block in shape_for_display, which is exactly what these must never do.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _fs_error(raw: Any) -> Optional[str]:
+    if isinstance(raw, dict) and raw.get("error"):
+        return raw["error"]
+    return None
+
+def _fs_search_exec(raw: Any) -> Dict:
+    err = _fs_error(raw)
+    if err:
+        return {"error": err}
+    if not isinstance(raw, dict):
+        return {"error": _trunc(str(raw), 300)}
+    matches = (raw.get("matches") or [])[:30]
+    return {
+        "query": raw.get("query"),
+        "root": raw.get("root"),
+        "count": raw.get("count"),
+        "truncated": raw.get("truncated"),
+        "matches": [
+            {
+                "path": m.get("path"),
+                "name": m.get("name"),
+                "size_bytes": m.get("size_bytes"),
+                "modified": _date(m.get("modified")),
+            }
+            for m in matches
+        ],
+    }
+
+def _fs_search_disp(raw: Any) -> str:
+    s = _fs_search_exec(raw)
+    if "error" in s:
+        return f"**Search failed:** {s['error']}"
+    matches = s.get("matches", [])
+    if not matches:
+        return f"No files matching `{s.get('query')}` found."
+    total = s.get("count", len(matches))
+    trunc_note = " _(truncated)_" if s.get("truncated") else ""
+    lines = [f"**{_num(total)} file(s) found**{trunc_note}:\n"]
+    for m in matches:
+        size = f"{_num(m['size_bytes'])} bytes" if m.get("size_bytes") is not None else "—"
+        lines.append(f"- `{m['path']}` — {size} · {m.get('modified', '—')}")
+    return "\n".join(lines)
+
+def _fs_list_folder_exec(raw: Any) -> Dict:
+    err = _fs_error(raw)
+    if err:
+        return {"error": err}
+    if not isinstance(raw, dict):
+        return {"error": _trunc(str(raw), 300)}
+    entries = (raw.get("entries") or [])[:50]
+    return {
+        "path": raw.get("path"),
+        "count": raw.get("count"),
+        "truncated": raw.get("truncated"),
+        "entries": [
+            {
+                "name": e.get("name"),
+                "is_dir": e.get("is_dir"),
+                "size_bytes": e.get("size_bytes"),
+                "modified": _date(e.get("modified")),
+            }
+            for e in entries
+        ],
+    }
+
+def _fs_list_folder_disp(raw: Any) -> str:
+    s = _fs_list_folder_exec(raw)
+    if "error" in s:
+        return f"**Could not list folder:** {s['error']}"
+    entries = s.get("entries", [])
+    if not entries:
+        return f"`{s.get('path')}` is empty."
+    trunc_note = " _(truncated)_" if s.get("truncated") else ""
+    lines = [f"**`{s.get('path')}`** — {_num(s.get('count', len(entries)))} item(s){trunc_note}:\n"]
+    for e in entries:
+        kind = " (folder)" if e.get("is_dir") else ""
+        size = f" — {_num(e['size_bytes'])} bytes" if e.get("size_bytes") is not None else ""
+        lines.append(f"- {e['name']}{kind}{size} · {e.get('modified', '—')}")
+    return "\n".join(lines)
+
+def _fs_read_file_exec(raw: Any) -> Dict:
+    """Passes text_preview through untouched — same reasoning as
+    _web_scrape_exec: chat.py's read_file dispatch already bounds it to one
+    _chunk_text chunk via `offset`, so re-truncating here would silently
+    shrink what the caller deliberately sized."""
+    err = _fs_error(raw)
+    if err:
+        return {"error": err}
+    if not isinstance(raw, dict):
+        return {"error": _trunc(str(raw), 300)}
+    out = {
+        "path": raw.get("path"),
+        "file_type": raw.get("file_type"),
+        "text_preview": raw.get("text_preview", ""),
+    }
+    if raw.get("note"):
+        out["note"] = raw["note"]
+    return out
+
+def _fs_read_file_disp(raw: Any) -> str:
+    if not isinstance(raw, dict):
+        return _trunc(str(raw), 2000)
+    err = _fs_error(raw)
+    if err:
+        return f"**Could not read file:** {err}"
+    path = raw.get("path") or ""
+    file_type = raw.get("file_type") or ""
+    preview = raw.get("text_preview", "")
+    note = f"\n\n_{raw['note']}_" if raw.get("note") else ""
+    return f"**`{path}`** ({file_type})\n\n```\n{preview}\n```{note}"
+
+def _fs_write_file_exec(raw: Any) -> Dict:
+    err = _fs_error(raw)
+    if err:
+        return {"error": err}
+    if not isinstance(raw, dict):
+        return {"error": _trunc(str(raw), 300)}
+    return {
+        "path": raw.get("path"),
+        "bytes_written": raw.get("bytes_written"),
+        "overwritten": raw.get("overwritten"),
+    }
+
+def _fs_write_file_disp(raw: Any) -> str:
+    s = _fs_write_file_exec(raw)
+    if "error" in s:
+        return f"**Write failed:** {s['error']}"
+    action = "Overwrote" if s.get("overwritten") else "Wrote"
+    return f"{action} **`{s.get('path')}`** ({_num(s.get('bytes_written'))} bytes)."
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Persistent browser session (browser_* tools — app.core.browser_session)
 #
 # browser_navigate and browser_extract_text land in _web_scrape_exec/_disp
@@ -867,25 +1004,6 @@ def _browser_screenshot_disp(raw: Any) -> str:
         return "**Screenshot failed:** no image data returned."
     return f"![Screenshot](data:image/jpeg;base64,{b64})"
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Document export (export_document — app.core.exporter, not an MCP server)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _export_document_exec(raw: Any) -> Dict:
-    if not isinstance(raw, dict):
-        return {"error": _trunc(str(raw), 300)}
-    if raw.get("error") or not raw.get("success"):
-        return {"error": raw.get("error") or "Export failed."}
-    return {
-        "filename": raw.get("filename"),
-        "download_url": raw.get("download_url"),
-    }
-
-def _export_document_disp(raw: Any) -> str:
-    s = _export_document_exec(raw)
-    if "error" in s:
-        return f"**Export failed:** {s['error']}"
-    return f"📄 **[{s['filename']}]({s['download_url']})** is ready to download."
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Shaper registry
@@ -932,6 +1050,12 @@ _SHAPERS: Dict[str, _ShapeEntry] = {
     # ── Web scrape (Chat/Agent Mode's built-in tool, not an MCP server) ──────
     "web_scrape":             (_web_scrape_exec,              _web_scrape_disp),
 
+    # ── Local filesystem tools (app.core.filesystem_tools) ────────────────────
+    "search_local_files":     (_fs_search_exec,               _fs_search_disp),
+    "list_folder":            (_fs_list_folder_exec,           _fs_list_folder_disp),
+    "read_file":              (_fs_read_file_exec,             _fs_read_file_disp),
+    "write_file":             (_fs_write_file_exec,            _fs_write_file_disp),
+
     # ── Persistent browser session (app.core.browser_session) — also not
     #    MCP servers. browser_navigate and browser_extract_text reuse the
     #    web_scrape shapers directly: chat.py's executor loop already
@@ -948,9 +1072,6 @@ _SHAPERS: Dict[str, _ShapeEntry] = {
     "browser_list_tabs":      (_browser_list_tabs_exec,       _browser_list_tabs_disp),
     "browser_switch_tab":     (_browser_switch_tab_exec,      _browser_switch_tab_disp),
     "browser_close":          (_browser_close_exec,           _browser_close_disp),
-
-    # ── Document export (app.core.exporter) — also not an MCP server ────────
-    "export_document":        (_export_document_exec,         _export_document_disp),
 }
 
 

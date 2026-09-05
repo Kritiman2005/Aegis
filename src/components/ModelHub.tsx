@@ -21,7 +21,7 @@ interface ModelResult {
   downloads: number;
   likes: number;
   tags: string[];
-  familyKey?: string;
+  categoryKey?: string;
 }
 
 interface GGUFFile {
@@ -35,9 +35,16 @@ interface LocalModel {
   filename: string;
   status: 'downloading' | 'downloaded' | 'failed';
   file_size_bytes: number;
+  is_vision?: boolean;
+  mmproj_filename?: string | null;
+  // Only relevant when is_vision is true — a vision model isn't actually
+  // usable until its paired mmproj file also finishes (see llm_manager.py's
+  // MTMDChatHandler wiring), so this tracks that second download separately
+  // from `status` above, which only covers the main weights file.
+  mmproj_status?: 'downloading' | 'downloaded' | 'failed' | null;
 }
 
-interface ModelFamily {
+interface ModelCategory {
   key: string;
   label: string;
   description: string;
@@ -45,57 +52,97 @@ interface ModelFamily {
   bg: string;
   initial: string;
   searchQuery: string;
+  // Substrings checked against a free-text search result's `id author`
+  // (lowercased) to guess which category it belongs to — see guessCategory.
+  matchers: string[];
 }
 
-// ── Model families ────────────────────────────────────────────────────────────
+// ── Model categories ──────────────────────────────────────────────────────────
+// Task-based, not vendor-based: each chip answers "what is this model good
+// for" rather than "who made it". Order matters for guessCategory below —
+// narrower/specialist categories are listed before broader ones so e.g. a
+// "Qwen2.5-Coder" result is caught by Coding before Multilingual's much
+// broader 'qwen' matcher ever gets a chance to claim it.
+//
+// Vision is real now: llm_manager.py wires a model's paired mmproj (CLIP
+// vision tower) file into llama.cpp's generic MTMDChatHandler, and the
+// detail modal below auto-pairs that file with whichever quant the user
+// downloads (see ModelDetailModal's mmprojFiles handling) — a downloaded
+// vision model actually sees attached images in Chat Mode, not just OCR
+// text like every other document.
 
-const FAMILIES: ModelFamily[] = [
+const CATEGORIES: ModelCategory[] = [
   {
-    key: 'qwen',
-    label: 'Qwen',
-    description: "Alibaba's high-performance multilingual models. Excellent reasoning, coding, and long-context tasks.",
+    key: 'vision',
+    label: 'Vision',
+    description: "Sees images, not just text — attach a photo or screenshot in chat and it can actually describe or answer questions about it. Needs a paired mmproj (vision tower) file, downloaded automatically alongside the model.",
+    color: '#0891B2',
+    bg: '#ECFEFF',
+    initial: 'V',
+    searchQuery: 'LLaVA GGUF',
+    matchers: ['llava', 'vision', 'vl-', 'minicpm-v', 'qwen2-vl', 'qwen2.5-vl'],
+  },
+  {
+    key: 'coding',
+    label: 'Coding',
+    description: 'Trained on large code corpora — stronger at completions, refactors, and explaining bugs than a general-purpose model of the same size.',
     color: '#2563EB',
     bg: '#EFF6FF',
-    initial: 'Q',
-    searchQuery: 'Qwen2.5 GGUF',
+    initial: 'C',
+    searchQuery: 'Qwen2.5-Coder GGUF',
+    matchers: ['coder', 'codellama', 'starcoder', 'code-'],
   },
   {
-    key: 'llama',
-    label: 'Llama',
-    description: "Meta's open LLaMA family. Industry standard for general-purpose tasks with broad community support.",
+    key: 'reasoning',
+    label: 'Reasoning',
+    description: 'Extended chain-of-thought training for tougher math, logic, and multi-step problems — slower per answer, but more careful.',
     color: '#7C3AED',
     bg: '#F5F3FF',
-    initial: 'L',
-    searchQuery: 'Llama-3 GGUF',
+    initial: 'R',
+    searchQuery: 'DeepSeek-R1 GGUF',
+    matchers: ['deepseek-r1', 'qwq', 'reasoning', '-r1-', '-r1.'],
   },
   {
-    key: 'mistral',
-    label: 'Mistral',
-    description: 'Efficient, fast, and capable models from Mistral AI. Great balance of quality and speed.',
+    key: 'compact',
+    label: 'Fast & Small',
+    description: 'Small enough to run quickly on modest hardware, with surprisingly strong quality for their size — a good pick on lower-RAM machines.',
+    color: '#D97706',
+    bg: '#FFFBEB',
+    initial: 'F',
+    searchQuery: 'Phi-3-mini GGUF',
+    matchers: ['mini', 'tiny', '0.5b', '1b', '1.5b'],
+  },
+  {
+    key: 'multilingual',
+    label: 'Multilingual',
+    description: 'Strong across many languages, not just English — a good default when you need non-English conversation or translation.',
     color: '#059669',
     bg: '#ECFDF5',
     initial: 'M',
-    searchQuery: 'Mistral GGUF',
+    searchQuery: 'Qwen2.5 GGUF',
+    matchers: ['qwen', 'multilingual', 'aya-'],
   },
   {
-    key: 'phi',
-    label: 'Phi',
-    description: "Microsoft's small language models. Exceptionally capable at coding and reasoning for their size.",
-    color: '#D97706',
-    bg: '#FFFBEB',
-    initial: 'P',
-    searchQuery: 'Phi-3 GGUF',
+    key: 'general',
+    label: 'General Chat',
+    description: "Balanced, well-rounded assistants for everyday conversation, writing, and Q&A — the safe default when you don't need a specialist.",
+    color: '#DB2777',
+    bg: '#FDF2F8',
+    initial: 'G',
+    searchQuery: 'Llama-3 Instruct GGUF',
+    matchers: ['llama', 'instruct', 'mistral', 'chat'],
   },
 ];
 
-const FAMILY_BY_KEY: Record<string, ModelFamily> = Object.fromEntries(FAMILIES.map(f => [f.key, f]));
+const CATEGORY_BY_KEY: Record<string, ModelCategory> = Object.fromEntries(CATEGORIES.map(c => [c.key, c]));
 
-// Best-effort family guess for free-text search results, which don't already
-// carry a familyKey — matched against the repo id/author so cards still get
-// a color, initial, and description instead of falling back to generic gray.
-function guessFamily(model: ModelResult): ModelFamily {
+// Best-effort category guess for free-text search results, which don't
+// already carry a categoryKey — matched (in CATEGORIES' priority order)
+// against the repo id/author so cards still get a color, initial, and
+// description instead of falling back to generic gray.
+function guessCategory(model: ModelResult): ModelCategory {
   const hay = `${model.id} ${model.author}`.toLowerCase();
-  return FAMILIES.find(f => hay.includes(f.key)) || {
+  return CATEGORIES.find(c => c.matchers.some(m => hay.includes(m))) || {
     key: 'other',
     label: model.author || 'Other',
     description: 'A GGUF-quantized model compatible with local inference.',
@@ -103,6 +150,7 @@ function guessFamily(model: ModelResult): ModelFamily {
     bg: '#F1F5F9',
     initial: (model.author || model.id || '?').charAt(0).toUpperCase(),
     searchQuery: '',
+    matchers: [],
   };
 }
 
@@ -208,19 +256,27 @@ function FileRow({
   progressData,
   onDownload,
   recommended,
+  mmprojFilename,
 }: {
   file: GGUFFile;
   repoId: string;
   localModels: Record<string, LocalModel>;
   progressData: Record<string, { progress: number; downloaded_bytes: number; total_bytes: number }>;
-  onDownload: (repoId: string, filename: string) => void;
+  onDownload: (repoId: string, filename: string, mmprojFilename?: string) => void;
   recommended?: boolean;
+  // Present only when this repo bundles a vision model — the paired mmproj
+  // (vision tower) file gets downloaded automatically alongside whichever
+  // quant the user picks here (see ModelHub's startDownload).
+  mmprojFilename?: string;
 }) {
   const key = `${repoId}/${file.filename}`;
   const local = localModels[key];
   const prog = progressData[key];
-  const isDownloaded = local?.status === 'downloaded';
-  const isDownloading = local?.status === 'downloading' || prog !== undefined;
+  const mmprojKey = mmprojFilename ? `${repoId}/${mmprojFilename}` : null;
+  const mmprojDownloading = local?.is_vision && local?.mmproj_status === 'downloading';
+  const mmprojProg = mmprojKey ? progressData[mmprojKey] : undefined;
+  const isDownloaded = local?.status === 'downloaded' && (!local?.is_vision || local?.mmproj_status === 'downloaded');
+  const isDownloading = local?.status === 'downloading' || prog !== undefined || mmprojDownloading || mmprojProg !== undefined;
   const quantInfo = getQuantInfo(file.filename);
 
   return (
@@ -235,7 +291,10 @@ function FileRow({
               </span>
             )}
           </div>
-          <p className="text-[11px] text-aegis-text-muted mt-0.5">{formatBytes(file.size)}</p>
+          <p className="text-[11px] text-aegis-text-muted mt-0.5">
+            {formatBytes(file.size)}
+            {mmprojFilename && ' · includes vision support (downloads mmproj automatically)'}
+          </p>
         </div>
 
         <div className="ml-4 flex-shrink-0">
@@ -244,26 +303,36 @@ function FileRow({
               <CheckCircle2 className="w-3.5 h-3.5" /> Downloaded
             </span>
           ) : isDownloading ? (
-            <div className="flex flex-col items-end gap-1 min-w-[110px]">
-              <div className="flex items-center justify-between w-full text-[11px] font-semibold text-aegis-primary-light">
-                <span>Downloading...</span>
-                <span>{(prog?.progress || 0).toFixed(0)}%</span>
-              </div>
-              <div className="w-full bg-aegis-overlay h-1.5 rounded-full overflow-hidden">
-                <div
-                  className="bg-aegis-primary h-full rounded-full transition-all duration-300"
-                  style={{ width: `${prog?.progress || 0}%` }}
-                />
-              </div>
-              {prog && prog.total_bytes > 0 && (
-                <span className="text-[10px] text-aegis-text-muted">
-                  {formatBytes(prog.downloaded_bytes)} / {formatBytes(prog.total_bytes)}
-                </span>
-              )}
-            </div>
+            (() => {
+              // While the main file is still in flight, show its progress;
+              // once it's done but the paired mmproj isn't yet, switch to
+              // showing that download instead so the bar doesn't just
+              // freeze at 100% while vision support quietly finishes up.
+              const activeProg = prog ?? mmprojProg;
+              const label = !prog && mmprojDownloading ? 'Downloading vision support...' : 'Downloading...';
+              return (
+                <div className="flex flex-col items-end gap-1 min-w-[110px]">
+                  <div className="flex items-center justify-between w-full text-[11px] font-semibold text-aegis-primary-light">
+                    <span>{label}</span>
+                    <span>{(activeProg?.progress || 0).toFixed(0)}%</span>
+                  </div>
+                  <div className="w-full bg-aegis-overlay h-1.5 rounded-full overflow-hidden">
+                    <div
+                      className="bg-aegis-primary h-full rounded-full transition-all duration-300"
+                      style={{ width: `${activeProg?.progress || 0}%` }}
+                    />
+                  </div>
+                  {activeProg && activeProg.total_bytes > 0 && (
+                    <span className="text-[10px] text-aegis-text-muted">
+                      {formatBytes(activeProg.downloaded_bytes)} / {formatBytes(activeProg.total_bytes)}
+                    </span>
+                  )}
+                </div>
+              );
+            })()
           ) : (
             <button
-              onClick={() => onDownload(repoId, file.filename)}
+              onClick={() => onDownload(repoId, file.filename, mmprojFilename)}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-aegis-raised border border-aegis-border hover:border-aegis-primary hover:text-aegis-primary-light text-aegis-text-secondary text-xs font-semibold rounded-lg transition-all"
             >
               <Download className="w-3.5 h-3.5" /> Download
@@ -290,13 +359,13 @@ function FileRow({
 
 // ── Model Detail Modal ───────────────────────────────────────────────────────
 // The per-model "nice description" panel — model identity, a short blurb
-// (family blurb + parsed param size), and the full quant list with a
+// (category blurb + parsed param size), and the full quant list with a
 // RAM-aware "Recommended" badge, closer to how LM Studio presents a model's
 // available quantizations rather than the old bare filename/size list.
 
 function ModelDetailModal({
   model,
-  family,
+  category,
   ramTotalGb,
   localModels,
   progressData,
@@ -304,14 +373,15 @@ function ModelDetailModal({
   onClose,
 }: {
   model: ModelResult;
-  family: ModelFamily;
+  category: ModelCategory;
   ramTotalGb: number | null;
   localModels: Record<string, LocalModel>;
   progressData: Record<string, { progress: number; downloaded_bytes: number; total_bytes: number }>;
-  onDownload: (repoId: string, filename: string) => void;
+  onDownload: (repoId: string, filename: string, mmprojFilename?: string) => void;
   onClose: () => void;
 }) {
   const [files, setFiles] = useState<GGUFFile[]>([]);
+  const [mmprojFiles, setMmprojFiles] = useState<GGUFFile[]>([]);
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -324,12 +394,26 @@ function ModelDetailModal({
         if (!r.ok) throw new Error(data.detail || 'Failed to load quantizations');
         return data;
       })
-      .then(data => setFiles(data.files || []))
+      .then(data => {
+        setFiles(data.files || []);
+        setMmprojFiles(data.mmproj_files || []);
+      })
       .catch(err => setErrorMsg(err.message || 'Failed to load quantizations'))
       .finally(() => setLoading(false));
   }, [model.id]);
 
   const visibleFiles = useMemo(() => files.filter(f => !SHARD_FILE_PATTERN.test(f.filename)), [files]);
+
+  // Repos that bundle a vision model ship at most a couple of mmproj
+  // variants (e.g. f16 vs a lightly quantized one) — pick the largest
+  // (highest quality) since these files are small enough that size is
+  // rarely the deciding factor. Every quant the user picks below gets
+  // paired with this same one file automatically.
+  const bestMmproj = useMemo(() => (
+    mmprojFiles.length > 0
+      ? mmprojFiles.reduce((best, f) => (f.size > best.size ? f : best), mmprojFiles[0])
+      : null
+  ), [mmprojFiles]);
 
   // Recommend the largest (best-quality) quant that still comfortably fits
   // this machine's RAM — same "biggest that fits" logic as model_catalog.py's
@@ -354,9 +438,9 @@ function ModelDetailModal({
           <div className="flex items-start gap-3 min-w-0">
             <div
               className="w-11 h-11 rounded-2xl flex items-center justify-center text-base font-black flex-shrink-0"
-              style={{ background: family.bg, color: family.color }}
+              style={{ background: category.bg, color: category.color }}
             >
-              {family.initial}
+              {category.initial}
             </div>
             <div className="min-w-0">
               <h3 className="text-base font-bold text-aegis-text-primary break-words">{cleanTitle(model.id)}</h3>
@@ -364,13 +448,21 @@ function ModelDetailModal({
               <div className="flex items-center gap-2 flex-wrap mt-2">
                 <span
                   className="text-[11px] font-bold px-2 py-0.5 rounded-full"
-                  style={{ background: family.bg, color: family.color }}
+                  style={{ background: category.bg, color: category.color }}
                 >
-                  {family.label}
+                  {category.label}
                 </span>
                 {paramSize && (
                   <span className="text-[11px] font-semibold text-aegis-text-secondary bg-aegis-overlay border border-aegis-border px-2 py-0.5 rounded-full">
                     {paramSize}
+                  </span>
+                )}
+                {bestMmproj && (
+                  <span
+                    className="text-[11px] font-bold px-2 py-0.5 rounded-full"
+                    style={{ background: CATEGORY_BY_KEY.vision.bg, color: CATEGORY_BY_KEY.vision.color }}
+                  >
+                    Vision-capable
                   </span>
                 )}
                 <span className="text-[11px] text-aegis-text-muted flex items-center gap-1">
@@ -390,7 +482,7 @@ function ModelDetailModal({
 
         {/* Body */}
         <div className="p-6 overflow-y-auto space-y-4">
-          <p className="text-xs text-aegis-text-secondary leading-relaxed">{family.description}</p>
+          <p className="text-xs text-aegis-text-secondary leading-relaxed">{category.description}</p>
 
           <div>
             <p className="text-xs font-semibold text-aegis-text-primary mb-2">Available quantizations</p>
@@ -415,6 +507,7 @@ function ModelDetailModal({
                     progressData={progressData}
                     onDownload={onDownload}
                     recommended={f.filename === recommendedFilename}
+                    mmprojFilename={bestMmproj?.filename}
                   />
                 ))}
               </div>
@@ -430,12 +523,12 @@ function ModelDetailModal({
 
 function ModelCard({
   model,
-  family,
+  category,
   localModels,
   onOpen,
 }: {
   model: ModelResult;
-  family: ModelFamily;
+  category: ModelCategory;
   localModels: Record<string, LocalModel>;
   onOpen: () => void;
 }) {
@@ -451,9 +544,9 @@ function ModelCard({
         <div className="flex items-center gap-3 min-w-0">
           <div
             className="w-10 h-10 rounded-2xl flex items-center justify-center text-base font-black flex-shrink-0"
-            style={{ background: family.bg, color: family.color }}
+            style={{ background: category.bg, color: category.color }}
           >
-            {family.initial}
+            {category.initial}
           </div>
           <div className="min-w-0">
             <h4 className="text-sm font-bold text-aegis-text-primary truncate">{cleanTitle(model.id)}</h4>
@@ -467,15 +560,15 @@ function ModelCard({
         )}
       </div>
 
-      <p className="text-xs text-aegis-text-secondary leading-relaxed line-clamp-2">{family.description}</p>
+      <p className="text-xs text-aegis-text-secondary leading-relaxed line-clamp-2">{category.description}</p>
 
       <div className="flex items-center justify-between mt-auto pt-1">
         <div className="flex items-center gap-1.5 flex-wrap">
           <span
             className="text-[10px] font-bold px-2 py-0.5 rounded-full"
-            style={{ background: family.bg, color: family.color }}
+            style={{ background: category.bg, color: category.color }}
           >
-            {family.label}
+            {category.label}
           </span>
           {paramSize && (
             <span className="text-[10px] font-semibold text-aegis-text-secondary bg-aegis-overlay border border-aegis-border px-2 py-0.5 rounded-full">
@@ -499,10 +592,10 @@ export default function ModelHub() {
   const [progressData, setProgressData] = useState<Record<string, { progress: number; downloaded_bytes: number; total_bytes: number }>>({});
   const [ramTotalGb, setRamTotalGb] = useState<number | null>(null);
 
-  const [activeFamily, setActiveFamily] = useState<string>('all');
-  const [familyModels, setFamilyModels] = useState<Record<string, ModelResult[]>>({});
-  const [familyLoading, setFamilyLoading] = useState<Record<string, boolean>>({});
-  const [familyError, setFamilyError] = useState<Record<string, string | null>>({});
+  const [activeCategory, setActiveCategory] = useState<string>('all');
+  const [categoryModels, setCategoryModels] = useState<Record<string, ModelResult[]>>({});
+  const [categoryLoading, setCategoryLoading] = useState<Record<string, boolean>>({});
+  const [categoryError, setCategoryError] = useState<Record<string, string | null>>({});
 
   const [searchInput, setSearchInput] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
@@ -510,7 +603,7 @@ export default function ModelHub() {
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
 
-  const [selectedModel, setSelectedModel] = useState<{ model: ModelResult; family: ModelFamily } | null>(null);
+  const [selectedModel, setSelectedModel] = useState<{ model: ModelResult; category: ModelCategory } | null>(null);
 
   const fetchLocalModels = useCallback(async () => {
     try {
@@ -549,8 +642,18 @@ export default function ModelHub() {
       } else if (type === 'download_complete') {
         setProgressData(prev => { const n = { ...prev }; delete n[key]; return n; });
         fetchLocalModels().then(mapping => {
-          const model = mapping?.[key];
+          if (!mapping) return;
+          // A vision model's mmproj file is tracked on the SAME row as the
+          // main model, under a DIFFERENT filename — so a "this file just
+          // finished" event for it won't match `key` directly. Fall back to
+          // finding the row it belongs to by mmproj_filename.
+          const model = mapping[key] || Object.values(mapping).find(m => m.mmproj_filename === filename);
           if (!model) return;
+          // Only auto-load once every part this model needs has actually
+          // landed — loading a vision model before its mmproj arrives would
+          // wire it up with no chat_handler, silently losing vision support.
+          const ready = model.status === 'downloaded' && (!model.is_vision || model.mmproj_status === 'downloaded');
+          if (!ready) return;
           fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hardware/load`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -564,54 +667,59 @@ export default function ModelHub() {
     });
   }, [addMessageHandler, fetchLocalModels]);
 
-  const startDownload = async (repoId: string, filename: string) => {
+  const startDownload = async (repoId: string, filename: string, mmprojFilename?: string) => {
     try {
       await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hub/download`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ repo_id: repoId, filename }),
+        body: JSON.stringify({ repo_id: repoId, filename, mmproj_filename: mmprojFilename }),
       });
       setLocalModels(prev => ({
         ...prev,
-        [`${repoId}/${filename}`]: { id: -1, repo_id: repoId, filename, status: 'downloading', file_size_bytes: 0 },
+        [`${repoId}/${filename}`]: {
+          id: -1, repo_id: repoId, filename, status: 'downloading', file_size_bytes: 0,
+          is_vision: !!mmprojFilename,
+          mmproj_filename: mmprojFilename,
+          mmproj_status: mmprojFilename ? 'downloading' : undefined,
+        },
       }));
     } catch {}
   };
 
-  // Fetch a family's model list on first selection (or on first render for
-  // "All", which fans out across every family) — cached per family so
+  // Fetch a category's model list on first selection (or on first render for
+  // "All", which fans out across every category) — cached per category so
   // switching chips back and forth doesn't re-hit the network.
-  const loadFamily = useCallback((familyKey: string) => {
-    if (familyModels[familyKey] || familyLoading[familyKey]) return;
-    const family = FAMILY_BY_KEY[familyKey];
-    if (!family) return;
-    setFamilyLoading(prev => ({ ...prev, [familyKey]: true }));
-    setFamilyError(prev => ({ ...prev, [familyKey]: null }));
-    fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hub/search?q=${encodeURIComponent(family.searchQuery)}&limit=8`)
+  const loadCategory = useCallback((categoryKey: string) => {
+    if (categoryModels[categoryKey] || categoryLoading[categoryKey]) return;
+    const category = CATEGORY_BY_KEY[categoryKey];
+    if (!category) return;
+    setCategoryLoading(prev => ({ ...prev, [categoryKey]: true }));
+    setCategoryError(prev => ({ ...prev, [categoryKey]: null }));
+    fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hub/search?q=${encodeURIComponent(category.searchQuery)}&limit=8`)
       .then(async r => {
         const data = await r.json();
         if (!r.ok) throw new Error(data.detail || 'API Error');
         return data;
       })
       .then(data => {
-        const models: ModelResult[] = (data.models || []).map((m: ModelResult) => ({ ...m, familyKey }));
-        setFamilyModels(prev => ({ ...prev, [familyKey]: models }));
+        const models: ModelResult[] = (data.models || []).map((m: ModelResult) => ({ ...m, categoryKey }));
+        setCategoryModels(prev => ({ ...prev, [categoryKey]: models }));
       })
-      .catch(err => setFamilyError(prev => ({ ...prev, [familyKey]: err.message || 'Failed to fetch models' })))
-      .finally(() => setFamilyLoading(prev => ({ ...prev, [familyKey]: false })));
-  }, [familyModels, familyLoading]);
+      .catch(err => setCategoryError(prev => ({ ...prev, [categoryKey]: err.message || 'Failed to fetch models' })))
+      .finally(() => setCategoryLoading(prev => ({ ...prev, [categoryKey]: false })));
+  }, [categoryModels, categoryLoading]);
 
   useEffect(() => {
-    if (activeFamily === 'all') {
-      FAMILIES.forEach(f => loadFamily(f.key));
+    if (activeCategory === 'all') {
+      CATEGORIES.forEach(c => loadCategory(c.key));
     } else {
-      loadFamily(activeFamily);
+      loadCategory(activeCategory);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeFamily]);
+  }, [activeCategory]);
 
   // Debounced free-text search — takes over the grid whenever non-empty,
-  // querying HF directly instead of the fixed per-family queries.
+  // querying HF directly instead of the fixed per-category queries.
   useEffect(() => {
     const trimmed = searchInput.trim();
     const t = setTimeout(() => setSearchQuery(trimmed), 400);
@@ -637,17 +745,17 @@ export default function ModelHub() {
 
   const displayedModels: ModelResult[] = isSearching
     ? searchResults
-    : activeFamily === 'all'
-      ? FAMILIES.flatMap(f => familyModels[f.key] || [])
-      : (familyModels[activeFamily] || []);
+    : activeCategory === 'all'
+      ? CATEGORIES.flatMap(c => categoryModels[c.key] || [])
+      : (categoryModels[activeCategory] || []);
 
   const loadingGrid = isSearching
     ? searching
-    : activeFamily === 'all'
-      ? FAMILIES.some(f => familyLoading[f.key])
-      : !!familyLoading[activeFamily];
+    : activeCategory === 'all'
+      ? CATEGORIES.some(c => categoryLoading[c.key])
+      : !!categoryLoading[activeCategory];
 
-  const gridError = isSearching ? searchError : (activeFamily !== 'all' ? familyError[activeFamily] : null);
+  const gridError = isSearching ? searchError : (activeCategory !== 'all' ? categoryError[activeCategory] : null);
 
   return (
     <div className="flex-1 flex flex-col bg-aegis-base overflow-hidden">
@@ -657,7 +765,7 @@ export default function ModelHub() {
           <Cpu className="w-6 h-6 text-aegis-primary" />
           <h1 className="text-2xl font-bold text-aegis-text-primary">LLMs</h1>
         </div>
-        <p className="text-sm text-aegis-text-secondary">Browse and download GGUF models by family. Models run 100% locally.</p>
+        <p className="text-sm text-aegis-text-secondary">Browse and download GGUF models by what they're best at. Models run 100% locally.</p>
       </div>
 
       {/* Search */}
@@ -673,22 +781,22 @@ export default function ModelHub() {
         </div>
       </div>
 
-      {/* Family filter chips */}
+      {/* Category filter chips */}
       {!isSearching && (
         <div className="px-8 pb-5 flex items-center gap-2 flex-wrap">
           <button
-            onClick={() => setActiveFamily('all')}
-            className={`px-4 py-2 rounded-full text-sm font-semibold transition-colors ${activeFamily === 'all' ? 'bg-aegis-primary text-white' : 'bg-aegis-raised border border-aegis-border text-aegis-text-secondary hover:text-aegis-text-primary'}`}
+            onClick={() => setActiveCategory('all')}
+            className={`px-4 py-2 rounded-full text-sm font-semibold transition-colors ${activeCategory === 'all' ? 'bg-aegis-primary text-white' : 'bg-aegis-raised border border-aegis-border text-aegis-text-secondary hover:text-aegis-text-primary'}`}
           >
-            All families
+            All categories
           </button>
-          {FAMILIES.map(f => (
+          {CATEGORIES.map(c => (
             <button
-              key={f.key}
-              onClick={() => setActiveFamily(f.key)}
-              className={`px-4 py-2 rounded-full text-sm font-semibold transition-colors ${activeFamily === f.key ? 'bg-aegis-primary text-white' : 'bg-aegis-raised border border-aegis-border text-aegis-text-secondary hover:text-aegis-text-primary'}`}
+              key={c.key}
+              onClick={() => setActiveCategory(c.key)}
+              className={`px-4 py-2 rounded-full text-sm font-semibold transition-colors ${activeCategory === c.key ? 'bg-aegis-primary text-white' : 'bg-aegis-raised border border-aegis-border text-aegis-text-secondary hover:text-aegis-text-primary'}`}
             >
-              {f.label}
+              {c.label}
             </button>
           ))}
         </div>
@@ -710,14 +818,14 @@ export default function ModelHub() {
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {displayedModels.map(model => {
-              const family = model.familyKey ? FAMILY_BY_KEY[model.familyKey] || guessFamily(model) : guessFamily(model);
+              const category = model.categoryKey ? CATEGORY_BY_KEY[model.categoryKey] || guessCategory(model) : guessCategory(model);
               return (
                 <ModelCard
                   key={model.id}
                   model={model}
-                  family={family}
+                  category={category}
                   localModels={localModels}
-                  onOpen={() => setSelectedModel({ model, family })}
+                  onOpen={() => setSelectedModel({ model, category })}
                 />
               );
             })}
@@ -728,7 +836,7 @@ export default function ModelHub() {
       {selectedModel && (
         <ModelDetailModal
           model={selectedModel.model}
-          family={selectedModel.family}
+          category={selectedModel.category}
           ramTotalGb={ramTotalGb}
           localModels={localModels}
           progressData={progressData}

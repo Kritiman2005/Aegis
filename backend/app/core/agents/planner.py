@@ -109,6 +109,7 @@ class PlannerAgent(BaseAgent):
         token_callback=None,
         is_counting: bool = False,
         tool_names: Optional[List[str]] = None,
+        attachments: Optional[List[Dict]] = None,
     ) -> str:
         llm = self.get_llm()
         if not llm:
@@ -131,6 +132,15 @@ class PlannerAgent(BaseAgent):
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(chat_history)
         messages.append({"role": "user", "content": augmented_message})
+        # Real vision input for Agent Mode: if an image is attached this turn
+        # and the active model has a vision chat_handler wired, the planner
+        # gets to actually see it — this is what lets "what's in this
+        # image?" produce a direct_response grounded in the real image
+        # instead of just OCR'd text (see BaseAgent._attach_vision_images).
+        # Grammar-constrained sampling below is unaffected: the grammar
+        # constrains which tokens can be emitted, not what fed the model's
+        # context, so it composes fine with multimodal input.
+        self._attach_vision_images(messages, attachments)
 
         grammar = _build_plan_grammar(tool_names or [])
         base_kwargs = dict(messages=messages, temperature=0.1, stream=True, max_tokens=1024)
