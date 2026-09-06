@@ -5,8 +5,8 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_dynamic_libs
 
 # ── Hidden imports ────────────────────────────────────────────────────────────
-# NOTE: easyocr, torch, torchvision, torchaudio are excluded — they are lazy-
-# imported at runtime when OCR is first used, not at startup.
+# NOTE: torch, torchvision, torchaudio are excluded — they are lazy-imported
+# at runtime by the embedding/reranker models, not at startup.
 hidden_imports = (
     collect_submodules('app') +
     collect_submodules('uvicorn') +
@@ -151,8 +151,8 @@ a = Analysis(
     runtime_hooks=[],
     excludes=[
         'tkinter', 'PyQt5', 'PySide2',
-        # easyocr/torch are lazy-imported at runtime — never bundle them
-        'easyocr', 'torch', 'torchvision', 'torchaudio',
+        # torch is lazy-imported at runtime — never bundle it
+        'torch', 'torchvision', 'torchaudio',
         # dev-only tools
         'pytest', 'setuptools', 'distutils',
     ],

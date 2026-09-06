@@ -79,7 +79,15 @@ const CATEGORIES: ModelCategory[] = [
     color: '#0891B2',
     bg: '#ECFEFF',
     initial: 'V',
-    searchQuery: 'LLaVA GGUF',
+    // Was 'LLaVA GGUF' — LLaVA 1.5/1.6 is 2023-era and noticeably weaker
+    // than current vision models. Qwen2.5-VL's top results are from
+    // reputable quantizers (unsloth, lmstudio-community, and ggml-org —
+    // llama.cpp's own org, the strongest compatibility signal available)
+    // with far higher downloads, and it's a stronger model outright.
+    // 'MiniCPM-V GGUF' was considered but its top-downloads result on HF
+    // is a spam repo impersonating Anthropic model names in its title —
+    // not something to default users into.
+    searchQuery: 'Qwen2.5-VL GGUF',
     matchers: ['llava', 'vision', 'vl-', 'minicpm-v', 'qwen2-vl', 'qwen2.5-vl'],
   },
   {
@@ -152,6 +160,88 @@ function guessCategory(model: ModelResult): ModelCategory {
     searchQuery: '',
     matchers: [],
   };
+}
+
+// Real per-maker brand marks (Qwen/Llama/Mistral/DeepSeek/Phi/Gemma), shown
+// instead of the generic category-color-and-initial badge whenever a
+// model's repo id or author identifies who actually trained it — orthogonal
+// to CATEGORIES above, which groups by "what it's good for" rather than
+// "who made it". Simplified stylized marks (same fidelity as the connector
+// icons in ConnectorsView.tsx), not exact trademark reproductions. Falls
+// back to the category badge (guessCategory) for every quantizer/finetune
+// whose base model isn't one of these — most of what search actually
+// returns, so that fallback carries most of the weight.
+const FAMILY_ICONS: { matchers: string[]; icon: React.ReactNode }[] = [
+  {
+    matchers: ['qwen'],
+    icon: (
+      <svg viewBox="0 0 24 24" className="w-full h-full" fill="none">
+        <circle cx="12" cy="12" r="10" fill="#615CED" fillOpacity="0.15" />
+        <path d="M6.5 15.5C8 10 10 7 12 7s4 3 5.5 8.5" stroke="#615CED" strokeWidth="1.8" strokeLinecap="round" fill="none" />
+        <circle cx="12" cy="16.5" r="1.3" fill="#615CED" />
+      </svg>
+    ),
+  },
+  {
+    matchers: ['llama', 'meta-llama', 'meta/'],
+    icon: (
+      <svg viewBox="0 0 24 24" className="w-full h-full" fill="none">
+        <circle cx="12" cy="12" r="10" fill="#0668E1" fillOpacity="0.15" />
+        <path d="M4.5 15c0-4.2 2-7.5 3.7-7.5 1 0 1.4 1.3 1.8 2.8.4-1.5.9-2.8 2-2.8s1.6 1.3 2 2.8c.4-1.5.8-2.8 1.8-2.8 1.7 0 3.7 3.3 3.7 7.5" stroke="#0668E1" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+      </svg>
+    ),
+  },
+  {
+    matchers: ['mistral'],
+    icon: (
+      <svg viewBox="0 0 24 24">
+        <rect x="3" y="4.5" width="4.2" height="4.2" fill="#F7A400" />
+        <rect x="8.2" y="4.5" width="4.2" height="4.2" fill="#F7591F" />
+        <rect x="13.4" y="4.5" width="4.2" height="4.2" fill="#F7591F" />
+        <rect x="18.6" y="4.5" width="2.4" height="4.2" fill="#F23821" />
+        <rect x="3" y="9.9" width="4.2" height="4.2" fill="#F7A400" fillOpacity="0.65" />
+        <rect x="18.6" y="9.9" width="2.4" height="4.2" fill="#F23821" fillOpacity="0.65" />
+        <rect x="3" y="15.3" width="4.2" height="4.2" fill="#F7A400" fillOpacity="0.35" />
+        <rect x="8.2" y="15.3" width="4.2" height="4.2" fill="#F7591F" fillOpacity="0.35" />
+        <rect x="13.4" y="15.3" width="4.2" height="4.2" fill="#F7591F" fillOpacity="0.35" />
+        <rect x="18.6" y="15.3" width="2.4" height="4.2" fill="#F23821" fillOpacity="0.35" />
+      </svg>
+    ),
+  },
+  {
+    matchers: ['deepseek'],
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none">
+        <circle cx="12" cy="12" r="10" fill="#4D6BFE" fillOpacity="0.15" />
+        <path d="M5.5 13c1.8-3 4-4.8 6.5-4.8s4.7 1.8 6.5 4.8c-1.8 2.6-4 4-6.5 4s-4.7-1.4-6.5-4z" fill="#4D6BFE" />
+        <circle cx="9.3" cy="12.3" r="1" fill="white" />
+      </svg>
+    ),
+  },
+  {
+    matchers: ['phi-', 'phi_2', 'phi_3', 'phi2', 'phi3', 'phi4', 'microsoft'],
+    icon: (
+      <svg viewBox="0 0 24 24">
+        <rect x="3" y="3" width="8" height="8" fill="#F25022" />
+        <rect x="13" y="3" width="8" height="8" fill="#7FBA00" />
+        <rect x="3" y="13" width="8" height="8" fill="#00A4EF" />
+        <rect x="13" y="13" width="8" height="8" fill="#FFB900" />
+      </svg>
+    ),
+  },
+  {
+    matchers: ['gemma', 'google/'],
+    icon: (
+      <svg viewBox="0 0 24 24">
+        <path d="M12 2.5L17 6l-1.6 9.5L12 21.5 8.6 15.5 7 6z" fill="#4C8DF6" />
+      </svg>
+    ),
+  },
+];
+
+function getFamilyIcon(model: ModelResult): React.ReactNode | null {
+  const hay = `${model.id} ${model.author}`.toLowerCase();
+  return FAMILY_ICONS.find(f => f.matchers.some(m => hay.includes(m)))?.icon ?? null;
 }
 
 // Pull a human parameter-count badge ("7B", "1.5B") out of a repo id — HF
@@ -436,12 +526,19 @@ function ModelDetailModal({
         {/* Header */}
         <div className="p-6 border-b border-aegis-border flex items-start justify-between flex-shrink-0">
           <div className="flex items-start gap-3 min-w-0">
-            <div
-              className="w-11 h-11 rounded-2xl flex items-center justify-center text-base font-black flex-shrink-0"
-              style={{ background: category.bg, color: category.color }}
-            >
-              {category.initial}
-            </div>
+            {(() => {
+              const familyIcon = getFamilyIcon(model);
+              return familyIcon ? (
+                <div className="w-11 h-11 rounded-2xl bg-aegis-overlay p-2 flex-shrink-0">{familyIcon}</div>
+              ) : (
+                <div
+                  className="w-11 h-11 rounded-2xl flex items-center justify-center text-base font-black flex-shrink-0"
+                  style={{ background: category.bg, color: category.color }}
+                >
+                  {category.initial}
+                </div>
+              );
+            })()}
             <div className="min-w-0">
               <h3 className="text-base font-bold text-aegis-text-primary break-words">{cleanTitle(model.id)}</h3>
               <p className="text-xs text-aegis-text-muted mt-0.5">by {model.author}</p>
@@ -542,12 +639,19 @@ function ModelCard({
     >
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-3 min-w-0">
-          <div
-            className="w-10 h-10 rounded-2xl flex items-center justify-center text-base font-black flex-shrink-0"
-            style={{ background: category.bg, color: category.color }}
-          >
-            {category.initial}
-          </div>
+          {(() => {
+            const familyIcon = getFamilyIcon(model);
+            return familyIcon ? (
+              <div className="w-10 h-10 rounded-2xl bg-aegis-overlay p-2 flex-shrink-0">{familyIcon}</div>
+            ) : (
+              <div
+                className="w-10 h-10 rounded-2xl flex items-center justify-center text-base font-black flex-shrink-0"
+                style={{ background: category.bg, color: category.color }}
+              >
+                {category.initial}
+              </div>
+            );
+          })()}
           <div className="min-w-0">
             <h4 className="text-sm font-bold text-aegis-text-primary truncate">{cleanTitle(model.id)}</h4>
             <p className="text-[11px] text-aegis-text-muted truncate">by {model.author}</p>

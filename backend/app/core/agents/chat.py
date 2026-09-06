@@ -413,10 +413,11 @@ class ChatAgent(BaseAgent):
                     "the user's laptop by its exact path (get the path from "
                     "search_local_files or list_folder first if you don't already "
                     "have it) — confined to their home directory, credential-shaped "
-                    "files refused. Supports PDF, DOCX, XLSX, PPTX, CSV, plain "
-                    "text/markdown, and images (via OCR) — the same extraction "
-                    "used for files the user uploads to chat, so a file already "
-                    "on disk doesn't need to be manually uploaded first. Long "
+                    "files refused. Supports PDF, DOCX, XLSX, PPTX, CSV, and plain "
+                    "text/markdown — the same extraction used for files the user "
+                    "uploads to chat, so a file already on disk doesn't need to be "
+                    "manually uploaded first. Images and audio/video files are not "
+                    "supported (no OCR or transcription fallback). Long "
                     "files come back in chunks — if the result reports "
                     "`has_more`, call this again with the same path and `offset` "
                     "set to the reported `next_offset` to keep reading."
@@ -433,22 +434,108 @@ class ChatAgent(BaseAgent):
             {
                 "name": "write_file",
                 "description": (
-                    "Writes plain-text content to a file on the user's laptop, "
-                    "confined to their home directory. Fails if the file already "
-                    "exists unless `overwrite` is explicitly set true — never "
-                    "silently replaces an existing file. Use when the user asks "
-                    "you to save something (a summary, a list, generated text) "
-                    "to a real file on disk, as opposed to Chat Mode's "
-                    "export-to-download-link for a PDF/DOCX/XLSX."
+                    "Writes content to a file on the user's laptop, confined to "
+                    "their home directory. Fails if the file already exists unless "
+                    "`overwrite` is explicitly set true — never silently replaces "
+                    "an existing file. Use when the user asks you to save something "
+                    "(a summary, a list, generated text) to a real file on disk. "
+                    "Plain text (`encoding` omitted or 'text') covers most cases — "
+                    "for a binary file (e.g. placing a PDF/DOCX you generated), set "
+                    "`encoding` to 'base64' and pass the file's base64-encoded bytes "
+                    "as `content`."
                 ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "Destination file path, relative to the home directory or absolute. Parent folders are created if needed."},
-                        "content": {"type": "string", "description": "The exact plain-text content to write."},
+                        "content": {"type": "string", "description": "The content to write — plain text, or base64-encoded bytes when encoding='base64'."},
                         "overwrite": {"type": "boolean", "description": "Set true to replace an existing file at that path. Defaults to false (fails instead of clobbering)."},
+                        "encoding": {"type": "string", "enum": ["text", "base64"], "description": "'text' (default) writes `content` as UTF-8 text. 'base64' decodes `content` and writes the raw bytes — use for PDFs, images, or any other binary file."},
                     },
                     "required": ["path", "content"],
+                },
+            },
+            {
+                "name": "copy_file",
+                "description": (
+                    "Copies a single file on the user's laptop from one path to "
+                    "another, both confined to their home directory. Fails if the "
+                    "destination already exists unless `overwrite` is explicitly "
+                    "set true. Use for 'copy this file to that folder' — the "
+                    "original at `src` is left in place. Directories are not "
+                    "supported, only single files."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "src": {"type": "string", "description": "Path of the existing file to copy, relative to the home directory or absolute."},
+                        "dst": {"type": "string", "description": "Destination file path. Parent folders are created if needed."},
+                        "overwrite": {"type": "boolean", "description": "Set true to replace an existing file at dst. Defaults to false."},
+                    },
+                    "required": ["src", "dst"],
+                },
+            },
+            {
+                "name": "move_file",
+                "description": (
+                    "Moves (or renames) a single file on the user's laptop from "
+                    "one path to another, both confined to their home directory. "
+                    "Fails if the destination already exists unless `overwrite` is "
+                    "explicitly set true. Use for 'move this file to that folder' "
+                    "or 'rename this file' — the source no longer exists at `src` "
+                    "afterward. Directories are not supported, only single files."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "src": {"type": "string", "description": "Path of the existing file to move, relative to the home directory or absolute."},
+                        "dst": {"type": "string", "description": "Destination file path. Parent folders are created if needed."},
+                        "overwrite": {"type": "boolean", "description": "Set true to replace an existing file at dst. Defaults to false."},
+                    },
+                    "required": ["src", "dst"],
+                },
+            },
+            {
+                "name": "delete_file",
+                "description": (
+                    "Permanently deletes a single file on the user's laptop, "
+                    "confined to their home directory — there is no trash/recycle "
+                    "bin and no undo. Directories are not supported, only single "
+                    "files. Only use this when the user has clearly and "
+                    "specifically asked to delete or remove a file."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Exact file path to delete, relative to the home directory or absolute."},
+                    },
+                    "required": ["path"],
+                },
+            },
+            {
+                "name": "export_file",
+                "description": (
+                    "Renders markdown content as a real PDF, DOCX, or XLSX file and "
+                    "saves it directly to a path on the user's laptop, confined to "
+                    "their home directory — proper formatting (headings, tables, "
+                    "lists), not a plain-text dump. Distinct from write_file: this "
+                    "one converts the content for you, so pass plain markdown as "
+                    "`content`, not base64. Fails if the destination already exists "
+                    "unless `overwrite` is explicitly set true. Use whenever the "
+                    "user wants generated content (a report, a summary, a table) "
+                    "saved as an actual PDF/DOCX/XLSX file on disk, as opposed to "
+                    "Chat Mode's export-to-download-link."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string", "description": "The exact markdown content to render into the file (headings, lists, tables, plain paragraphs)."},
+                        "format": {"type": "string", "enum": ["pdf", "docx", "xlsx"], "description": "Output file format."},
+                        "path": {"type": "string", "description": "Destination file path (include the matching extension, e.g. 'Documents/report.pdf'), relative to the home directory or absolute. Parent folders are created if needed."},
+                        "title": {"type": "string", "description": "Optional document title. Omit if `content` already starts with its own top-level heading."},
+                        "overwrite": {"type": "boolean", "description": "Set true to replace an existing file at that path. Defaults to false (fails instead of clobbering)."},
+                    },
+                    "required": ["content", "format", "path"],
                 },
             },
         ]
@@ -812,9 +899,13 @@ class ChatAgent(BaseAgent):
             "error": result.error,
         }
 
-    _FILESYSTEM_TOOL_NAMES = {"search_local_files", "list_folder", "read_file", "write_file"}
-    # Every filesystem tool except write_file only ever looks at the disk —
-    # used for the plan-confirmation card's [read-only]/[writes] badge.
+    _FILESYSTEM_TOOL_NAMES = {
+        "search_local_files", "list_folder", "read_file",
+        "write_file", "copy_file", "move_file", "delete_file", "export_file",
+    }
+    # Every filesystem tool except the write/copy/move/delete ones only ever
+    # looks at the disk — used for the plan-confirmation card's
+    # [read-only]/[writes] badge.
     _READ_ONLY_TOOL_NAMES = {"web_scrape", "search_local_files", "list_folder", "read_file"}
 
     async def _execute_filesystem_tool(self, tool_name: str, arguments: Dict) -> Dict:
@@ -832,7 +923,8 @@ class ChatAgent(BaseAgent):
         "Internal bug" rather than the plain refusal it actually is.
         """
         from app.core.filesystem_tools import (
-            search_files, list_folder, read_file_text, write_file, SandboxError,
+            search_files, list_folder, read_file_text, write_file,
+            copy_file, move_file, delete_file, SandboxError,
         )
 
         try:
@@ -868,11 +960,73 @@ class ChatAgent(BaseAgent):
                     path=arguments.get("path", ""),
                     content=arguments.get("content", ""),
                     overwrite=bool(arguments.get("overwrite", False)),
+                    encoding=arguments.get("encoding", "text"),
                 ))
+
+            if tool_name == "copy_file":
+                return await anyio.to_thread.run_sync(lambda: copy_file(
+                    src=arguments.get("src", ""),
+                    dst=arguments.get("dst", ""),
+                    overwrite=bool(arguments.get("overwrite", False)),
+                ))
+
+            if tool_name == "move_file":
+                return await anyio.to_thread.run_sync(lambda: move_file(
+                    src=arguments.get("src", ""),
+                    dst=arguments.get("dst", ""),
+                    overwrite=bool(arguments.get("overwrite", False)),
+                ))
+
+            if tool_name == "delete_file":
+                return await anyio.to_thread.run_sync(lambda: delete_file(arguments.get("path", "")))
+
+            if tool_name == "export_file":
+                return await self._execute_export_file(arguments)
 
             return {"success": False, "error": f"Unknown filesystem tool '{tool_name}'."}
         except SandboxError as e:
             return {"success": False, "error": str(e)}
+
+    async def _execute_export_file(self, arguments: Dict) -> Dict:
+        """
+        Dispatch for export_file: renders markdown -> PDF/DOCX/XLSX bytes via
+        app.core.exporter (the same renderer Chat Mode's export-to-download-
+        link uses), then hands the bytes to filesystem_tools.write_file's
+        base64 path for the actual sandboxed write — reusing its overwrite/
+        denylist/containment checks rather than duplicating them here.
+        """
+        import base64
+        from app.core.exporter import export_markdown, CONTENT_TYPES
+        from app.core.filesystem_tools import write_file, SandboxError
+
+        content = arguments.get("content", "")
+        fmt = (arguments.get("format") or "").lower().strip()
+        path = arguments.get("path", "")
+        title = arguments.get("title", "")
+
+        if fmt not in CONTENT_TYPES:
+            return {"success": False, "error": f"Unsupported format '{fmt}'. Use pdf, docx, or xlsx."}
+        if not content.strip():
+            return {"success": False, "error": "Nothing to export — content was empty."}
+
+        try:
+            data = await anyio.to_thread.run_sync(export_markdown, content, fmt, title)
+        except Exception as e:
+            return {"success": False, "error": f"Export failed: {e}"}
+
+        try:
+            result = await anyio.to_thread.run_sync(lambda: write_file(
+                path=path,
+                content=base64.b64encode(data).decode(),
+                overwrite=bool(arguments.get("overwrite", False)),
+                encoding="base64",
+            ))
+        except SandboxError as e:
+            return {"success": False, "error": str(e)}
+
+        if result.get("success"):
+            result["format"] = fmt
+        return result
 
     async def _execute_browser_action(self, tool_name: str, arguments: Dict) -> Dict:
         """
@@ -1521,35 +1675,53 @@ Output valid JSON only. Example: {{"is_export": true, "format": "docx", "parts":
                     "again in a moment. Do NOT claim you have no way to access uploaded files."
                 )
 
-        # An image whose OCR was skipped at upload time (see documents.py's
-        # skip_ocr) has NO searchable content in Qdrant at all — it was only
-        # ever going to be readable via _attach_vision_images sending it as
-        # real image input. If the active model has since changed (or its
-        # mmproj is no longer paired) by the time this turn actually sends,
-        # that image now has no representation whatsoever — surface that
-        # explicitly rather than silently answering as if nothing were
-        # attached, which is indistinguishable from the model just not
-        # noticing the attachment.
+        # Images have NO searchable content in Qdrant at all — OCR is no
+        # longer used as a fallback (see documents.py), so an image is only
+        # ever readable by a vision model looking at it directly via
+        # _attach_vision_images. Two distinct gaps to surface explicitly
+        # rather than silently answering as if nothing were attached, which
+        # is indistinguishable from the model just not noticing the
+        # attachment:
+        #   1. Vision was active at upload (so the row looks "ready") but is
+        #      no longer active by send time — content is stranded.
+        #   2. No vision model was ever active — documents.py already
+        #      rejected the upload outright, but the agent still needs to
+        #      relay that reason instead of treating it like any other
+        #      generic ingestion failure.
         vision_gap_note = ""
-        if attached_ids and not self.get_active_vision_mmproj_path():
+        if attached_ids:
             from app.db.models import UserDocument
             _db = SessionLocal()
             try:
-                stranded = _db.query(UserDocument).filter(
-                    UserDocument.id.in_(attached_ids),
-                    UserDocument.ocr_skipped_for_vision == True,
-                ).all()
+                attached_docs = _db.query(UserDocument).filter(UserDocument.id.in_(attached_ids)).all()
             finally:
                 _db.close()
-            if stranded:
-                names = ", ".join(d.filename for d in stranded)
-                vision_gap_note = (
-                    f"[SYSTEM NOTE]: {names} was uploaded while a vision-capable model was "
-                    "active, so its content was never OCR'd or indexed — it was only ever "
-                    "readable by a vision model looking at it directly. The currently active "
-                    "model is no longer vision-capable, so this image's content is NOT "
-                    "available right now. Tell the user to switch back to a vision-capable "
-                    "model (LLM panel) and re-send to have it read, rather than answering as "
+
+            if not self.get_active_vision_mmproj_path():
+                stranded = [d for d in attached_docs if d.ocr_skipped_for_vision]
+                if stranded:
+                    names = ", ".join(d.filename for d in stranded)
+                    vision_gap_note += (
+                        f"[SYSTEM NOTE]: {names} was uploaded while a vision-capable model was "
+                        "active, so its content was never OCR'd or indexed — it was only ever "
+                        "readable by a vision model looking at it directly. The currently active "
+                        "model is no longer vision-capable, so this image's content is NOT "
+                        "available right now. Tell the user to switch back to a vision-capable "
+                        "model (LLM panel) and re-send to have it read, rather than answering as "
+                        "if the image isn't there.\n\n"
+                    )
+
+            no_vision_failed = [
+                d for d in attached_docs
+                if d.status == "failed" and d.file_type in ("png", "jpg", "jpeg")
+            ]
+            if no_vision_failed:
+                names = ", ".join(d.filename for d in no_vision_failed)
+                vision_gap_note += (
+                    f"[SYSTEM NOTE]: {names} could not be read — no vision-capable model was "
+                    "active when it was uploaded, and this app no longer falls back to OCR for "
+                    "images. Tell the user to download and activate a vision-capable model (LLM "
+                    "panel) and re-upload the image so it can be read, rather than answering as "
                     "if the image isn't there.\n\n"
                 )
 

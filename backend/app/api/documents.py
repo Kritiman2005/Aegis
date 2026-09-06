@@ -1,7 +1,8 @@
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse
 from typing import List, Dict, Any, Optional
+import mimetypes
 import os
-import shutil
 import threading
 from pathlib import Path
 from datetime import datetime
@@ -24,6 +25,17 @@ router = APIRouter(prefix="/api/documents", tags=["Documents"])
 # stuck in "processing" forever with zero explanation. This ceiling
 # guarantees ingestion always reaches ready/failed within a bounded time.
 _INGEST_TIMEOUT_SECONDS = 180
+
+# No cap existed at all before this — a user could upload an arbitrarily
+# large file (disk/memory risk on its own), and it fed straight into
+# extraction/chunking/embedding with no bound on how long that would take,
+# which is exactly what could make an otherwise-legitimate huge PDF/DOCX
+# collide with _INGEST_TIMEOUT_SECONDS above and get killed as if it were a
+# hung network download. Checked incrementally while streaming to disk
+# (not from a Content-Length header, which a client can omit or lie about)
+# so an oversized upload is rejected before it's ever fully written.
+_MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
+_UPLOAD_COPY_CHUNK_SIZE = 1024 * 1024
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
 _data_dir = os.environ.get("AEGIS_DATA_DIR")
@@ -102,7 +114,13 @@ def process_upload_task(doc_id: int, file_path: str, file_type: str, filename: s
     finally:
         db.close()
 
-_AUDIO_VIDEO_EXTENSIONS = {
+# Audio/video upload+transcription was removed — faster-whisper transcription
+# stays only for the composer's live mic button (app/core/transcription.py,
+# app/api/voice.py), which is unaffected by this. Rejected explicitly here
+# rather than left to fail downstream in extract_text(), so the user gets an
+# immediate, clear reason instead of a document stuck in "processing" until
+# ingestion gets to it.
+_REJECTED_AUDIO_VIDEO_EXTENSIONS = {
     "mp3", "wav", "m4a", "ogg", "flac", "aac", "wma",
     "mp4", "mov", "mkv", "webm", "avi",
 }
@@ -110,8 +128,7 @@ _AUDIO_VIDEO_EXTENSIONS = {
 
 async def async_process_upload_task(doc_id: int, file_path: str, file_type: str, filename: str, conversation_id: str):
     """Async wrapper to broadcast progress over WebSockets and run the heavy ML ingestion in a separate thread."""
-    verb = "Transcribing" if file_type.lower() in _AUDIO_VIDEO_EXTENSIONS else "Ingesting"
-    await ws_manager.broadcast_json({"type": "document_progress", "content": f"{verb} {filename} (this may take a moment)..."})
+    await ws_manager.broadcast_json({"type": "document_progress", "content": f"Ingesting {filename} (this may take a moment)..."})
     try:
         # Run blocking processing in a thread pool so we don't freeze FastAPI's async event loop
         success, error_message = await anyio.to_thread.run_sync(
@@ -144,11 +161,30 @@ async def upload_document(
         raise HTTPException(status_code=400, detail="Invalid filename")
 
     ext = safe_filename.split(".")[-1].lower() if "." in safe_filename else "txt"
+    if ext in _REJECTED_AUDIO_VIDEO_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail="Audio/video upload isn't supported — this app no longer transcribes uploaded audio or video files.",
+        )
     file_path = UPLOAD_DIR / f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{safe_filename}"
 
+    total_bytes = 0
     with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-        
+        while True:
+            chunk = await file.read(_UPLOAD_COPY_CHUNK_SIZE)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > _MAX_UPLOAD_BYTES:
+                buffer.close()
+                file_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File too large — the limit is {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+                )
+            buffer.write(chunk)
+
+
     # Save to SQLite
     doc = UserDocument(
         conversation_id=conversation_id,
@@ -170,18 +206,18 @@ async def upload_document(
     # app.api.websocket's message handler and app.core.agents.chat's
     # _handle_idle(attachments=...).
 
-    # An image is a special case when a vision model is active: it'll be
-    # sent to the model directly as real vision input at send-time (see
-    # BaseAgent._attach_vision_images), so running OCR/RAG on it here would
-    # be pure wasted latency and compute for content nothing will ever read.
-    # Skip ingestion entirely rather than just not waiting on it — this
-    # image's content is only ever available live in-context on the turn
-    # it's attached, not indexed for later search, which is the deliberate
-    # trade-off of going all-in on vision over OCR for these images.
+    # Images never go through RAG ingestion at all now — vision is the only
+    # way their content is ever read. A vision-capable active model gets the
+    # image as real vision input at send-time (BaseAgent._attach_vision_images);
+    # with no vision model active, OCR is no longer used as a fallback (it
+    # silently produced garbled/unreliable text for a feature — "read this
+    # image" — users expect to just work), so the upload fails immediately
+    # with an explicit reason instead of quietly indexing OCR noise.
     from app.db.crud import get_active_vision_mmproj_path
-    skip_ocr = ext in ("png", "jpg", "jpeg") and get_active_vision_mmproj_path(db) is not None
+    is_image = ext in ("png", "jpg", "jpeg")
+    has_vision = get_active_vision_mmproj_path(db) is not None
 
-    if skip_ocr:
+    if is_image and has_vision:
         doc.status = "ready"
         # Flags this row as having NO searchable content at all — see
         # ChatAgent._get_document_context (chat.py), which checks this at
@@ -191,6 +227,14 @@ async def upload_document(
         doc.ocr_skipped_for_vision = True
         db.commit()
         logger.info(f"Skipping OCR for image upload '{file.filename}' — vision model active, will be sent as real image input instead.")
+    elif is_image and not has_vision:
+        doc.status = "failed"
+        doc.error_message = (
+            "No vision-capable model is active — download and select a vision model "
+            "(LLM panel) to read image content. OCR is no longer used as a fallback."
+        )
+        db.commit()
+        logger.info(f"Rejecting image upload '{file.filename}' — no vision model active and OCR fallback has been removed.")
     else:
         logger.info(f"Received document upload: {file.filename} -> starting background RAG ingestion.")
         # Process asynchronously via BackgroundTasks to immediately return HTTP 200
@@ -230,6 +274,79 @@ async def list_documents(conversation_id: Optional[str] = None, db = Depends(get
         "error_message": d.error_message,
         "created_at": d.created_at.isoformat() if d.created_at else None,
     } for d in docs]
+
+
+@router.get("/{document_id}/raw")
+async def get_document_raw(document_id: int, download: bool = False, db = Depends(get_db)):
+    """
+    Serves the original uploaded file as-is — used by the frontend preview
+    modal for content a browser can render natively (PDF via <iframe>,
+    images via <img>) and, with ?download=true, as the "Download" link for
+    everything else.
+
+    content_disposition_type defaults to "attachment" in Starlette's
+    FileResponse whenever `filename` is passed — silently forcing every
+    response into a download instead of rendering inline, which is why an
+    <iframe src=".../raw"> would show nothing at all (the browser tries to
+    download the framed content rather than display it). Explicit "inline"
+    here is what actually makes the PDF preview work; ?download=true is a
+    deliberate opt-in back to "attachment" for the real download link,
+    since the frontend and backend are different origins (localhost:3000 vs
+    127.0.0.1:8000) — the HTML `download` attribute on an <a> tag is only
+    honored by browsers for same-origin (or blob/data) URLs, so it can't be
+    relied on here to force the save behavior on its own.
+    """
+    doc = db.query(UserDocument).filter(UserDocument.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    file_path = Path(doc.file_path)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="The file is no longer on disk.")
+    media_type, _ = mimetypes.guess_type(doc.filename)
+    return FileResponse(
+        file_path,
+        media_type=media_type or "application/octet-stream",
+        filename=doc.filename,
+        content_disposition_type="attachment" if download else "inline",
+    )
+
+
+# Preview-only cap — independent of _MAX_EXTRACTED_CHARS in rag/processor.py
+# (which bounds what gets chunked/embedded). This just keeps a single
+# preview response from shipping megabytes of text to the browser at once;
+# the full content is still what actually got indexed for chat/search.
+_PREVIEW_MAX_CHARS = 50_000
+
+
+@router.get("/{document_id}/text")
+async def get_document_text(document_id: int, db = Depends(get_db)):
+    """
+    Extracts and returns a text preview for formats a browser can't render
+    natively (DOCX/XLSX/PPTX/CSV/TXT/MD) — used by the frontend preview
+    modal's fallback pane. Images and PDFs are previewed via /raw instead
+    and never call this.
+    """
+    doc = db.query(UserDocument).filter(UserDocument.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    if doc.status == "failed":
+        raise HTTPException(status_code=422, detail=doc.error_message or "This document failed to process.")
+    if doc.status != "ready":
+        raise HTTPException(status_code=409, detail="This document is still processing.")
+
+    from app.core.rag.processor import extract_text
+    try:
+        text = await anyio.to_thread.run_sync(extract_text, doc.file_path, doc.file_type)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    truncated = len(text) > _PREVIEW_MAX_CHARS
+    return {
+        "filename": doc.filename,
+        "file_type": doc.file_type,
+        "text": text[:_PREVIEW_MAX_CHARS],
+        "truncated": truncated,
+    }
 
 
 @router.delete("/{document_id}")

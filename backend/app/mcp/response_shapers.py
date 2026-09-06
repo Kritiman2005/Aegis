@@ -878,6 +878,80 @@ def _fs_write_file_disp(raw: Any) -> str:
     action = "Overwrote" if s.get("overwritten") else "Wrote"
     return f"{action} **`{s.get('path')}`** ({_num(s.get('bytes_written'))} bytes)."
 
+def _fs_copy_file_exec(raw: Any) -> Dict:
+    err = _fs_error(raw)
+    if err:
+        return {"error": err}
+    if not isinstance(raw, dict):
+        return {"error": _trunc(str(raw), 300)}
+    return {
+        "src": raw.get("src"),
+        "dst": raw.get("dst"),
+        "bytes_copied": raw.get("bytes_copied"),
+        "overwritten": raw.get("overwritten"),
+    }
+
+def _fs_copy_file_disp(raw: Any) -> str:
+    s = _fs_copy_file_exec(raw)
+    if "error" in s:
+        return f"**Copy failed:** {s['error']}"
+    note = " (overwrote existing file)" if s.get("overwritten") else ""
+    return f"Copied **`{s.get('src')}`** → **`{s.get('dst')}`** ({_num(s.get('bytes_copied'))} bytes){note}."
+
+def _fs_move_file_exec(raw: Any) -> Dict:
+    err = _fs_error(raw)
+    if err:
+        return {"error": err}
+    if not isinstance(raw, dict):
+        return {"error": _trunc(str(raw), 300)}
+    return {
+        "src": raw.get("src"),
+        "dst": raw.get("dst"),
+        "overwritten": raw.get("overwritten"),
+    }
+
+def _fs_move_file_disp(raw: Any) -> str:
+    s = _fs_move_file_exec(raw)
+    if "error" in s:
+        return f"**Move failed:** {s['error']}"
+    note = " (overwrote existing file)" if s.get("overwritten") else ""
+    return f"Moved **`{s.get('src')}`** → **`{s.get('dst')}`**{note}."
+
+def _fs_delete_file_exec(raw: Any) -> Dict:
+    err = _fs_error(raw)
+    if err:
+        return {"error": err}
+    if not isinstance(raw, dict):
+        return {"error": _trunc(str(raw), 300)}
+    return {"path": raw.get("path")}
+
+def _fs_delete_file_disp(raw: Any) -> str:
+    s = _fs_delete_file_exec(raw)
+    if "error" in s:
+        return f"**Delete failed:** {s['error']}"
+    return f"Deleted **`{s.get('path')}`**."
+
+def _fs_export_file_exec(raw: Any) -> Dict:
+    err = _fs_error(raw)
+    if err:
+        return {"error": err}
+    if not isinstance(raw, dict):
+        return {"error": _trunc(str(raw), 300)}
+    return {
+        "path": raw.get("path"),
+        "format": raw.get("format"),
+        "bytes_written": raw.get("bytes_written"),
+        "overwritten": raw.get("overwritten"),
+    }
+
+def _fs_export_file_disp(raw: Any) -> str:
+    s = _fs_export_file_exec(raw)
+    if "error" in s:
+        return f"**Export failed:** {s['error']}"
+    action = "Overwrote" if s.get("overwritten") else "Saved"
+    fmt = (s.get("format") or "").upper()
+    return f"{action} **`{s.get('path')}`** ({fmt}, {_num(s.get('bytes_written'))} bytes)."
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Persistent browser session (browser_* tools — app.core.browser_session)
@@ -1055,6 +1129,10 @@ _SHAPERS: Dict[str, _ShapeEntry] = {
     "list_folder":            (_fs_list_folder_exec,           _fs_list_folder_disp),
     "read_file":              (_fs_read_file_exec,             _fs_read_file_disp),
     "write_file":             (_fs_write_file_exec,            _fs_write_file_disp),
+    "copy_file":              (_fs_copy_file_exec,             _fs_copy_file_disp),
+    "move_file":              (_fs_move_file_exec,             _fs_move_file_disp),
+    "delete_file":            (_fs_delete_file_exec,           _fs_delete_file_disp),
+    "export_file":            (_fs_export_file_exec,           _fs_export_file_disp),
 
     # ── Persistent browser session (app.core.browser_session) — also not
     #    MCP servers. browser_navigate and browser_extract_text reuse the

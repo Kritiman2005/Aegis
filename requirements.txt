@@ -48,7 +48,6 @@ python-dotenv>=1.0.1
 # RAG & Document Processing
 pymupdf>=1.23.0
 python-pptx>=0.6.23
-easyocr>=1.7.1
 qdrant-client>=1.7.0
 fastembed>=0.2.0
 sentence-transformers>=2.3.00

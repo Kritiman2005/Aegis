@@ -29,6 +29,7 @@ import { selectSessionId } from '@/store/sessionSlice';
 import AgentThinking from './AgentThinking';
 import MarkdownContent from './MarkdownContent';
 import PlanCard, { parsePlanMarkdown } from './PlanCard';
+import DocumentPreviewModal from './DocumentPreviewModal';
 import { useMemo } from 'react';
 
 function ToggleSwitch({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
@@ -47,11 +48,15 @@ function ToggleSwitch({ checked, onChange }: { checked: boolean; onChange: (v: b
 
 type DocStatus = 'processing' | 'ready' | 'failed';
 
-function AttachmentChip({ attachment, status }: { attachment: Attachment; status?: DocStatus }) {
+function AttachmentChip({ attachment, status, onPreview }: { attachment: Attachment; status?: DocStatus; onPreview?: () => void }) {
   const ext = attachment.file_type.toLowerCase();
-  const isImage = ['png', 'jpg', 'jpeg'].includes(ext);
   return (
-    <div className="flex items-center gap-2.5 bg-aegis-raised border border-aegis-border rounded-xl px-3.5 py-2.5 max-w-xs">
+    <button
+      onClick={onPreview}
+      disabled={!onPreview}
+      title={onPreview ? `Preview ${attachment.filename}` : undefined}
+      className="flex items-center gap-2.5 bg-aegis-raised border border-aegis-border rounded-xl px-3.5 py-2.5 max-w-xs text-left enabled:hover:bg-aegis-overlay enabled:hover:border-aegis-primary-light transition-colors disabled:cursor-default"
+    >
       <div className="w-8 h-8 rounded-lg bg-aegis-overlay flex items-center justify-center flex-shrink-0">
         <FileText className="w-4 h-4 text-aegis-primary-light" />
       </div>
@@ -66,7 +71,7 @@ function AttachmentChip({ attachment, status }: { attachment: Attachment; status
       ) : (
         <Loader2 className="w-4 h-4 text-aegis-text-muted animate-spin flex-shrink-0" />
       )}
-    </div>
+    </button>
   );
 }
 
@@ -166,12 +171,20 @@ export default function ChatView({
         const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/documents?conversation_id=${encodeURIComponent(sessionId)}`);
         const docs = await res.json();
         if (cancelled || !Array.isArray(docs)) return;
-        let anyPending = false;
+        // Computed from `docs` directly, NOT inside the setDocStatuses updater
+        // below — React doesn't guarantee that updater runs synchronously
+        // before this line (and empirically, here, it doesn't: it's deferred
+        // to the render phase), so a `let` mutated only inside it is still
+        // its initial `false` by the time it's read here. That silently
+        // cleared the interval after every single tick regardless of real
+        // status, permanently freezing the chip at whatever state that one
+        // tick happened to catch — usually "processing", since ingestion
+        // rarely finishes within the same tick as the upload response.
+        const anyPending = docs.some((d: { status: string }) => d.status !== 'ready' && d.status !== 'failed');
         setDocStatuses(prev => {
           const next = { ...prev };
           for (const d of docs) {
-            if (d.status === 'ready' || d.status === 'failed') next[d.id] = d.status;
-            else { next[d.id] = 'processing'; anyPending = true; }
+            next[d.id] = (d.status === 'ready' || d.status === 'failed') ? d.status : 'processing';
           }
           return next;
         });
@@ -291,7 +304,17 @@ export default function ChatView({
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // "+" attach menu: Upload Document / Tools / Skills
+  const [previewAttachment, setPreviewAttachment] = useState<Attachment | null>(null);
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
+  // Collapsed by default — the "+" menu shows one "Export" row that expands
+  // to reveal the PDF/DOCX/XLSX choices, rather than always showing all
+  // three as separate top-level rows. Reset whenever the parent menu closes
+  // (for any reason: picking an item, clicking outside, toggling "+" again)
+  // so it doesn't reopen pre-expanded next time.
+  const [exportSubmenuOpen, setExportSubmenuOpen] = useState(false);
+  useEffect(() => {
+    if (!attachMenuOpen) setExportSubmenuOpen(false);
+  }, [attachMenuOpen]);
   const [scrapeBarOpen, setScrapeBarOpen] = useState(false);
   const [scrapeUrl, setScrapeUrl] = useState('');
   const [isScraping, setIsScraping] = useState(false);
@@ -678,7 +701,7 @@ export default function ChatView({
                       {msg.attachments && msg.attachments.length > 0 && (
                         <div className="flex flex-col gap-2 items-end">
                           {msg.attachments.map(a => (
-                            <AttachmentChip key={a.document_id} attachment={a} status={docStatuses[a.document_id]} />
+                            <AttachmentChip key={a.document_id} attachment={a} status={docStatuses[a.document_id]} onPreview={() => setPreviewAttachment(a)} />
                           ))}
                         </div>
                       )}
@@ -830,7 +853,9 @@ export default function ChatView({
             {pendingAttachments.map(a => (
               <div
                 key={a.document_id}
-                className="flex items-center gap-2 bg-aegis-raised border border-aegis-border rounded-xl pl-3 pr-2 py-2"
+                onClick={() => setPreviewAttachment(a)}
+                title={`Preview ${a.filename}`}
+                className="flex items-center gap-2 bg-aegis-raised border border-aegis-border rounded-xl pl-3 pr-2 py-2 cursor-pointer hover:border-aegis-primary-light transition-colors"
               >
                 <FileText className="w-3.5 h-3.5 text-aegis-primary-light flex-shrink-0" />
                 <span className="text-[12px] text-aegis-text-primary truncate max-w-[160px]">{a.filename}</span>
@@ -842,7 +867,7 @@ export default function ChatView({
                   <Loader2 className="w-3.5 h-3.5 text-aegis-text-muted animate-spin flex-shrink-0" />
                 )}
                 <button
-                  onClick={() => setPendingAttachments(prev => prev.filter(p => p.document_id !== a.document_id))}
+                  onClick={(e) => { e.stopPropagation(); setPendingAttachments(prev => prev.filter(p => p.document_id !== a.document_id)); }}
                   className="text-aegis-text-muted hover:text-aegis-error p-0.5"
                   title="Remove attachment"
                 >
@@ -912,7 +937,7 @@ export default function ChatView({
                 ref={fileInputRef}
                 onChange={handleFileUpload}
                 className="hidden"
-                accept=".txt,.md,.csv,.pdf,.ppt,.pptx,.docx,.xlsx,.png,.jpg,.jpeg,.mp3,.wav,.m4a,.ogg,.flac,.aac,.wma,.mp4,.mov,.mkv,.webm,.avi"
+                accept=".txt,.md,.csv,.pdf,.ppt,.pptx,.docx,.xlsx,.png,.jpg,.jpeg"
               />
               <button
                 onClick={() => setAttachMenuOpen(v => !v)}
@@ -932,31 +957,42 @@ export default function ChatView({
                       className="w-full flex items-center gap-2.5 px-3.5 py-2 text-[13px] text-aegis-text-primary hover:bg-aegis-overlay transition-colors"
                     >
                       <Paperclip className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
-                      <span className="whitespace-nowrap">Upload Document / Audio / Video</span>
+                      <span className="whitespace-nowrap">Upload Document</span>
                     </button>
 
-                    {/* Export — Chat Mode only (Agent Mode has no export
-                        tool; see backend chat.py's _get_local_tools
-                        docstring). Picking a format here up front skips the
-                        agent having to guess export intent from free text —
-                        it's attached to the next message like a pending
-                        attachment and applies automatically once sent. */}
+                    {/* Export — Chat Mode only. One "Export" row expands to
+                        the PDF/DOCX/XLSX choices rather than showing all
+                        three as separate top-level rows. Picking a format
+                        skips the agent having to guess export intent from
+                        free text — it's attached to the next message like a
+                        pending attachment and applies automatically once
+                        sent (backend's deterministic _classify_export_intent
+                        path, chat.py). Agent Mode does have a backend
+                        export_file tool (writes a generated PDF/DOCX/XLSX
+                        straight to a path on disk), but no menu entry point
+                        here yet — its planner picks the tool up from plain
+                        free-text instructions instead (e.g. "export this as
+                        a PDF to Documents/report.pdf"). */}
                     {chatMode === 'chat' && (
-                      <>
-                        <div className="mt-1 pt-1.5 border-t border-aegis-border px-3.5 pb-1 text-[11px] font-semibold text-aegis-text-muted uppercase tracking-wide">
-                          Export
-                        </div>
-                        {(['pdf', 'docx', 'xlsx'] as const).map(fmt => (
+                      <div className="mt-1 pt-1.5 border-t border-aegis-border">
+                        <button
+                          onClick={() => setExportSubmenuOpen(v => !v)}
+                          className="w-full flex items-center gap-2.5 px-3.5 py-2 text-[13px] text-aegis-text-primary hover:bg-aegis-overlay transition-colors"
+                        >
+                          <Download className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
+                          <span className="flex-1 text-left whitespace-nowrap">Export</span>
+                          <ChevronDown className={`w-3.5 h-3.5 text-aegis-text-muted flex-shrink-0 transition-transform ${exportSubmenuOpen ? 'rotate-180' : ''}`} />
+                        </button>
+                        {exportSubmenuOpen && (['pdf', 'docx', 'xlsx'] as const).map(fmt => (
                           <button
                             key={fmt}
                             onClick={() => { setAttachMenuOpen(false); setPendingExportFormat(fmt); }}
-                            className="w-full flex items-center gap-2.5 px-3.5 py-2 text-[13px] text-aegis-text-primary hover:bg-aegis-overlay transition-colors"
+                            className="w-full flex items-center gap-2.5 pl-9 pr-3.5 py-2 text-[13px] text-aegis-text-primary hover:bg-aegis-overlay transition-colors"
                           >
-                            <Download className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
-                            <span className="whitespace-nowrap">Export answer as {fmt.toUpperCase()}</span>
+                            <span className="whitespace-nowrap">{fmt.toUpperCase()}</span>
                           </button>
                         ))}
-                      </>
+                      </div>
                     )}
 
                     {/* Tools — installed once via the Marketplace, switched
@@ -1182,6 +1218,15 @@ export default function ChatView({
           Press <span className="font-semibold text-aegis-text-secondary">Enter</span> to send • Aegis can generate errors. Verify important information.
         </p>
       </div>
+
+      {previewAttachment && (
+        <DocumentPreviewModal
+          documentId={previewAttachment.document_id}
+          filename={previewAttachment.filename}
+          fileType={previewAttachment.file_type}
+          onClose={() => setPreviewAttachment(null)}
+        />
+      )}
     </div>
   );
 }

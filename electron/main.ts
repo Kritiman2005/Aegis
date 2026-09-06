@@ -317,7 +317,15 @@ function configureCSP(): void {
             "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
             "font-src 'self' https://fonts.gstatic.com",
             "connect-src 'self' ws://localhost:8000 http://localhost:8000 ws://127.0.0.1:8000 http://127.0.0.1:8000",
-            "img-src 'self' data: blob:",
+            // Document preview (DocumentPreviewModal) renders an uploaded
+            // file straight from the backend: images via <img>, PDFs via
+            // <iframe>. img-src needs the backend origin for the former;
+            // frame-src needs it for the latter — with no frame-src set at
+            // all, it falls back to default-src 'self' and silently blocks
+            // the iframe (no CSP violation visibly surfaced, it just never
+            // loads), so this is spelled out explicitly rather than omitted.
+            "img-src 'self' data: blob: http://localhost:8000 http://127.0.0.1:8000",
+            "frame-src 'self' http://localhost:8000 http://127.0.0.1:8000",
           ].join('; '),
         ],
       },

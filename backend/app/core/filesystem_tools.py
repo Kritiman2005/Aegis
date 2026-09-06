@@ -39,8 +39,10 @@ with how the rest of this app treats "sandboxing" (e.g. the scraper's
 public-pages-only rule is enforced in Python, not by an OS jail either).
 """
 
+import base64
 import fnmatch
 import os
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -282,8 +284,9 @@ def list_folder(path: Optional[str] = None) -> Dict[str, Any]:
 def read_file_text(path: str) -> Dict[str, Any]:
     """
     Extracts a file's text content via the same app.core.rag.processor
-    pipeline used for chat uploads (PDF/DOCX/XLSX/PPTX/CSV/plain-text/
-    images-via-OCR/audio-video-via-transcription) — the caller is
+    pipeline used for chat uploads (PDF/DOCX/XLSX/PPTX/CSV/plain-text —
+    images and audio/video are not extractable here; images go through
+    vision instead, audio/video isn't supported at all) — the caller is
     responsible for chunking/pagination (see ChatAgent._chunk_text); this
     just returns the full extracted text plus basic file metadata.
     """
@@ -324,42 +327,167 @@ def read_file_text(path: str) -> Dict[str, Any]:
     }
 
 
-def write_file(path: str, content: str, overwrite: bool = False) -> Dict[str, Any]:
+def write_file(path: str, content: str, overwrite: bool = False, encoding: str = "text") -> Dict[str, Any]:
     """
-    Writes plain-text content to a path in the sandbox. Fails closed: an
-    existing file is never clobbered unless overwrite=True is explicit.
-    Parent directories are created as needed (but still inside the sandbox
-    — resolve_in_sandbox already rejected anything outside it).
+    Writes content to a path in the sandbox — plain UTF-8 text by default,
+    or raw bytes when encoding="base64" (content is then a base64 string,
+    e.g. a PDF/DOCX the model generated via app.core.exporter, or bytes read
+    from elsewhere). Fails closed: an existing file is never clobbered
+    unless overwrite=True is explicit. Parent directories are created as
+    needed (but still inside the sandbox — resolve_in_sandbox already
+    rejected anything outside it).
     """
     if content is None:
         return {"success": False, "error": "No content was given to write."}
+    if encoding not in ("text", "base64"):
+        return {"success": False, "error": f"Unsupported encoding '{encoding}' — use 'text' or 'base64'."}
 
     try:
         resolved = resolve_in_sandbox(path)
     except SandboxError as e:
         return {"success": False, "error": str(e)}
+    if resolved.exists() and resolved.is_dir():
+        return {"success": False, "error": f"'{path}' is a directory, not a file."}
     if resolved.exists() and not overwrite:
         return {
             "success": False,
             "error": f"'{path}' already exists — pass overwrite=true if you really want to replace it.",
         }
-    if resolved.exists() and resolved.is_dir():
-        return {"success": False, "error": f"'{path}' is a directory, not a file."}
     if _is_denied_file(resolved.name):
         return {"success": False, "error": f"'{path}' looks like a credential/secret filename — refusing to write it."}
 
+    if encoding == "base64":
+        try:
+            data = base64.b64decode(content, validate=True)
+        except (base64.binascii.Error, ValueError) as e:
+            return {"success": False, "error": f"Content is not valid base64: {e}"}
+    else:
+        data = content.encode("utf-8")
+
+    was_overwrite = resolved.exists()
     try:
         resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_text(content, encoding="utf-8")
+        resolved.write_bytes(data)
     except OSError as e:
         return {"success": False, "error": f"Could not write '{path}': {e}"}
 
     return {
         "success": True,
         "path": str(resolved),
-        "bytes_written": len(content.encode("utf-8")),
-        "overwritten": resolved.exists() and overwrite,
+        "bytes_written": len(data),
+        "overwritten": was_overwrite,
     }
+
+
+def copy_file(src: str, dst: str, overwrite: bool = False) -> Dict[str, Any]:
+    """
+    Copies a single file from src to dst, both resolved in the sandbox.
+    Fails closed on an existing dst unless overwrite=True. dst's parent
+    directories are created as needed. Directories are not supported (single
+    files only, matching read_file/write_file's own scope) — use it to place
+    an existing file (e.g. one just dropped in Downloads) somewhere else.
+    """
+    try:
+        resolved_src = resolve_in_sandbox(src)
+        resolved_dst = resolve_in_sandbox(dst)
+    except SandboxError as e:
+        return {"success": False, "error": str(e)}
+
+    if not resolved_src.exists():
+        return {"success": False, "error": f"'{src}' does not exist."}
+    if resolved_src.is_dir():
+        return {"success": False, "error": f"'{src}' is a directory — only single files are supported."}
+    if _is_denied_file(resolved_src.name):
+        return {"success": False, "error": f"'{src}' looks like a credential/secret file — refusing to copy it."}
+    if resolved_dst.exists() and resolved_dst.is_dir():
+        return {"success": False, "error": f"'{dst}' is a directory, not a file."}
+    if resolved_dst.exists() and not overwrite:
+        return {"success": False, "error": f"'{dst}' already exists — pass overwrite=true if you really want to replace it."}
+    if _is_denied_file(resolved_dst.name):
+        return {"success": False, "error": f"'{dst}' looks like a credential/secret filename — refusing to write it."}
+
+    was_overwrite = resolved_dst.exists()
+    try:
+        resolved_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(resolved_src, resolved_dst)
+    except OSError as e:
+        return {"success": False, "error": f"Could not copy '{src}' to '{dst}': {e}"}
+
+    return {
+        "success": True,
+        "src": str(resolved_src),
+        "dst": str(resolved_dst),
+        "bytes_copied": resolved_dst.stat().st_size,
+        "overwritten": was_overwrite,
+    }
+
+
+def move_file(src: str, dst: str, overwrite: bool = False) -> Dict[str, Any]:
+    """
+    Moves (renames) a single file from src to dst, both resolved in the
+    sandbox. Same fail-closed overwrite behavior and single-file scope as
+    copy_file. Use for "move this to that folder" / "rename this file".
+    """
+    try:
+        resolved_src = resolve_in_sandbox(src)
+        resolved_dst = resolve_in_sandbox(dst)
+    except SandboxError as e:
+        return {"success": False, "error": str(e)}
+
+    if not resolved_src.exists():
+        return {"success": False, "error": f"'{src}' does not exist."}
+    if resolved_src.is_dir():
+        return {"success": False, "error": f"'{src}' is a directory — only single files are supported."}
+    if _is_denied_file(resolved_src.name):
+        return {"success": False, "error": f"'{src}' looks like a credential/secret file — refusing to move it."}
+    if resolved_dst.exists() and resolved_dst.is_dir():
+        return {"success": False, "error": f"'{dst}' is a directory, not a file."}
+    if resolved_dst.exists() and not overwrite:
+        return {"success": False, "error": f"'{dst}' already exists — pass overwrite=true if you really want to replace it."}
+    if _is_denied_file(resolved_dst.name):
+        return {"success": False, "error": f"'{dst}' looks like a credential/secret filename — refusing to write it."}
+
+    was_overwrite = resolved_dst.exists()
+    try:
+        resolved_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(resolved_src), str(resolved_dst))
+    except OSError as e:
+        return {"success": False, "error": f"Could not move '{src}' to '{dst}': {e}"}
+
+    return {
+        "success": True,
+        "src": str(resolved_src),
+        "dst": str(resolved_dst),
+        "overwritten": was_overwrite,
+    }
+
+
+def delete_file(path: str) -> Dict[str, Any]:
+    """
+    Permanently deletes a single file in the sandbox — no trash/recycle
+    bin, no undo. Directories are refused (single files only, matching
+    every other tool here). Relies entirely on Agent Mode's own
+    plan-confirmation step for safety, same as write_file's overwrite — this
+    function itself doesn't ask twice.
+    """
+    try:
+        resolved = resolve_in_sandbox(path)
+    except SandboxError as e:
+        return {"success": False, "error": str(e)}
+
+    if not resolved.exists():
+        return {"success": False, "error": f"'{path}' does not exist."}
+    if resolved.is_dir():
+        return {"success": False, "error": f"'{path}' is a directory — only single files are supported."}
+    if _is_denied_file(resolved.name):
+        return {"success": False, "error": f"'{path}' looks like a credential/secret file — refusing to delete it."}
+
+    try:
+        resolved.unlink()
+    except OSError as e:
+        return {"success": False, "error": f"Could not delete '{path}': {e}"}
+
+    return {"success": True, "path": str(resolved)}
 
 
 def _parse_date(value: Optional[str]) -> Optional[float]:

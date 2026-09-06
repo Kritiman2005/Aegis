@@ -10,8 +10,8 @@ import fitz  # PyMuPDF
 from pptx import Presentation
 
 # ── ALL heavy ML libraries are lazy-imported inside functions ─────────────────
-# qdrant_client, fastembed, sentence_transformers, and easyocr all pull in
-# PyTorch (~2 GB of DLLs) when imported. Importing them at module level causes
+# qdrant_client, fastembed, and sentence_transformers all pull in PyTorch
+# (~2 GB of DLLs) when imported. Importing them at module level causes
 # the PyInstaller binary to crash immediately on Windows before /api/health
 # can respond. They are imported inside the getter functions below, so the
 # server starts in <1 second and the libraries load on first actual use.
@@ -35,7 +35,6 @@ _qdrant_client = None
 _dense_model    = None
 _sparse_model   = None
 _reranker       = None
-_ocr_reader     = None
 
 # Qdrant's embedded/local mode persists to a plain sqlite3 connection created
 # once, in init_qdrant(), on whichever thread calls it first (FastAPI startup —
@@ -126,39 +125,35 @@ def get_reranker():
     return _reranker
 
 
-def get_ocr_reader():
-    global _ocr_reader
-    if _ocr_reader is None:
-        with _model_init_lock:
-            if _ocr_reader is None:
-                import easyocr  # lazy import — pulls torch
-                logger.info("Initializing EasyOCR reader (this might take a moment)...")
-                _ocr_reader = easyocr.Reader(['en'], gpu=False)
-    return _ocr_reader
-
-
 # ─── Text Extraction ──────────────────────────────────────────────────────────
-
-# Handled by app.core.transcription (bundled faster-whisper — see that
-# module's docstring for why it ships in the app itself rather than being a
-# marketplace download like everything else here). av/ffmpeg decodes the
-# audio track directly out of any of these containers, video included, so
-# no separate demuxing step is needed before handing the path to whisper.
-_AUDIO_VIDEO_EXTENSIONS = {
-    "mp3", "wav", "m4a", "ogg", "flac", "aac", "wma",
-    "mp4", "mov", "mkv", "webm", "avi",
-}
-
 
 def extract_text(file_path: str, file_type: str) -> str:
     ext = file_type.lower()
     try:
         if ext == 'pdf':
             doc = fitz.open(file_path)
-            text_content = ""
-            for page in doc:
-                text_content += page.get_text() + "\n"
-            return text_content
+            try:
+                # needs_pass (not is_encrypted) is the one that actually
+                # blocks get_text() below — a PDF can be "encrypted" with
+                # only owner-password restrictions and still open/extract
+                # fine, in which case needs_pass is 0 despite is_encrypted
+                # being true. Checking this explicitly turns what would
+                # otherwise be silent empty/garbage text (or a cryptic
+                # PyMuPDF error deep in the page loop) into one clear,
+                # actionable failure.
+                if doc.needs_pass:
+                    raise ValueError(
+                        "This PDF is password-protected — remove the password and re-upload."
+                    )
+                text_content = ""
+                for page in doc:
+                    text_content += page.get_text() + "\n"
+                return text_content
+            finally:
+                # fitz.Document holds the file open for lazy per-page
+                # access; never closing it leaks a file descriptor per
+                # upload for the life of this long-running backend process.
+                doc.close()
 
         elif ext in ['ppt', 'pptx']:
             prs = Presentation(file_path)
@@ -203,15 +198,11 @@ def extract_text(file_path: str, file_type: str) -> str:
             return "\n".join(parts)
 
         elif ext in ['png', 'jpg', 'jpeg']:
-            reader = get_ocr_reader()
-            results = reader.readtext(file_path)
-            return " ".join([res[1] for res in results])
-
-        elif ext in _AUDIO_VIDEO_EXTENSIONS:
-            from app.core.transcription import transcribe, is_installed
-            if not is_installed():
-                raise ValueError("Voice model unavailable in this build — can't transcribe audio/video.")
-            return transcribe(file_path)
+            # Images never reach extract_text at all — documents.py routes
+            # them to vision (if a vision model is active) or rejects the
+            # upload outright (if not) before ingestion ever starts. OCR is
+            # no longer used as a fallback for image content.
+            raise ValueError("Image ingestion is not supported — images are handled via vision, not RAG.")
 
         else:
             logger.warning(f"Unsupported file type for extraction: {ext}")
@@ -236,10 +227,28 @@ def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> List[str]
 
 # ─── Ingestion ────────────────────────────────────────────────────────────────
 
+# Nothing bounded how much text a single document could hand to chunk_text —
+# a genuinely huge PDF/DOCX (a full textbook, a scanned archive) could
+# generate thousands of chunks with no limit, each needing its own embedding
+# pass. Slow on CPU-only hardware, and it's what could make an otherwise-
+# legitimate large document collide with documents.py's own
+# _INGEST_TIMEOUT_SECONDS and get killed as if ingestion were hung rather
+# than just processing a lot of real content. ~2M chars (~350k words) caps
+# chunking at roughly 1400 chunks — generous for a real document, bounded
+# enough to keep embedding time sane.
+_MAX_EXTRACTED_CHARS = 2_000_000
+
+
 def ingest_document(document_id: int, file_path: str, file_type: str, filename: str):
     logger.info(f"Ingesting document {document_id}: {filename}")
-    
+
     raw_text = extract_text(file_path, file_type)
+    if len(raw_text) > _MAX_EXTRACTED_CHARS:
+        logger.warning(
+            f"Document {document_id} ({filename}) extracted to {len(raw_text):,} chars — "
+            f"truncating to {_MAX_EXTRACTED_CHARS:,}."
+        )
+        raw_text = raw_text[:_MAX_EXTRACTED_CHARS]
     if not raw_text.strip():
         # Raise rather than return — the caller (process_upload_task) marks the
         # document "ready" on a normal return, which previously made empty-text
