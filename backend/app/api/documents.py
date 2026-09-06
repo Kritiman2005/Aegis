@@ -183,6 +183,12 @@ async def upload_document(
 
     if skip_ocr:
         doc.status = "ready"
+        # Flags this row as having NO searchable content at all — see
+        # ChatAgent._get_document_context (chat.py), which checks this at
+        # send time to catch the case where the active model has changed
+        # (or lost its vision pairing) since this upload, so the image's
+        # content isn't silently dropped with zero explanation.
+        doc.ocr_skipped_for_vision = True
         db.commit()
         logger.info(f"Skipping OCR for image upload '{file.filename}' — vision model active, will be sent as real image input instead.")
     else:

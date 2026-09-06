@@ -139,6 +139,18 @@ export default function ChatView({
   // the composer — Claude-style: attach, optionally type text, then send.
   const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>([]);
 
+  // ChatView is a single long-lived instance (page.tsx keeps it mounted
+  // across tabs), so nothing else ever resets this on its own. Without this,
+  // attaching a file in conversation A and switching to B before sending
+  // leaves A's chip and status sitting in B's composer — sending there
+  // attaches A's document_id to a B message, for a document
+  // /api/documents?conversation_id=B will never return, so its chip is then
+  // stuck exactly like the missing-dependency bug above.
+  useEffect(() => {
+    setPendingAttachments([]);
+    setDocStatuses({});
+  }, [sessionId]);
+
   useEffect(() => {
     const pendingIds = messages
       .flatMap(m => m.attachments || [])
@@ -171,8 +183,17 @@ export default function ChatView({
     poll();
     interval = setInterval(poll, 2000);
     return () => { cancelled = true; if (interval) clearInterval(interval); };
+    // pendingAttachments is read above (concat'd into pendingIds) and MUST be
+    // a real dependency: attaching a file only calls setPendingAttachments,
+    // never touching messages/sessionId, so without this the effect never
+    // re-runs for it — docStatuses[document_id] stays undefined forever,
+    // which both AttachmentChip and hasProcessingAttachment treat the same
+    // as "still processing", permanently disabling Send for a chip that may
+    // have finished ingesting seconds ago. eslint-disable stays only for
+    // docStatuses (read but deliberately not a dep — it's this same effect's
+    // own state, re-adding it would just restart polling on every tick).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [messages, sessionId]);
+  }, [messages, sessionId, pendingAttachments]);
 
   // Claude-style plain-text "Thinking…" / "Thought for Xs" — no icons, no
   // dots, just an elapsed-seconds counter that ticks while waiting for the

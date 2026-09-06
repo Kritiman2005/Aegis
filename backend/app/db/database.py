@@ -53,6 +53,11 @@ def init_db():
             conn.execute(text("ALTER TABLE chat_messages ADD COLUMN msg_type TEXT"))
             conn.commit()
 
+        existing_doc_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(user_documents)"))}
+        if "ocr_skipped_for_vision" not in existing_doc_cols:
+            conn.execute(text("ALTER TABLE user_documents ADD COLUMN ocr_skipped_for_vision BOOLEAN DEFAULT 0"))
+            conn.commit()
+
         # Vision support (see ModelRegistry's own comment): an existing
         # install's models table predates these columns entirely.
         existing_model_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(models)"))}

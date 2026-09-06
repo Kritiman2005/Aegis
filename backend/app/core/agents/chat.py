@@ -1521,6 +1521,38 @@ Output valid JSON only. Example: {{"is_export": true, "format": "docx", "parts":
                     "again in a moment. Do NOT claim you have no way to access uploaded files."
                 )
 
+        # An image whose OCR was skipped at upload time (see documents.py's
+        # skip_ocr) has NO searchable content in Qdrant at all — it was only
+        # ever going to be readable via _attach_vision_images sending it as
+        # real image input. If the active model has since changed (or its
+        # mmproj is no longer paired) by the time this turn actually sends,
+        # that image now has no representation whatsoever — surface that
+        # explicitly rather than silently answering as if nothing were
+        # attached, which is indistinguishable from the model just not
+        # noticing the attachment.
+        vision_gap_note = ""
+        if attached_ids and not self.get_active_vision_mmproj_path():
+            from app.db.models import UserDocument
+            _db = SessionLocal()
+            try:
+                stranded = _db.query(UserDocument).filter(
+                    UserDocument.id.in_(attached_ids),
+                    UserDocument.ocr_skipped_for_vision == True,
+                ).all()
+            finally:
+                _db.close()
+            if stranded:
+                names = ", ".join(d.filename for d in stranded)
+                vision_gap_note = (
+                    f"[SYSTEM NOTE]: {names} was uploaded while a vision-capable model was "
+                    "active, so its content was never OCR'd or indexed — it was only ever "
+                    "readable by a vision model looking at it directly. The currently active "
+                    "model is no longer vision-capable, so this image's content is NOT "
+                    "available right now. Tell the user to switch back to a vision-capable "
+                    "model (LLM panel) and re-send to have it read, rather than answering as "
+                    "if the image isn't there.\n\n"
+                )
+
         if status_callback:
             await status_callback("Searching your documents...")
 
@@ -1541,10 +1573,10 @@ Output valid JSON only. Example: {{"is_export": true, "format": "docx", "parts":
 
         if not relevant_chunks:
             logger.info(f"RAG retrieved 0 chunks for query: {message}")
-            return ""
+            return vision_gap_note
 
         logger.info(f"RAG retrieved {len(relevant_chunks)} chunks for query: {message}")
-        document_context = "Relevant excerpts from your uploaded documents:\n\n"
+        document_context = vision_gap_note + "Relevant excerpts from your uploaded documents:\n\n"
         for chunk in relevant_chunks:
             document_context += f"--- Source: {chunk.get('filename')} ---\n{chunk.get('content')}\n\n"
         return document_context

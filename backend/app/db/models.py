@@ -113,6 +113,13 @@ class UserDocument(Base):
     status = Column(String, default="processing") # processing, ready, failed
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # True when upload-time OCR was skipped because a vision model was
+    # active then (see api/documents.py's skip_ocr) — lets
+    # ChatAgent._get_document_context (chat.py) notice, at send time, that
+    # this image has NO searchable content at all if the active model is no
+    # longer vision-capable by the time the message is actually sent, rather
+    # than silently answering as if the image were never attached.
+    ocr_skipped_for_vision = Column(Boolean, default=False)
     
 class ScheduledJob(Base):
     """
