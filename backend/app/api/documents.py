@@ -2,6 +2,7 @@ from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, B
 from typing import List, Dict, Any, Optional
 import os
 import shutil
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -12,6 +13,17 @@ from app.core.connection_manager import manager as ws_manager
 import anyio
 
 router = APIRouter(prefix="/api/documents", tags=["Documents"])
+
+# A document's very first ingestion can legitimately need to download the
+# embedding/reranker models (a few hundred MB total) if they weren't already
+# warmed by main.py's startup preload — slow but survivable on a slow
+# connection. What must NOT happen is an unbounded hang: on a network that
+# silently drops packets instead of refusing them (common behind restrictive
+# firewalls/proxies), a streamed HTTP download can stall indefinitely past
+# any of huggingface_hub's own per-request timeouts, leaving a document
+# stuck in "processing" forever with zero explanation. This ceiling
+# guarantees ingestion always reaches ready/failed within a bounded time.
+_INGEST_TIMEOUT_SECONDS = 180
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
 _data_dir = os.environ.get("AEGIS_DATA_DIR")
@@ -37,8 +49,46 @@ def process_upload_task(doc_id: int, file_path: str, file_type: str, filename: s
 
     logger.info(f"Starting RAG processing for document: {filename} (ID: {doc_id})")
     try:
-        # Call RAG processor
-        ingest_document(doc_id, file_path, file_type, filename)
+        # Run ingestion on a separate worker with a hard ceiling — a bad
+        # network (see _INGEST_TIMEOUT_SECONDS' comment above) can make the
+        # underlying HTTP download stall well past this call ever
+        # returning, and a plain synchronous call here would have no way
+        # to give up. Deliberately a raw daemon Thread, NOT
+        # concurrent.futures.ThreadPoolExecutor: that class registers every
+        # worker with an atexit hook that JOINS it (waits, unbounded) before
+        # the interpreter is allowed to exit — confirmed against a real
+        # stuck call, where it made the whole backend process un-killable
+        # on normal shutdown even though this function itself returned
+        # correctly. A daemon thread carries no such hook — a stuck one is
+        # abandoned cleanly at process exit instead of blocking it. This
+        # can't forcibly kill the stuck thread while the process stays
+        # alive (not possible in Python), but it guarantees THIS document
+        # always reaches ready/failed within the ceiling, which is what the
+        # UI actually reads.
+        result: Dict[str, Any] = {}
+
+        def _run():
+            try:
+                ingest_document(doc_id, file_path, file_type, filename)
+                result["ok"] = True
+            except Exception as e:
+                result["ok"] = False
+                result["error"] = e
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        worker.join(timeout=_INGEST_TIMEOUT_SECONDS)
+
+        if worker.is_alive():
+            raise TimeoutError(
+                f"Processing took longer than {_INGEST_TIMEOUT_SECONDS}s — this usually means "
+                "the local search models couldn't finish downloading (check your internet "
+                "connection, or a restrictive network may be blocking the download). Try again "
+                "once you have a stable connection."
+            )
+        if not result.get("ok"):
+            raise result["error"]
+
         doc.status = "ready"
         db.commit()
         logger.info(f"Successfully processed and embedded document: {filename}")

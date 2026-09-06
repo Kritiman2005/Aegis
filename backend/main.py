@@ -18,6 +18,19 @@ if not getattr(sys, 'frozen', False):
     root_dir = Path(__file__).resolve().parent.parent
     load_dotenv(dotenv_path=root_dir / ".env")
 
+# huggingface_hub reads these once, at import time, so they must be set
+# before anything (fastembed, sentence_transformers, transformers) first
+# imports it — which happens lazily, well after this point, inside
+# app/core/rag/processor.py's model getters. Pinned explicitly rather than
+# left to the library's own default: this is what bounds each individual
+# request huggingface_hub makes while downloading the embedding/reranker
+# models on first use, so a network that silently drops packets (instead
+# of refusing the connection) can't stall a download indefinitely — see
+# app/api/documents.py's _INGEST_TIMEOUT_SECONDS for the outer ceiling this
+# composes with.
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "10")
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "10")
+
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
