@@ -820,6 +820,10 @@ export default function ChatView({
                 if (chatMode === 'chat') onSendMessage('__system_mode_switch__', 'system');
                 setChatMode('agent');
                 setPendingExportFormat(null);
+                // Documents are Chat Mode only now — an attachment left
+                // pending from before the switch would otherwise sit in
+                // the composer and go nowhere once sent in Agent Mode.
+                setPendingAttachments([]);
               }}
               className={`relative z-10 flex-1 py-1.5 rounded-md text-xs font-semibold transition-colors ${
                 chatMode === 'agent' ? 'text-aegis-primary-light' : 'text-aegis-text-secondary'
@@ -952,13 +956,21 @@ export default function ChatView({
                 <>
                   <div className="fixed inset-0 z-10" onClick={() => setAttachMenuOpen(false)} />
                   <div className="absolute bottom-full left-0 mb-2 w-72 max-h-[26rem] overflow-y-auto bg-aegis-raised border border-aegis-border rounded-xl shadow-lg py-1.5 z-20">
-                    <button
-                      onClick={() => { setAttachMenuOpen(false); fileInputRef.current?.click(); }}
-                      className="w-full flex items-center gap-2.5 px-3.5 py-2 text-[13px] text-aegis-text-primary hover:bg-aegis-overlay transition-colors"
-                    >
-                      <Paperclip className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
-                      <span className="whitespace-nowrap">Upload Document</span>
-                    </button>
+                    {/* Chat Mode only — documents/attachments are no longer
+                        handled in Agent Mode at all (backend's _handle_idle
+                        agent branch now nudges to Chat Mode if a message
+                        somehow arrives with one attached, rather than
+                        silently ignoring it). Hidden here so Agent Mode
+                        never offers an upload path that leads nowhere. */}
+                    {chatMode === 'chat' && (
+                      <button
+                        onClick={() => { setAttachMenuOpen(false); fileInputRef.current?.click(); }}
+                        className="w-full flex items-center gap-2.5 px-3.5 py-2 text-[13px] text-aegis-text-primary hover:bg-aegis-overlay transition-colors"
+                      >
+                        <Paperclip className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
+                        <span className="whitespace-nowrap">Upload Document</span>
+                      </button>
+                    )}
 
                     {/* Export — Chat Mode only. One "Export" row expands to
                         the PDF/DOCX/XLSX choices rather than showing all

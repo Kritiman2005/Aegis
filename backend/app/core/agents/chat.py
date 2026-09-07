@@ -57,6 +57,34 @@ def get_llm_manager():
     return _llm_manager
 
 
+def _build_document_search_grammar():
+    """
+    Same grammar-constrained-JSON pattern as planner.py's
+    _build_plan_grammar, sized for _decide_document_search's much smaller
+    decision schema. Returns None (caller falls back to response_format
+    json_object) if llama_cpp isn't importable or compilation fails.
+    """
+    try:
+        from llama_cpp import LlamaGrammar
+    except ImportError:
+        return None
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "needs_search": {"type": "boolean"},
+            "whole_document": {"type": "boolean"},
+            "query": {"type": "string"},
+        },
+        "required": ["needs_search", "whole_document", "query"],
+    }
+    try:
+        return LlamaGrammar.from_json_schema(json.dumps(schema))
+    except Exception as e:
+        logger.warning(f"[ChatAgent] Document-search grammar compile failed, falling back to json_object mode: {e}")
+        return None
+
+
 # Detects a chat answer (_call_llm_text) that's degenerated into a bare JSON
 # object/array instead of prose — verified live against this app's own
 # bundled model: a grammar constraining just the first character wasn't
@@ -292,6 +320,17 @@ class ChatAgent(BaseAgent):
               REQUIRED args: arg1 (type) — description | arg2 (type) — description
               OPTIONAL args: arg3 (type) — description
               USE WHEN: <natural-language trigger hint derived from the tool name>
+              EXAMPLES:
+                "<a realistic user phrasing>" -> arguments: {"arg1": "..."}
+
+        EXAMPLES is opt-in per tool (only local tools carry one so far — see
+        _get_filesystem_tool_defs) rather than derived automatically: a
+        schema alone tells a small local model WHAT the arguments are, not
+        HOW a real user phrasing maps to concrete values for THIS specific
+        tool, which is exactly the gap a couple of real prompt->arguments
+        pairs closes. Same technique AnythingLLM's aibitat tool plugins use
+        (each tool ships its own few-shot `examples` array) — verified
+        directly against their rag-memory tool definition.
         """
         name = t.get("name", "")
         description = t.get("description", "").strip()
@@ -320,6 +359,14 @@ class ChatAgent(BaseAgent):
         use_when = cls._derive_use_when(name)
         if use_when:
             lines.append(f"  USE WHEN: {use_when}")
+
+        examples = t.get("examples") or []
+        if examples:
+            lines.append("  EXAMPLES:")
+            for ex in examples:
+                prompt = ex.get("prompt", "")
+                args_json = json.dumps(ex.get("arguments", {}))
+                lines.append(f'    "{prompt}" -> arguments: {args_json}')
 
         return "\n".join(lines)
 
@@ -389,6 +436,10 @@ class ChatAgent(BaseAgent):
                     },
                     "required": ["query"],
                 },
+                "examples": [
+                    {"prompt": "find my resume", "arguments": {"query": "resume"}},
+                    {"prompt": "look for PDFs in Downloads from this year", "arguments": {"query": "", "root": "Downloads", "extension": "pdf", "modified_after": "2026-01-01"}},
+                ],
             },
             {
                 "name": "list_folder",
@@ -405,6 +456,9 @@ class ChatAgent(BaseAgent):
                         "path": {"type": "string", "description": "Folder path, relative to the home directory (e.g. 'Downloads') or absolute. Omit to list the home directory itself."},
                     },
                 },
+                "examples": [
+                    {"prompt": "what's in my Downloads folder?", "arguments": {"path": "Downloads"}},
+                ],
             },
             {
                 "name": "read_file",
@@ -430,6 +484,9 @@ class ChatAgent(BaseAgent):
                     },
                     "required": ["path"],
                 },
+                "examples": [
+                    {"prompt": "read report.pdf on my desktop", "arguments": {"path": "Desktop/report.pdf"}},
+                ],
             },
             {
                 "name": "write_file",
@@ -454,6 +511,9 @@ class ChatAgent(BaseAgent):
                     },
                     "required": ["path", "content"],
                 },
+                "examples": [
+                    {"prompt": "save this summary to notes.txt in Documents", "arguments": {"path": "Documents/notes.txt", "content": "<the summary text>"}},
+                ],
             },
             {
                 "name": "copy_file",
@@ -474,6 +534,9 @@ class ChatAgent(BaseAgent):
                     },
                     "required": ["src", "dst"],
                 },
+                "examples": [
+                    {"prompt": "copy report.pdf from Downloads to Documents", "arguments": {"src": "Downloads/report.pdf", "dst": "Documents/report.pdf"}},
+                ],
             },
             {
                 "name": "move_file",
@@ -494,6 +557,9 @@ class ChatAgent(BaseAgent):
                     },
                     "required": ["src", "dst"],
                 },
+                "examples": [
+                    {"prompt": "move budget.xlsx to the Archive folder", "arguments": {"src": "budget.xlsx", "dst": "Archive/budget.xlsx"}},
+                ],
             },
             {
                 "name": "delete_file",
@@ -511,6 +577,9 @@ class ChatAgent(BaseAgent):
                     },
                     "required": ["path"],
                 },
+                "examples": [
+                    {"prompt": "delete old_notes.txt", "arguments": {"path": "old_notes.txt"}},
+                ],
             },
             {
                 "name": "export_file",
@@ -537,6 +606,9 @@ class ChatAgent(BaseAgent):
                     },
                     "required": ["content", "format", "path"],
                 },
+                "examples": [
+                    {"prompt": "export this summary as a PDF to Documents/summary.pdf", "arguments": {"content": "<the summary content, in markdown>", "format": "pdf", "path": "Documents/summary.pdf"}},
+                ],
             },
         ]
 
@@ -1182,6 +1254,79 @@ class ChatAgent(BaseAgent):
         re.IGNORECASE,
     )
 
+    # "What is this", "describe/summarize the PDF", "what's in this file" —
+    # requests about the document AS A WHOLE, not a specific fact in it.
+    # These have essentially no content of their own to embed, so semantic/
+    # keyword retrieval has nothing real to match against — empirically
+    # verified these score in the same -8 to -11 rerank range as a
+    # genuinely off-topic query (see hybrid_search's _MIN_RERANK_SCORE),
+    # meaning top-k retrieval for a request like this either returns
+    # near-random chunks or, with that cutoff in place, nothing at all.
+    # _get_document_context checks this before running hybrid_search at
+    # all, and hands over the full extracted text instead when it fits.
+    _WHOLE_DOCUMENT_INTENT_RE = re.compile(
+        r"what(?:'s|\s+is)\s+(?:this|it)\b"
+        r"|\bdescribe\s+(?:this|the)\s+(?:pdf|document|file|doc|spreadsheet|report)\b"
+        r"|\bsummar(?:y|ize|ise)\b"
+        r"|\boverview\b"
+        r"|what\s+does\s+(?:this|it)\s+(?:say|contain|cover)\b"
+        r"|what'?s\s+in\s+(?:this|the)\s+(?:file|document|pdf|doc)\b"
+        r"|\bexplain\s+(?:this|the)\s+(?:document|file|pdf|doc)\b"
+        r"|tell\s+me\s+about\s+(?:this|the)\s+(?:document|file|pdf|doc)\b",
+        re.IGNORECASE,
+    )
+
+    # ~40K chars (~10K tokens) comfortably fits alongside history/system
+    # prompt even in a small local model's context window (e.g. the 32K
+    # default), while still being generous for a real document — a
+    # novel-length upload correctly falls through to top-k retrieval
+    # instead of silently truncating and claiming it's complete.
+    _WHOLE_DOCUMENT_MAX_CHARS = 40_000
+
+    async def _whole_document_context(self, attached_ids: List[int], vision_gap_note: str) -> Optional[str]:
+        """
+        Full-extracted-text fallback for _get_document_context's
+        whole-document-intent branch. Returns None (meaning: fall through
+        to normal top-k retrieval) if no attached document is ready yet,
+        extraction fails, or the combined text is too large to inject
+        whole — never partial/truncated silently, since that would look
+        complete to the model while actually missing content.
+        """
+        from app.db.models import UserDocument
+        from app.core.rag.processor import extract_text
+        import asyncio as _asyncio
+        loop = _asyncio.get_running_loop()
+
+        _db = SessionLocal()
+        try:
+            rows = _db.query(UserDocument).filter(UserDocument.id.in_(attached_ids)).all()
+        finally:
+            _db.close()
+
+        ready_rows = [r for r in rows if r.status == "ready"]
+        if not ready_rows:
+            return None
+
+        sections = []
+        total_chars = 0
+        for row in ready_rows:
+            try:
+                text = await loop.run_in_executor(db_executor, extract_text, row.file_path, row.file_type)
+            except Exception:
+                return None
+            total_chars += len(text)
+            if total_chars > self._WHOLE_DOCUMENT_MAX_CHARS:
+                return None
+            sections.append((row.filename, text))
+
+        if not sections:
+            return None
+
+        block = vision_gap_note + "Full content of your uploaded document(s):\n\n"
+        for filename, text in sections:
+            block += f"--- Source: {filename} ---\n{text}\n\n"
+        return block
+
     _FAKE_TOOL_NARRATION_RE = re.compile(
         r'\n\s*\**\s*Step\s*1\s*[:.]|\bweb_scrape\b|\bexport_document\b|\n```json'
         r'|\[Download [^\]]*\]\(https?://[^)]*\)'
@@ -1620,6 +1765,87 @@ Output valid JSON only. Example: {{"is_export": true, "format": "docx", "parts":
 
         return "Unknown state."
 
+    def _decide_document_search(self, message: str, attached_ids: List[int]) -> Optional[Dict[str, Any]]:
+        """
+        Replaces _WHOLE_DOCUMENT_INTENT_RE plus "always hybrid_search the
+        raw message verbatim" with an actual LLM judgment call: does this
+        turn need document content at all, is it a whole-document request,
+        and if it's a targeted lookup, what's the best focused query to
+        search for — resolving vague/pronoun-laden phrasing the raw
+        message alone wouldn't retrieve well. Same cheap synchronous
+        classifier pattern as _classify_export_intent; callers run this via
+        llm_executor, not directly (it makes a blocking LLM call).
+
+        Returns None on any failure (LLM not loaded, grammar/JSON failure)
+        so the caller falls back to the old regex+raw-query behavior
+        exactly — this call can only improve on that baseline, never
+        regress below it.
+        """
+        llm = self.get_llm()
+        if not llm:
+            return None
+
+        attachment_note = ""
+        if attached_ids:
+            from app.db.models import UserDocument
+            _db = SessionLocal()
+            try:
+                names = [
+                    d.filename for d in
+                    _db.query(UserDocument).filter(UserDocument.id.in_(attached_ids)).all()
+                ]
+            finally:
+                _db.close()
+            if names:
+                attachment_note = f"Attached this turn: {', '.join(names)}.\n"
+
+        prompt = f"""{attachment_note}Message: "{message}"
+
+Decide whether answering this message requires looking at the content of the user's uploaded document(s) in this conversation.
+
+Output a JSON object with three keys:
+- "needs_search": true only if the document's actual content is needed to answer — not for general questions, greetings, or things answerable without it.
+- "whole_document": true if the user wants the document's content broadly — summarize/describe/explain it, "what is this", "what does it say", "give me a rundown/overview/walkthrough of it", "tell me everything/everything in it" — anything asking about the document as a whole rather than one specific fact. false only for a targeted lookup of one specific detail (a clause, a number, a name, a date).
+- "query": if needs_search is true and whole_document is false, a short focused search phrase capturing exactly what to look up (resolve any vague wording or pronouns using the message itself) — otherwise an empty string.
+
+Output valid JSON only. Two examples:
+Targeted lookup: {{"needs_search": true, "whole_document": false, "query": "termination clause notice period"}}
+Whole document: {{"needs_search": true, "whole_document": true, "query": ""}}"""
+
+        kwargs = dict(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=150,
+        )
+        grammar = _build_document_search_grammar()
+        if grammar is not None:
+            kwargs["grammar"] = grammar
+        else:
+            kwargs["response_format"] = {"type": "json_object"}
+
+        try:
+            try:
+                response = llm.create_chat_completion(**kwargs)
+            except Exception as e:
+                if grammar is not None:
+                    logger.warning(f"Document-search grammar generation failed, retrying without it: {e}")
+                    kwargs.pop("grammar", None)
+                    kwargs["response_format"] = {"type": "json_object"}
+                    response = llm.create_chat_completion(**kwargs)
+                else:
+                    raise
+
+            content = response["choices"][0]["message"]["content"].strip()
+            data = json.loads(content)
+            return {
+                "needs_search": bool(data.get("needs_search")),
+                "whole_document": bool(data.get("whole_document")),
+                "query": str(data.get("query") or "").strip(),
+            }
+        except Exception as e:
+            logger.warning(f"Document-search decision failed: {e}")
+            return None
+
     async def _get_document_context(self, message: str, attachments: Optional[List[Dict]], status_callback=None) -> str:
         """
         Waits for any documents attached to *this* message to finish
@@ -1725,6 +1951,45 @@ Output valid JSON only. Example: {{"is_export": true, "format": "docx", "parts":
                     "if the image isn't there.\n\n"
                 )
 
+        # LLM-driven decision: does this turn actually need document
+        # search, is it a whole-document request, and if it's a targeted
+        # lookup, what's the best query to search for — replaces the old
+        # regex-only gate with an actual judgment call, while keeping that
+        # regex as the fallback if the LLM call itself fails for any
+        # reason (see _decide_document_search's docstring). Gated on the
+        # conversation actually having a document at all, so a plain chat
+        # where nothing was ever uploaded doesn't pay for an extra LLM call.
+        import asyncio
+        from app.db.models import UserDocument
+        _db = SessionLocal()
+        try:
+            has_conversation_docs = _db.query(UserDocument.id).filter(
+                UserDocument.conversation_id == self.connection_id
+            ).first() is not None
+        finally:
+            _db.close()
+
+        search_query = message
+        if has_conversation_docs:
+            loop = asyncio.get_running_loop()
+            decision = await loop.run_in_executor(llm_executor, self._decide_document_search, message, attached_ids)
+
+            if decision is not None:
+                if not decision["needs_search"]:
+                    return vision_gap_note
+                if decision["whole_document"] and attached_ids:
+                    whole_doc_context = await self._whole_document_context(attached_ids, vision_gap_note)
+                    if whole_doc_context is not None:
+                        return whole_doc_context
+                search_query = decision["query"] or message
+            elif attached_ids and self._WHOLE_DOCUMENT_INTENT_RE.search(message):
+                # Fallback path: _decide_document_search failed outright —
+                # reproduce the exact pre-existing behavior instead of
+                # silently dropping the whole-document shortcut.
+                whole_doc_context = await self._whole_document_context(attached_ids, vision_gap_note)
+                if whole_doc_context is not None:
+                    return whole_doc_context
+
         if status_callback:
             await status_callback("Searching your documents...")
 
@@ -1732,22 +1997,32 @@ Output valid JSON only. Example: {{"is_export": true, "format": "docx", "parts":
         max_rag_chunks = ctx_cfg.get("chat").get("max_rag_chunks", 5)
 
         try:
-            import asyncio
             loop = asyncio.get_running_loop()
             from app.core.rag.processor import hybrid_search
             relevant_chunks = await loop.run_in_executor(
                 db_executor,
-                lambda: hybrid_search(query=message, conversation_id=self.connection_id, top_k=max_rag_chunks)
+                lambda: hybrid_search(query=search_query, conversation_id=self.connection_id, top_k=max_rag_chunks)
             )
         except Exception as e:
             logger.warning(f"RAG search failed: {e}")
             relevant_chunks = []
 
         if not relevant_chunks:
-            logger.info(f"RAG retrieved 0 chunks for query: {message}")
+            logger.info(f"RAG retrieved 0 chunks for query: {search_query}")
+            # Last-resort fallback: the classifier said search was needed but
+            # got whole_document wrong (observed live — a small local model
+            # misjudging "give me a rundown of everything in this file" as a
+            # targeted lookup, producing a weak query that scored nothing
+            # above _MIN_RERANK_SCORE). Rather than surface "I don't have
+            # access to that file" when a document plainly WAS attached this
+            # turn, try the whole-document path once before giving up.
+            if attached_ids:
+                whole_doc_context = await self._whole_document_context(attached_ids, vision_gap_note)
+                if whole_doc_context is not None:
+                    return whole_doc_context
             return vision_gap_note
 
-        logger.info(f"RAG retrieved {len(relevant_chunks)} chunks for query: {message}")
+        logger.info(f"RAG retrieved {len(relevant_chunks)} chunks for query: {search_query}")
         document_context = vision_gap_note + "Relevant excerpts from your uploaded documents:\n\n"
         for chunk in relevant_chunks:
             document_context += f"--- Source: {chunk.get('filename')} ---\n{chunk.get('content')}\n\n"
@@ -2045,12 +2320,23 @@ Output valid JSON only. Example: {{"is_export": true, "format": "docx", "parts":
             await self._append_history("assistant", nudge)
             return nudge
 
-        # RAG context on already-uploaded documents — without this the
-        # planner has no way to know a document exists at all and will
-        # hallucinate a URL/tool for "the report I uploaded earlier" instead
-        # of just using its content (e.g. to feed a Gmail/Slack send tool).
-        document_context = await self._get_document_context(message, attachments, status_callback)
-        planner_context = entity_context + ("\n\n" + document_context if document_context else "")
+        # Documents/attachments are Chat Mode only — _get_document_context
+        # (RAG retrieval, whole-document injection, vision-gap detection)
+        # is no longer called here at all. Mirrors the export_format nudge
+        # just above: tell the user plainly rather than silently ignoring
+        # an attachment they can see sitting right there in the composer,
+        # which the old behavior risked if a message ever reached here with
+        # one attached (the frontend no longer offers Upload Document in
+        # Agent Mode, but this is the backend-side guarantee either way).
+        if attachments:
+            nudge = (
+                "Documents are handled in **Chat Mode** — switch to it "
+                "(the toggle below) and ask me again there."
+            )
+            await self._append_history("assistant", nudge)
+            return nudge
+
+        planner_context = entity_context
 
         import asyncio
         loop = asyncio.get_running_loop()

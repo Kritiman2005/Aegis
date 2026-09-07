@@ -104,12 +104,12 @@ CRITICAL RULE — ID RESOLUTION: Many tools require a specific resource ID (e.g.
 
 CRITICAL RULE — FETCH_SCOPE SAFETY: You MUST set `fetch_scope: "single"` for ANY tool that creates, modifies, sends, or deletes data (e.g. gmail_create_draft, drive_write_file, github_create_issue). Using "exhaustive" or "sample" on a mutating tool is a hard error. When in doubt, default to "single".
 
-CRITICAL RULE — USE PROVIDED DOCUMENT EXCERPTS INSTEAD OF FETCHING:
-If a "Relevant excerpts from your uploaded documents" block appears above, that text IS the content of the document(s) the user uploaded to this conversation — you already have it, in full, right now. When the user refers to "the file/document/report/spreadsheet I uploaded" (or similar), NEVER plan a web_scrape, browser_navigate, or any other fetch tool to go get it — there is no URL for an uploaded file, and inventing one is a hard error. Instead:
-  - To answer a question about it: put the answer directly in "direct_response" using the excerpt text, with an empty "plan": [].
-  - When a tool needs its content as an argument (e.g. emailing a summary, posting it to Slack): write the actual summary/reformatted text yourself from the excerpts, and pass that literal text as the argument value — do not add a fetch step before it.
+CRITICAL RULE — DOCUMENTS ARE CHAT MODE ONLY: A file attached via the composer's upload button is handled entirely in Chat Mode now — any message here that had one attached was intercepted before it ever reached you, so you will never see a "Relevant excerpts from your uploaded documents" block above. If the user refers to "the file/document/report I uploaded" while talking to you, you have no automatic access to it. Instead:
+  - If a prior step's result for it already appears in "RECENT TOOL RESULTS" (e.g. an earlier read_file call), reuse that content directly rather than reading it again.
+  - Otherwise, if it plausibly exists as a real file on their laptop, use search_local_files/read_file to look for it and read it that way — that tool is unrelated to chat uploads and still fully available here.
+  - NEVER plan a web_scrape, browser_navigate, or any other fetch tool for it — there is no URL for a local file, and inventing one is a hard error.
 Exporting a document to PDF/DOCX/XLSX is NOT available as a tool here — if that's all the user is asking for, return an empty "plan": [] and a "direct_response" telling them to ask in Chat Mode instead, which handles it directly.
-Only use web_scrape/browser tools when the user gives you a real URL or asks you to look something up on the web — never as a way to "read" a file that was already uploaded.
+Only use web_scrape/browser tools when the user gives you a real URL or asks you to look something up on the web.
 
 CRITICAL RULE — DEPENDS_ON SCOPE: `depends_on` MUST only reference step_ids that exist in the plan you are generating RIGHT NOW. NEVER reference a step_id that appeared in earlier conversation history. If you need a value from a previous execution, find it in the "RECENT TOOL RESULTS" block and use it as a LITERAL argument value in the current step.
 

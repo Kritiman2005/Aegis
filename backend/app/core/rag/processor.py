@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import logging
 import threading
@@ -127,6 +128,96 @@ def get_reranker():
 
 # ─── Text Extraction ──────────────────────────────────────────────────────────
 
+def _extract_pdf_page_text(page) -> str:
+    """
+    Ports AnythingLLM's own PDF text-extraction algorithm (their
+    collector/processSingleFile/convert/asPDF/PDFLoader — pdf.js-based)
+    onto PyMuPDF's structured span data, rather than PyMuPDF's plain
+    page.get_text(): walk every text span in extraction order, and insert a
+    newline only when a span's Y-origin differs from the previous one — two
+    spans at the same Y are the same visual line and get concatenated with
+    no separator, same as theirs. Still PyMuPDF/MuPDF underneath (kept for
+    its mature font/encoding handling — pdf.js has no particular edge here)
+    — same line-detection algorithm, not the same library.
+    """
+    text_dict = page.get_text("dict")
+    parts: List[str] = []
+    last_y = None
+    for block in text_dict.get("blocks", []):
+        if block.get("type") != 0:  # 0 = text block; skip images etc.
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                span_text = span.get("text", "")
+                if not span_text:
+                    continue
+                y = span["origin"][1]
+                if last_y is not None and y != last_y:
+                    parts.append("\n")
+                parts.append(span_text)
+                last_y = y
+    return "".join(parts)
+
+
+def _extract_pptx_shape_text(shape) -> List[str]:
+    """
+    Ports AnythingLLM's PPTX extraction (their asOfficeMime.js, backed by the
+    officeparser npm package) which grabs every text run on a slide
+    regardless of what container it sits in — text boxes, tables, grouped
+    shapes. The old code here did `if hasattr(shape, "text")`, which is
+    False for a GraphicFrame holding a table — table content on a slide was
+    silently dropped. This walks group shapes and tables explicitly instead
+    of relying on that attribute.
+    """
+    parts: List[str] = []
+    if shape.shape_type == 6:  # MSO_SHAPE_TYPE.GROUP — recurse into members
+        for sub_shape in shape.shapes:
+            parts.extend(_extract_pptx_shape_text(sub_shape))
+    elif shape.has_table:
+        for row in shape.table.rows:
+            cells = [cell.text for cell in row.cells if cell.text]
+            if cells:
+                parts.append(" | ".join(cells))
+    elif shape.has_text_frame and shape.text_frame.text:
+        parts.append(shape.text_frame.text)
+    return parts
+
+
+def _extract_docx_body_text(parent) -> List[str]:
+    """
+    Ports AnythingLLM's DOCX extraction (their asDocx.js, backed by
+    LangChain's DocxLoader / mammoth.js), which walks the document in
+    original document order. The old code here read all paragraphs first,
+    then appended all tables at the end — a document with a table between
+    two paragraphs came out with its table content relocated to the very
+    end, scrambling reading order relative to the source. This walks
+    `parent`'s direct XML children (a Document body or a table cell) in
+    order, recursing into tables (and any table nested inside a cell) so
+    paragraphs and table rows stay interleaved exactly as authored.
+    """
+    from docx.oxml.ns import qn
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    parts: List[str] = []
+    for child in parent.iterchildren():
+        if child.tag == qn('w:p'):
+            text = Paragraph(child, parent).text
+            if text:
+                parts.append(text)
+        elif child.tag == qn('w:tbl'):
+            table = Table(child, parent)
+            for row in table.rows:
+                row_cells = []
+                for cell in row.cells:
+                    cell_text = " ".join(_extract_docx_body_text(cell._tc))
+                    if cell_text:
+                        row_cells.append(cell_text)
+                if row_cells:
+                    parts.append(" | ".join(row_cells))
+    return parts
+
+
 def extract_text(file_path: str, file_type: str) -> str:
     ext = file_type.lower()
     try:
@@ -134,7 +225,7 @@ def extract_text(file_path: str, file_type: str) -> str:
             doc = fitz.open(file_path)
             try:
                 # needs_pass (not is_encrypted) is the one that actually
-                # blocks get_text() below — a PDF can be "encrypted" with
+                # blocks extraction below — a PDF can be "encrypted" with
                 # only owner-password restrictions and still open/extract
                 # fine, in which case needs_pass is 0 despite is_encrypted
                 # being true. Checking this explicitly turns what would
@@ -145,10 +236,7 @@ def extract_text(file_path: str, file_type: str) -> str:
                     raise ValueError(
                         "This PDF is password-protected — remove the password and re-upload."
                     )
-                text_content = ""
-                for page in doc:
-                    text_content += page.get_text() + "\n"
-                return text_content
+                return "\n\n".join(_extract_pdf_page_text(page) for page in doc)
             finally:
                 # fitz.Document holds the file open for lazy per-page
                 # access; never closing it leaks a file descriptor per
@@ -157,12 +245,11 @@ def extract_text(file_path: str, file_type: str) -> str:
 
         elif ext in ['ppt', 'pptx']:
             prs = Presentation(file_path)
-            text_content = ""
+            parts: List[str] = []
             for slide in prs.slides:
                 for shape in slide.shapes:
-                    if hasattr(shape, "text"):
-                        text_content += shape.text + "\n"
-            return text_content
+                    parts.extend(_extract_pptx_shape_text(shape))
+            return "\n".join(parts)
 
         elif ext in ['txt', 'md', 'csv']:
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -171,16 +258,7 @@ def extract_text(file_path: str, file_type: str) -> str:
         elif ext == 'docx':
             from docx import Document
             doc = Document(file_path)
-            parts = [p.text for p in doc.paragraphs if p.text]
-            # Tables aren't walked by doc.paragraphs at all — a docx with a
-            # table and no surrounding prose would otherwise extract as
-            # empty text.
-            for table in doc.tables:
-                for row in table.rows:
-                    cells = [cell.text for cell in row.cells if cell.text]
-                    if cells:
-                        parts.append(" | ".join(cells))
-            return "\n".join(parts)
+            return "\n".join(_extract_docx_body_text(doc.element.body))
 
         elif ext == 'xlsx':
             from openpyxl import load_workbook
@@ -214,14 +292,106 @@ def extract_text(file_path: str, file_type: str) -> str:
 
 # ─── Chunking ─────────────────────────────────────────────────────────────────
 
-def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> List[str]:
-    words = text.split()
-    chunks = []
+# Splits on whitespace that immediately follows a sentence-terminating
+# punctuation mark — a deliberately simple heuristic (no NLP sentence
+# tokenizer dependency), same tradeoff LangChain's own splitters make.
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
+
+
+def _split_sentences(paragraph: str) -> List[str]:
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(paragraph) if s.strip()]
+    return sentences or [paragraph]
+
+
+def _hard_split_words(unit: str, chunk_size: int, overlap: int) -> List[str]:
+    """Last-resort fallback: a single sentence (or a paragraph with no
+    sentence boundaries at all, e.g. a heading) that alone still exceeds
+    chunk_size. The only place left that cuts at an arbitrary word count
+    rather than a real semantic boundary."""
+    words = unit.split()
+    pieces = []
     i = 0
     while i < len(words):
-        chunk = " ".join(words[i:i + chunk_size])
-        chunks.append(chunk)
+        pieces.append(" ".join(words[i:i + chunk_size]))
         i += (chunk_size - overlap)
+    return pieces
+
+
+def _pack_units(units: List[str], chunk_size: int, overlap: int, joiner: str) -> List[str]:
+    """Greedily packs whole text units (paragraphs, or sentences within
+    one oversized paragraph) into chunk_size-word groups. Overlap is
+    approximated by carrying the previous group's last unit into the next
+    one, rather than a fixed word count, so the boundary context handed
+    forward is always a whole unit, never a mid-unit fragment."""
+    packed: List[str] = []
+    current: List[str] = []
+    current_words = 0
+
+    for unit in units:
+        unit_words = len(unit.split())
+        if current and current_words + unit_words > chunk_size:
+            packed.append(joiner.join(current))
+            current = [current[-1]] if overlap > 0 else []
+            current_words = len(current[-1].split()) if current else 0
+        current.append(unit)
+        current_words += unit_words
+
+    if current:
+        packed.append(joiner.join(current))
+    return packed
+
+
+def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> List[str]:
+    """
+    Multi-level recursive chunking, coarsest boundary first — same
+    philosophy as LangChain's RecursiveCharacterTextSplitter (paragraph ->
+    sentence -> word), so a chunk only ever splits at a finer boundary
+    than it needs to:
+      1. Paragraphs (newline-separated — how every extractor above already
+         separates them, including docx table rows joined with " | ") are
+         packed together up to chunk_size words.
+      2. A paragraph that alone exceeds chunk_size is split into sentences
+         first, which are then packed the same way — a long paragraph
+         still breaks at sentence boundaries, not mid-sentence.
+      3. Only a single sentence that alone exceeds chunk_size (rare — a
+         heading, a run-on line with no terminal punctuation) falls back
+         to a hard word-count cut.
+    Document order is preserved throughout — pending normal paragraphs are
+    flushed (packed and appended to the result) before an oversized
+    paragraph's own chunks are appended, so chunks always come out in the
+    same order their source paragraphs appeared in.
+    """
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    if not paragraphs:
+        return []
+
+    chunks: List[str] = []
+    pending_normal: List[str] = []
+
+    def flush_normal():
+        if pending_normal:
+            chunks.extend(_pack_units(pending_normal, chunk_size, overlap, joiner="\n"))
+            pending_normal.clear()
+
+    for para in paragraphs:
+        if len(para.split()) <= chunk_size:
+            pending_normal.append(para)
+            continue
+
+        flush_normal()
+        pending_sentences: List[str] = []
+        for sentence in _split_sentences(para):
+            if len(sentence.split()) <= chunk_size:
+                pending_sentences.append(sentence)
+                continue
+            if pending_sentences:
+                chunks.extend(_pack_units(pending_sentences, chunk_size, overlap, joiner=" "))
+                pending_sentences = []
+            chunks.extend(_hard_split_words(sentence, chunk_size, overlap))
+        if pending_sentences:
+            chunks.extend(_pack_units(pending_sentences, chunk_size, overlap, joiner=" "))
+
+    flush_normal()
     return chunks
 
 
@@ -394,12 +564,23 @@ def hybrid_search(query: str, conversation_id: str, top_k: int = 5) -> List[Dict
     reranker = get_reranker()
     pairs = [[query, chunk["content"]] for chunk in unique_chunks]
     scores = reranker.predict(pairs)
-    
-    filtered_chunks = []
+
     for i, chunk in enumerate(unique_chunks):
-        score = float(scores[i])
-        chunk["rerank_score"] = score
-        filtered_chunks.append(chunk)
-            
-    filtered_chunks.sort(key=lambda x: x["rerank_score"], reverse=True)
-    return filtered_chunks[:top_k]
+        chunk["rerank_score"] = float(scores[i])
+    unique_chunks.sort(key=lambda x: x["rerank_score"], reverse=True)
+
+    # Empirically calibrated against this exact model (cross-encoder/
+    # ms-marco-MiniLM-L-6-v2), not assumed: a genuinely on-topic match
+    # scored as low as -1.29, while an off-topic query against real
+    # document content, and vague non-factual queries ("what is this")
+    # that have nothing to semantically match against, both scored in the
+    # -7.9 to -11.2 range — a clearly separated band. Below this cutoff,
+    # every remaining candidate is closer to "unrelated" than "on-topic",
+    # so returning them as "Relevant excerpts" would just be confidently
+    # wrong — previously there was no cutoff at all, so top_k candidates
+    # were always returned regardless of how irrelevant they actually
+    # were. An empty result here correctly falls through to the "no
+    # relevant chunks" path in chat.py rather than injecting noise.
+    _MIN_RERANK_SCORE = -6.0
+    relevant = [c for c in unique_chunks if c["rerank_score"] >= _MIN_RERANK_SCORE]
+    return relevant[:top_k]

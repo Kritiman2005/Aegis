@@ -15,6 +15,42 @@ import anyio
 
 router = APIRouter(prefix="/api/documents", tags=["Documents"])
 
+# mimetypes.guess_type() consults the Windows registry as a supplement to
+# its built-in table on that platform — on a machine where an extension was
+# never associated with a MIME type (common for .pdf on a clean/minimal
+# Windows install with no PDF software ever registered, or when other
+# software has overwritten the association), it silently returns (None,
+# None), which get_document_raw() below then falls back to
+# "application/octet-stream" for. A browser <iframe> given
+# application/octet-stream never invokes its native PDF/image viewer
+# regardless of Content-Disposition: inline — it just shows nothing, which
+# is exactly the blank-preview symptom this dict exists to prevent. Listed
+# explicitly (bypassing the OS lookup entirely) for every format this app
+# actually serves through /raw, so preview rendering can't depend on
+# whatever happens to be in a given user's Windows registry.
+_EXPLICIT_MIME_TYPES = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".txt": "text/plain",
+    ".md": "text/plain",
+    ".csv": "text/csv",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+
+
+def _guess_media_type(filename: str) -> str:
+    ext = Path(filename).suffix.lower()
+    if ext in _EXPLICIT_MIME_TYPES:
+        return _EXPLICIT_MIME_TYPES[ext]
+    guessed, _ = mimetypes.guess_type(filename)
+    return guessed or "application/octet-stream"
+
 # A document's very first ingestion can legitimately need to download the
 # embedding/reranker models (a few hundred MB total) if they weren't already
 # warmed by main.py's startup preload — slow but survivable on a slow
@@ -302,10 +338,9 @@ async def get_document_raw(document_id: int, download: bool = False, db = Depend
     file_path = Path(doc.file_path)
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="The file is no longer on disk.")
-    media_type, _ = mimetypes.guess_type(doc.filename)
     return FileResponse(
         file_path,
-        media_type=media_type or "application/octet-stream",
+        media_type=_guess_media_type(doc.filename),
         filename=doc.filename,
         content_disposition_type="attachment" if download else "inline",
     )
