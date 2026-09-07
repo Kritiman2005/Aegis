@@ -57,6 +57,9 @@ def init_db():
         if "ocr_skipped_for_vision" not in existing_doc_cols:
             conn.execute(text("ALTER TABLE user_documents ADD COLUMN ocr_skipped_for_vision BOOLEAN DEFAULT 0"))
             conn.commit()
+        if "content_hash" not in existing_doc_cols:
+            conn.execute(text("ALTER TABLE user_documents ADD COLUMN content_hash TEXT"))
+            conn.commit()
 
         # Vision support (see ModelRegistry's own comment): an existing
         # install's models table predates these columns entirely.

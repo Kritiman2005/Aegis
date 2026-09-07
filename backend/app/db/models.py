@@ -120,7 +120,14 @@ class UserDocument(Base):
     # longer vision-capable by the time the message is actually sent, rather
     # than silently answering as if the image were never attached.
     ocr_skipped_for_vision = Column(Boolean, default=False)
-    
+    # SHA-256 of the raw uploaded bytes — lets a re-upload of the exact same
+    # file within the same conversation reuse the existing row/embeddings
+    # instead of re-ingesting a duplicate (see api/documents.py's upload
+    # endpoint). Not unique across the whole table: the same content can
+    # legitimately exist once per conversation, just not more than once
+    # within one.
+    content_hash = Column(String, index=True, nullable=True)
+
 class ScheduledJob(Base):
     """
     Opt-in unattended scheduled jobs.

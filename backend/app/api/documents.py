@@ -1,6 +1,7 @@
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from typing import List, Dict, Any, Optional
+import hashlib
 import mimetypes
 import os
 import threading
@@ -205,6 +206,7 @@ async def upload_document(
     file_path = UPLOAD_DIR / f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{safe_filename}"
 
     total_bytes = 0
+    hasher = hashlib.sha256()
     with open(file_path, "wb") as buffer:
         while True:
             chunk = await file.read(_UPLOAD_COPY_CHUNK_SIZE)
@@ -219,7 +221,42 @@ async def upload_document(
                     detail=f"File too large — the limit is {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
                 )
             buffer.write(chunk)
+            hasher.update(chunk)
 
+    content_hash = hasher.hexdigest()
+
+    # Re-uploading the exact same bytes into the same conversation (e.g. the
+    # user attaches the same file again in a later message) would otherwise
+    # re-run the full extract/chunk/embed pipeline and leave a duplicate set
+    # of chunks sitting in Qdrant next to the original — same content,
+    # doubled retrieval noise, wasted embedding compute. Only checked within
+    # this conversation: hybrid_search filters by which documents belong to
+    # it, so a real cross-conversation dedup would need points to be
+    # shareable across documents, not just skipped on upload — out of scope
+    # here. "failed" rows are excluded so a prior failed ingestion doesn't
+    # block a genuine retry from actually re-attempting it.
+    existing = (
+        db.query(UserDocument)
+        .filter(
+            UserDocument.conversation_id == conversation_id,
+            UserDocument.content_hash == content_hash,
+            UserDocument.status.in_(["ready", "processing"]),
+        )
+        .first()
+    )
+    if existing:
+        file_path.unlink(missing_ok=True)
+        logger.info(
+            f"Upload '{file.filename}' matches existing document {existing.id} "
+            f"('{existing.filename}') in this conversation by content hash — reusing it, skipping re-ingestion."
+        )
+        return {
+            "message": "This file is already attached in this conversation — reusing the existing copy.",
+            "document_id": existing.id,
+            "filename": existing.filename,
+            "file_type": existing.file_type,
+            "deduplicated": True,
+        }
 
     # Save to SQLite
     doc = UserDocument(
@@ -227,7 +264,8 @@ async def upload_document(
         filename=file.filename,
         file_path=str(file_path),
         file_type=ext,
-        status="processing"
+        status="processing",
+        content_hash=content_hash,
     )
     db.add(doc)
     db.commit()
@@ -384,6 +422,45 @@ async def get_document_text(document_id: int, db = Depends(get_db)):
     }
 
 
+def _purge_document(db, doc: UserDocument) -> None:
+    """
+    Removes one document's file on disk and its indexed Qdrant chunks, and
+    stages its DB row for deletion (caller commits — batched callers like
+    delete_documents_for_conversation below delete several docs under one
+    commit instead of one per row).
+    """
+    file_path = Path(doc.file_path)
+    if file_path.exists():
+        try:
+            file_path.unlink()
+        except OSError as e:
+            logger.warning(f"Could not remove file {file_path} for document {doc.id}: {e}")
+
+    try:
+        delete_document_points(doc.id)
+    except Exception as e:
+        logger.warning(f"Could not remove Qdrant points for document {doc.id}: {e}")
+
+    db.delete(doc)
+
+
+def delete_documents_for_conversation(db, conversation_id: str) -> int:
+    """
+    Sweeps up every document (file on disk, Qdrant chunks, DB row) that
+    belongs to a conversation — called when the conversation itself is
+    deleted (app/api/chat.py's delete_session). Without this, a deleted
+    chat's uploaded documents kept their file on disk and their embeddings
+    in Qdrant forever, unreachable by any conversation_id but never cleaned
+    up — a storage leak that grows with every chat a user deletes.
+    """
+    docs = db.query(UserDocument).filter(UserDocument.conversation_id == conversation_id).all()
+    for doc in docs:
+        _purge_document(db, doc)
+    if docs:
+        db.commit()
+    return len(docs)
+
+
 @router.delete("/{document_id}")
 async def delete_document(document_id: int, db = Depends(get_db)):
     """Delete an uploaded document: its file on disk, its indexed Qdrant chunks, and its DB row."""
@@ -391,18 +468,6 @@ async def delete_document(document_id: int, db = Depends(get_db)):
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
 
-    file_path = Path(doc.file_path)
-    if file_path.exists():
-        try:
-            file_path.unlink()
-        except OSError as e:
-            logger.warning(f"Could not remove file {file_path} for document {document_id}: {e}")
-
-    try:
-        delete_document_points(document_id)
-    except Exception as e:
-        logger.warning(f"Could not remove Qdrant points for document {document_id}: {e}")
-
-    db.delete(doc)
+    _purge_document(db, doc)
     db.commit()
     return {"success": True}

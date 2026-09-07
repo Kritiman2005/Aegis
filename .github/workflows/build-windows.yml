@@ -45,6 +45,28 @@ jobs:
           if (Test-Path requirements.txt) { pip install -r requirements.txt }
           pip install pyinstaller
 
+      # ── Backend test suite ──────────────────────────────────────────────────
+      # Runs before the (much slower) PyInstaller build below so a real
+      # regression fails fast instead of only surfacing after a 10+ minute
+      # build. Scoped explicitly to tests/ — backend/ also has several loose
+      # top-level test_*.py scratch scripts (test_llm.py, test_httpx.py, ...)
+      # that aren't real pytest suites: they have no test_ functions, just
+      # top-level code that loads a real model / hits a real network endpoint
+      # on import, which pytest's default discovery would otherwise try to
+      # collect and execute. SKIP_LIVE_LLM_TESTS skips tests/test_harness_
+      # fixes_live.py's real-model tests — no model is downloaded in this
+      # job, so they'd otherwise just skip on the missing-file check anyway,
+      # but this is faster and makes the intent explicit.
+      - name: Install Test Dependencies
+        working-directory: backend
+        run: pip install pytest pytest-asyncio
+
+      - name: Run Backend Tests
+        working-directory: backend
+        env:
+          SKIP_LIVE_LLM_TESTS: "1"
+        run: python -m pytest tests/ -v
+
       # ── Inject credentials before PyInstaller bundles them ───────────────────
       - name: Inject OAuth Credentials into build
         shell: pwsh
@@ -92,8 +114,32 @@ jobs:
           Add-Content  $file "ATLASSIAN_CLIENT_SECRET = '$env:ATLASSIAN_CLIENT_SECRET'"
           Add-Content  $file "SALESFORCE_CLIENT_ID     = '$env:SALESFORCE_CLIENT_ID'"
           Add-Content  $file "SALESFORCE_CLIENT_SECRET = '$env:SALESFORCE_CLIENT_SECRET'"
-          Write-Output "=== credentials.py written ==="
-          Get-Content $file
+
+          # Never print the file's contents (every OAuth client secret) to the
+          # log. GitHub Actions auto-masks exact `secrets.*` matches, but
+          # that's a best-effort mitigation, not a guarantee — it's documented
+          # to fail on short, transformed, or re-encoded values. This reports
+          # which vars ended up empty (a real, common misconfiguration — a
+          # secret never added to the repo) without ever printing a value.
+          Write-Output "=== credentials.py written (values withheld from the log) ==="
+          $secretNames = @(
+            'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET',
+            'SLACK_CLIENT_ID', 'SLACK_CLIENT_SECRET',
+            'NOTION_CLIENT_ID', 'NOTION_CLIENT_SECRET',
+            'FIGMA_CLIENT_ID', 'FIGMA_CLIENT_SECRET',
+            'GITHUB_OAUTH_CLIENT_ID', 'GITHUB_OAUTH_CLIENT_SECRET',
+            'HUBSPOT_CLIENT_ID', 'HUBSPOT_CLIENT_SECRET',
+            'LINEAR_CLIENT_ID', 'LINEAR_CLIENT_SECRET',
+            'AIRTABLE_CLIENT_ID', 'AIRTABLE_CLIENT_SECRET',
+            'ATLASSIAN_CLIENT_ID', 'ATLASSIAN_CLIENT_SECRET',
+            'SALESFORCE_CLIENT_ID', 'SALESFORCE_CLIENT_SECRET'
+          )
+          foreach ($name in $secretNames) {
+            $envVar = Get-Item "env:$name" -ErrorAction SilentlyContinue
+            if (-not $envVar -or [string]::IsNullOrEmpty($envVar.Value)) {
+              Write-Output "WARNING: $name is empty — that integration's OAuth will be unavailable in this build."
+            }
+          }
 
       # ── Bundle the Whisper model into the app itself (see
       # app/core/transcription.py) — main.spec's Analysis step fails loudly

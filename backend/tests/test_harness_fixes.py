@@ -426,6 +426,12 @@ async def _no_document_context(self, message, attachments, status_callback=None)
 async def test_agent_mode_direct_response_json_leak_is_sanitized(monkeypatch):
     agent = make_agent(connection_id="test_direct_response_leak")
     monkeypatch.setattr(ChatAgent, "_get_document_context", _no_document_context)
+    # _handle_idle's own early "is a model even downloaded" gate runs before
+    # mode branching and checks self.get_llm() directly — not exercised by
+    # the mocked planner below, so it must be satisfied on its own or this
+    # test only passes on a machine that happens to have a real model
+    # registered (never on a fresh checkout/CI DB).
+    monkeypatch.setattr(agent, "get_llm", lambda model_name=None: FakeLLM([]))
 
     leaked_direct_response = json.dumps({"answer": "The capital of France is Paris."})
     monkeypatch.setattr(
@@ -443,6 +449,7 @@ async def test_agent_mode_direct_response_json_leak_is_sanitized(monkeypatch):
 async def test_agent_mode_clarifying_question_json_leak_is_sanitized(monkeypatch):
     agent = make_agent(connection_id="test_clarifying_question_leak")
     monkeypatch.setattr(ChatAgent, "_get_document_context", _no_document_context)
+    monkeypatch.setattr(agent, "get_llm", lambda model_name=None: FakeLLM([]))
 
     leaked_question = json.dumps({"question": "Which folder should I search in?"})
     monkeypatch.setattr(
@@ -460,6 +467,7 @@ async def test_agent_mode_clarifying_question_json_leak_is_sanitized(monkeypatch
 async def test_agent_mode_direct_response_normal_text_passes_through(monkeypatch):
     agent = make_agent(connection_id="test_direct_response_normal")
     monkeypatch.setattr(ChatAgent, "_get_document_context", _no_document_context)
+    monkeypatch.setattr(agent, "get_llm", lambda model_name=None: FakeLLM([]))
 
     monkeypatch.setattr(
         agent.planner, "generate_plan",
