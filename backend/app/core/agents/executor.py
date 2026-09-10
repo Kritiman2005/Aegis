@@ -18,9 +18,15 @@ class ExecutorAgent(BaseAgent):
                            prior_results: dict,
                            entity_context: str,
                            user_request: str,
-                           retry_note: str = "") -> dict:
+                           retry_note: str = "",
+                           model_name: str = None) -> dict:
 
-        llm = self.get_llm()
+        # model_name lets a caller (a workflow's AI-flagged MCP/tool node —
+        # see app.core.workflows.engine) pin this call to a specific
+        # downloaded model instead of silently falling back to whichever
+        # one happens to be "active" — the same explicit choice a workflow's
+        # dedicated LLM node type always requires.
+        llm = self.get_llm(model_name)
         if not llm:
             logger.error("LLM not loaded for ExecutorAgent.")
             return {}

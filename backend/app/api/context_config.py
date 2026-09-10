@@ -31,6 +31,9 @@ class ChatConfig(BaseModel):
     max_rag_chunks: int = Field(..., ge=0, le=20, description="Number of RAG document chunks to inject")
     max_output_tokens: int = Field(..., ge=64, le=128000, description="Max tokens the LLM may generate")
     max_result_snippet: int = Field(2000, ge=100, le=10000, description="Character cap for recent tool result snippets")
+    system_prompt_override: Optional[str] = Field(None, max_length=8000, description="Full replacement for Chat Mode's system prompt; empty/unset = built-in default")
+    chunk_size: int = Field(300, ge=50, le=2000, description="Word count per document chunk on ingest")
+    chunk_overlap: int = Field(50, ge=0, le=500, description="Word overlap between consecutive chunks on ingest")
 
 class AgentConfig(BaseModel):
     max_history_messages: int = Field(..., ge=1, le=20, description="Max chat turns passed to Planner LLM")
@@ -158,6 +161,7 @@ def reset_context_config():
     """Reset all agent context config to factory defaults."""
     defaults = cfg_store.reset()
     return {"success": True, "config": defaults}
+
 
 @router.post("/api/hardware/unload")
 def unload_model():
@@ -357,4 +361,3 @@ def mark_welcome_seen():
             db.add(OnboardingState(id=1, welcome_seen=True))
         db.commit()
     return {"status": "ok"}
-

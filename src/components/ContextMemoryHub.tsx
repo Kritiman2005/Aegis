@@ -34,8 +34,14 @@ export default function ContextMemoryHub() {
     max_rag_chunks: 5,
   });
 
-  const [hasChanges, setHasChanges] = useState(false);
+  // Snapshot of the last fetched/saved config — hasChanges compares the
+  // live, edited `config` against this rather than a fixed initial value,
+  // so the Save button correctly disables itself again right after a
+  // successful save.
+  const [savedConfig, setSavedConfig] = useState<UnifiedConfig>(config);
   const [isSaving, setIsSaving] = useState(false);
+  const hasChanges = JSON.stringify(config) !== JSON.stringify(savedConfig);
+
   const [downloadedModels, setDownloadedModels] = useState<any[]>([]);
   const [unloading, setUnloading] = useState(false);
   const [loadingModelId, setLoadingModelId] = useState<number | null>(null);
@@ -76,41 +82,51 @@ export default function ContextMemoryHub() {
         const data = await res.json();
         // Chat's saved values are the shared starting point (it's the one
         // with max_rag_chunks); the Agent side is unified to match on save.
-        if (data.chat) setConfig(c => ({ ...c, ...data.chat }));
+        if (data.chat) {
+          setConfig(c => {
+            const next = { ...c, ...data.chat };
+            setSavedConfig(next);
+            return next;
+          });
+        }
       }
     } catch (e) {
       console.error(e);
     }
+  };
+
+  const handleConfigChange = (field: keyof UnifiedConfig, value: number) => {
+    setConfig(c => ({ ...c, [field]: value }));
   };
 
   const saveConfig = async () => {
     setIsSaving(true);
     try {
-      const { max_rag_chunks, ...shared } = config;
+      const shared = {
+        max_history_messages: config.max_history_messages,
+        max_msg_chars: config.max_msg_chars,
+        max_output_tokens: config.max_output_tokens,
+        max_result_snippet: config.max_result_snippet,
+      };
       const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/context-config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          chat: config,
+          chat: { ...shared, max_rag_chunks: config.max_rag_chunks },
           agent: shared,
-        })
+        }),
       });
       if (res.ok) {
-        setHasChanges(false);
+        setSavedConfig(config);
+        toast.success('Settings saved.');
       } else {
         toast.error('Failed to save settings.');
       }
     } catch (e) {
-      console.error(e);
-      toast.error('Network error while saving settings.');
+      toast.error('Failed to save settings.');
     } finally {
       setIsSaving(false);
     }
-  };
-
-  const handleConfigChange = (key: keyof UnifiedConfig, val: number) => {
-    setConfig({ ...config, [key]: val });
-    setHasChanges(true);
   };
 
   const handleUnloadModel = async () => {

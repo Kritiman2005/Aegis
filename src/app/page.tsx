@@ -5,6 +5,8 @@ import Sidebar, { TabType, AccountStatus } from '@/components/Sidebar';
 import ChatView from '@/components/ChatView';
 import ContextMemoryHub from '@/components/ContextMemoryHub';
 import ConnectorsView from '@/components/ConnectorsView';
+import MCPServersPanel from '@/components/MCPServersPanel';
+import WorkflowsView from '@/components/WorkflowsView';
 import ModelHub from '@/components/ModelHub';
 import SplashScreen from '@/components/SplashScreen';
 import AuthScreen from '@/components/AuthScreen';
@@ -103,14 +105,22 @@ export default function Home() {
   // never re-showing it, rather than risking an annoying repeat.
   const [welcomeSeen, setWelcomeSeen] = useState(true);
   const [welcomeChecked, setWelcomeChecked] = useState(false);
+  // Gated on backendReachable, not the full isBackendReady — same reasoning
+  // as the account check above (SQLite, which /api/onboarding/status reads,
+  // is already up as soon as the backend answers at all) — and this is what
+  // lets WelcomeScreen render before SplashScreen's boot/model-download
+  // sequence rather than after it (see the render order below): the
+  // hardware read it shows (/api/hardware/detect) has no SQLite/Qdrant/model
+  // dependency either, so there's no real reason a first-time user should
+  // ever have sat through model download before seeing it in the first place.
   useEffect(() => {
-    if (!isBackendReady || !account?.logged_in) return;
+    if (!backendReachable || !account?.logged_in) return;
     fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/onboarding/status`, { cache: 'no-store' })
       .then(res => res.json())
       .then(data => setWelcomeSeen(!!data.welcome_seen))
       .catch(() => {})
       .finally(() => setWelcomeChecked(true));
-  }, [isBackendReady, account?.logged_in]);
+  }, [backendReachable, account?.logged_in]);
 
   const handleLogout = useCallback(async () => {
     try {
@@ -126,10 +136,6 @@ export default function Home() {
     isStreaming,
     streamingContent,
     statusText,
-    agentState,
-    activeNodeId,
-    completedNodeIds,
-    failedNodeIds,
     sendMessage,
     cancelGeneration,
     clearMessages,
@@ -200,6 +206,21 @@ export default function Home() {
     return <AuthScreen onAuthenticated={refreshAccount} />;
   }
 
+  // Account check still in flight — brief blank beat before we know
+  // whether to show AuthScreen, WelcomeScreen, or move on to SplashScreen.
+  if (backendReachable && !accountChecked) {
+    return <div className="h-screen w-screen bg-aegis-base" />;
+  }
+
+  // Hardware-detection welcome screen, shown before the boot/model-download
+  // sequence (SplashScreen below) rather than after — it only needs the
+  // backend reachable (see the effect above), so a first-time user should
+  // see "here's what we found on your machine" first, and only then move
+  // on to picking/downloading a model. Still shown at most once ever.
+  if (backendReachable && accountChecked && account?.logged_in && welcomeChecked && !welcomeSeen) {
+    return <WelcomeScreen onContinue={() => setWelcomeSeen(true)} />;
+  }
+
   if (!isBackendReady) {
     return (
       <SplashScreen
@@ -208,14 +229,6 @@ export default function Home() {
         onBackendReachable={() => setBackendReachable(true)}
       />
     );
-  }
-
-  if (!accountChecked) {
-    return <div className="h-screen w-screen bg-aegis-base" />;
-  }
-
-  if (welcomeChecked && !welcomeSeen) {
-    return <WelcomeScreen onContinue={() => setWelcomeSeen(true)} />;
   }
 
   return (
@@ -254,13 +267,9 @@ export default function Home() {
             isStreaming={isStreaming}
             streamingContent={streamingContent}
             statusText={statusText}
-            agentState={agentState}
             onSendMessage={sendMessage}
             onCancelGeneration={cancelGeneration}
             onClearMessages={clearMessages}
-            activeNodeId={activeNodeId}
-            completedNodeIds={completedNodeIds}
-            failedNodeIds={failedNodeIds}
             onOpenLLMPanel={() => setActiveTab('llms')}
             onOpenContextPanel={() => setActiveTab('context')}
             onOpenMarketplace={() => setActiveTab('marketplace')}
@@ -268,6 +277,12 @@ export default function Home() {
         </div>
         {(activeTab === 'connectors' || activeTab === 'sync_detail') && (
           <ConnectorsView />
+        )}
+        {activeTab === 'mcp_servers' && (
+          <MCPServersPanel />
+        )}
+        {activeTab === 'workflows' && (
+          <WorkflowsView />
         )}
         {(activeTab === 'llms' || activeTab === 'model_hub') && (
           <ModelHub />

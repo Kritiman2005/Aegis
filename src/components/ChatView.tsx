@@ -12,7 +12,6 @@ import {
   Bookmark,
   Loader2,
   Plus,
-  Globe,
   Store,
   Sparkles,
   FileText,
@@ -26,10 +25,7 @@ import {
 import { type ChatMessage, type ConnectionStatus, type Attachment } from '@/hooks/useSocket';
 import { useAppSelector } from '@/hooks/useStore';
 import { selectSessionId } from '@/store/sessionSlice';
-import AgentThinking from './AgentThinking';
 import MarkdownContent from './MarkdownContent';
-import PlanCard, { parsePlanMarkdown } from './PlanCard';
-import DocumentPreviewModal from './DocumentPreviewModal';
 import { useMemo } from 'react';
 
 function ToggleSwitch({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
@@ -48,15 +44,10 @@ function ToggleSwitch({ checked, onChange }: { checked: boolean; onChange: (v: b
 
 type DocStatus = 'processing' | 'ready' | 'failed';
 
-function AttachmentChip({ attachment, status, onPreview }: { attachment: Attachment; status?: DocStatus; onPreview?: () => void }) {
+function AttachmentChip({ attachment, status }: { attachment: Attachment; status?: DocStatus }) {
   const ext = attachment.file_type.toLowerCase();
   return (
-    <button
-      onClick={onPreview}
-      disabled={!onPreview}
-      title={onPreview ? `Preview ${attachment.filename}` : undefined}
-      className="flex items-center gap-2.5 bg-aegis-raised border border-aegis-border rounded-xl px-3.5 py-2.5 max-w-xs text-left enabled:hover:bg-aegis-overlay enabled:hover:border-aegis-primary-light transition-colors disabled:cursor-default"
-    >
+    <div className="flex items-center gap-2.5 bg-aegis-raised border border-aegis-border rounded-xl px-3.5 py-2.5 max-w-xs text-left">
       <div className="w-8 h-8 rounded-lg bg-aegis-overlay flex items-center justify-center flex-shrink-0">
         <FileText className="w-4 h-4 text-aegis-primary-light" />
       </div>
@@ -71,7 +62,7 @@ function AttachmentChip({ attachment, status, onPreview }: { attachment: Attachm
       ) : (
         <Loader2 className="w-4 h-4 text-aegis-text-muted animate-spin flex-shrink-0" />
       )}
-    </button>
+    </div>
   );
 }
 
@@ -79,16 +70,12 @@ interface ChatViewProps {
   messages: ChatMessage[];
   status: ConnectionStatus;
   isStreaming: boolean;
-  onSendMessage: (msg: string, msgType?: string, mode?: string, userPrompt?: string, attachments?: Attachment[], exportFormat?: string) => boolean;
+  onSendMessage: (msg: string, msgType?: string, userPrompt?: string, attachments?: Attachment[], exportFormat?: string) => boolean;
   onCancelGeneration?: () => void;
   onClearMessages: () => void;
   activeConnectorName?: string;
-  activeNodeId?: string | null;
-  completedNodeIds?: Set<string>;
-  failedNodeIds?: Set<string>;
   streamingContent?: string;
   statusText?: string | null;
-  agentState?: string;
   onOpenLLMPanel?: () => void;
   onOpenContextPanel?: () => void;
   onOpenMarketplace?: () => void;
@@ -102,12 +89,8 @@ export default function ChatView({
   onCancelGeneration,
   onClearMessages,
   activeConnectorName = 'GitHub',
-  activeNodeId,
-  completedNodeIds,
-  failedNodeIds,
   streamingContent,
   statusText,
-  agentState,
   onOpenLLMPanel,
   onOpenContextPanel,
   onOpenMarketplace,
@@ -116,22 +99,7 @@ export default function ChatView({
   const [inputVal, setInputVal] = useState('');
   const [savingMsgId, setSavingMsgId] = useState<string | null>(null);
   const [savedMsgId, setSavedMsgId] = useState<string | null>(null);
-  const [chatMode, setChatMode] = useState<'chat' | 'agent'>('chat');
 
-  // chatMode is otherwise a pure UI toggle with no memory of which mode a
-  // given conversation was actually in — switching away and back (or a full
-  // reload) always restarted it at 'chat', silently stripping the
-  // interactive Yes/No buttons off a plan (or a cookie-input prompt) that
-  // was still genuinely waiting on the user, even though the backend agent
-  // itself was untouched and still paused. Only ever corrects *into* Agent
-  // Mode when there's positive evidence (a non-IDLE backend state) that
-  // something is pending — never forces back to 'chat', which would stomp
-  // a normal manual mode switch in an otherwise-idle conversation.
-  useEffect(() => {
-    if (agentState && agentState !== 'IDLE') {
-      setChatMode('agent');
-    }
-  }, [agentState, sessionId]);
   const [hardwareStatus, setHardwareStatus] = useState<{active_model: string, active_model_display?: string, max_context?: number, ram_percent: number} | null>(null);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const modelMenuRef = useRef<HTMLDivElement>(null);
@@ -214,7 +182,7 @@ export default function ChatView({
   // arriving (matching Claude's own "Thought for 53s" label).
   const [thinkingSeconds, setThinkingSeconds] = useState(0);
   const [thoughtDurationSec, setThoughtDurationSec] = useState<number | null>(null);
-  const preContentPhase = isStreaming && chatMode === 'chat' && !streamingContent;
+  const preContentPhase = isStreaming && !streamingContent;
 
   useEffect(() => {
     if (!isStreaming) return;
@@ -234,7 +202,7 @@ export default function ChatView({
     // First token just arrived — freeze the elapsed time as the summary,
     // the same way Claude's live "Thinking…" becomes a static "Thought for
     // Xs" once the answer starts.
-    if (chatMode === 'chat' && streamingContent && thoughtDurationSec === null) {
+    if (streamingContent && thoughtDurationSec === null) {
       setThoughtDurationSec(thinkingSeconds);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -273,24 +241,12 @@ export default function ChatView({
   
 
   
-  // Plan Editing State
-  const [editingPlanId, setEditingPlanId] = useState<string | null>(null);
-  const [planEditContent, setPlanEditContent] = useState('');
-  
-
   const groupedMessages = useMemo(() => {
-    const groups: Array<{ type: 'message' | 'system' | 'thinking', content: ChatMessage[], id: string }> = [];
-    
+    const groups: Array<{ type: 'message' | 'system', content: ChatMessage[], id: string }> = [];
+
     messages.forEach(msg => {
       if (msg.role === 'system') {
         groups.push({ type: 'system', content: [msg], id: msg.id });
-      } else if (msg.msgType === 'thought' || msg.msgType === 'tool_call') {
-        const lastGroup = groups[groups.length - 1];
-        if (lastGroup && lastGroup.type === 'thinking') {
-          lastGroup.content.push(msg);
-        } else {
-          groups.push({ type: 'thinking', content: [msg], id: `thinking-${msg.id}` });
-        }
       } else {
         groups.push({ type: 'message', content: [msg], id: msg.id });
       }
@@ -388,10 +344,10 @@ export default function ChatView({
         fetchCapabilities();
       } else {
         const err = await res.json().catch(() => ({}));
-        onSendMessage(`[System] Couldn't add that skill: ${err.detail || 'invalid file'}`, 'toast', chatMode);
+        onSendMessage(`[System] Couldn't add that skill: ${err.detail || 'invalid file'}`, 'toast');
       }
     } catch {
-      onSendMessage('[System] Failed to upload the skill file.', 'toast', chatMode);
+      onSendMessage('[System] Failed to upload the skill file.', 'toast');
     } finally {
       setIsUploadingSkill(false);
       if (skillFileInputRef.current) skillFileInputRef.current.value = '';
@@ -409,14 +365,14 @@ export default function ChatView({
         body: JSON.stringify({ url, conversation_id: sessionId }),
       });
       if (!res.ok) {
-        onSendMessage('[System] Failed to start scraping that page.', 'toast', chatMode);
+        onSendMessage('[System] Failed to start scraping that page.', 'toast');
       }
       // Same deal as document upload: the backend broadcasts real progress
       // ("Opening..." -> "✅ Scraped..." / "❌ ...") over the websocket, so we
       // don't post an assumed-success message here.
     } catch (err) {
       console.error(err);
-      onSendMessage('[System] Failed to connect to the scraping endpoint.', 'toast', chatMode);
+      onSendMessage('[System] Failed to connect to the scraping endpoint.', 'toast');
     } finally {
       setIsScraping(false);
       setScrapeUrl('');
@@ -523,10 +479,10 @@ export default function ChatView({
             setInputVal(baseTextRef.current && text ? `${baseTextRef.current} ${text}` : (text || baseTextRef.current));
             textareaRef.current?.focus();
           } else {
-            onSendMessage('[System] Voice transcription failed.', 'toast', chatMode);
+            onSendMessage('[System] Voice transcription failed.', 'toast');
           }
         } catch {
-          onSendMessage('[System] Failed to connect to the voice transcription endpoint.', 'toast', chatMode);
+          onSendMessage('[System] Failed to connect to the voice transcription endpoint.', 'toast');
         } finally {
           setIsTranscribing(false);
         }
@@ -538,7 +494,7 @@ export default function ChatView({
       recorder.start(1000);
       setIsRecording(true);
     } catch {
-      onSendMessage('[System] Microphone access is required for voice input.', 'toast', chatMode);
+      onSendMessage('[System] Microphone access is required for voice input.', 'toast');
     }
   };
 
@@ -567,7 +523,7 @@ export default function ChatView({
         body: formData,
       });
       if (!res.ok) {
-        onSendMessage(`[System] Failed to upload document.`, 'toast', chatMode);
+        onSendMessage(`[System] Failed to upload document.`, 'toast');
         return;
       }
       // Uploading only starts ingestion in the background — it does NOT send
@@ -584,7 +540,7 @@ export default function ChatView({
       }]);
     } catch (err) {
       console.error(err);
-      onSendMessage(`[System] Failed to connect to upload endpoint.`, 'toast', chatMode);
+      onSendMessage(`[System] Failed to connect to upload endpoint.`, 'toast');
     } finally {
       setIsUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -623,7 +579,6 @@ export default function ChatView({
     const sent = onSendMessage(
       inputVal,
       'message',
-      chatMode,
       undefined,
       pendingAttachments.length > 0 ? pendingAttachments : undefined,
       pendingExportFormat || undefined
@@ -672,20 +627,6 @@ export default function ChatView({
               );
             }
 
-            if (group.type === 'thinking') {
-              const isLast = index === groupedMessages.length - 1;
-              const shouldPassStream = isLast && isStreaming && chatMode === 'agent';
-              
-              return (
-                <AgentThinking 
-                  key={group.id} 
-                  messages={group.content} 
-                  isStreaming={shouldPassStream}
-                  streamingContent={shouldPassStream ? streamingContent : undefined}
-                />
-              );
-            }
-
             const msg = group.content[0];
             const isUser = msg.role === 'user';
 
@@ -701,7 +642,7 @@ export default function ChatView({
                       {msg.attachments && msg.attachments.length > 0 && (
                         <div className="flex flex-col gap-2 items-end">
                           {msg.attachments.map(a => (
-                            <AttachmentChip key={a.document_id} attachment={a} status={docStatuses[a.document_id]} onPreview={() => setPreviewAttachment(a)} />
+                            <AttachmentChip key={a.document_id} attachment={a} status={docStatuses[a.document_id]} />
                           ))}
                         </div>
                       )}
@@ -720,16 +661,7 @@ export default function ChatView({
                     </div>
                   ) : (
                     <div className="text-[13px] leading-relaxed min-w-0 group">
-                      {!msg.isStreaming && parsePlanMarkdown(msg.content) ? (
-                        <PlanCard
-                          content={msg.content}
-                          interactive={index === groupedMessages.length - 1 && !isStreaming && chatMode === 'agent' && status === 'connected'}
-                          onApprove={() => onSendMessage('yes', 'message', chatMode)}
-                          onEdit={() => textareaRef.current?.focus()}
-                        />
-                      ) : (
-                        <MarkdownContent content={msg.content} />
-                      )}
+                      <MarkdownContent content={msg.content} />
                     </div>
                   )}
                 </div>
@@ -745,7 +677,7 @@ export default function ChatView({
              own backend substeps ("searching documents", "generating"…) to
              the user, so this doesn't either; that stays reserved for the
              standalone status line below (uploads/scrapes with no chat turn). */}
-        {isStreaming && chatMode === 'chat' && (
+        {isStreaming && (
           <div className="max-w-4xl mx-auto">
             <div className="max-w-2xl w-full space-y-2">
               {!streamingContent && (
@@ -770,21 +702,12 @@ export default function ChatView({
           </div>
         )}
 
-        {/* If in agent mode and the last group is not thinking, we need a fresh AgentThinking for the stream */}
-        {isStreaming && chatMode === 'agent' && (!groupedMessages.length || groupedMessages[groupedMessages.length - 1].type !== 'thinking') && (
-          <AgentThinking
-            messages={[]}
-            isStreaming={true}
-            streamingContent={streamingContent}
-          />
-        )}
-
         {/* Standalone status line — covers cases with no response bubble to
-            show it in yet: a document/scrape upload (no chat turn at all),
-            or Agent Mode before its first token arrives. During an active
-            Chat Mode turn this is already shown inline in the response
-            bubble's header, so it's suppressed here to avoid a duplicate. */}
-        {statusText && !(isStreaming && chatMode === 'chat') && (
+            show it in yet: a document/scrape upload (no chat turn at all).
+            During an active chat turn this is already shown inline in the
+            response bubble's header, so it's suppressed here to avoid a
+            duplicate. */}
+        {statusText && !isStreaming && (
           <div className="max-w-4xl mx-auto">
             <span className="text-[13px] text-aegis-text-muted">{statusText}</span>
           </div>
@@ -795,44 +718,23 @@ export default function ChatView({
 
       {/* ── Bottom Input Bar ─────────────────────────────── */}
       <div className="p-6 pt-2 bg-aegis-base max-w-4xl w-full mx-auto space-y-3">
-        {/* Mode Toggle — a real sliding segmented switch, not two separate buttons */}
-        <div className="flex justify-center">
-          <div className={`relative bg-aegis-overlay/60 p-1 rounded-lg flex items-center w-[180px] ${
-            isStreaming || !!activeNodeId ? 'opacity-50 pointer-events-none' : ''
-          }`}>
-            <div
-              className="absolute top-1 bottom-1 left-1 w-[calc(50%-4px)] bg-aegis-raised rounded-md shadow-sm transition-transform duration-200 ease-out"
-              style={{ transform: chatMode === 'agent' ? 'translateX(calc(100% + 8px))' : 'translateX(0)' }}
-            />
-            <button
-              onClick={() => {
-                if (chatMode === 'agent') onSendMessage('__system_mode_switch__', 'system');
-                setChatMode('chat');
-              }}
-              className={`relative z-10 flex-1 py-1.5 rounded-md text-xs font-semibold transition-colors ${
-                chatMode === 'chat' ? 'text-aegis-text-primary' : 'text-aegis-text-secondary'
-              }`}
-            >
-              Chat
-            </button>
-            <button
-              onClick={() => {
-                if (chatMode === 'chat') onSendMessage('__system_mode_switch__', 'system');
-                setChatMode('agent');
-                setPendingExportFormat(null);
-                // Documents are Chat Mode only now — an attachment left
-                // pending from before the switch would otherwise sit in
-                // the composer and go nowhere once sent in Agent Mode.
-                setPendingAttachments([]);
-              }}
-              className={`relative z-10 flex-1 py-1.5 rounded-md text-xs font-semibold transition-colors ${
-                chatMode === 'agent' ? 'text-aegis-primary-light' : 'text-aegis-text-secondary'
-              }`}
-            >
-              Agent
-            </button>
+        {pendingExportFormat && (
+          <div className="flex flex-wrap gap-2 mb-2">
+            <div className="flex items-center gap-2 bg-aegis-raised border border-aegis-border rounded-xl pl-3 pr-2 py-2">
+              <Download className="w-3.5 h-3.5 text-aegis-primary-light flex-shrink-0" />
+              <span className="text-[12px] text-aegis-text-primary">
+                Will export your next answer as {pendingExportFormat.toUpperCase()}
+              </span>
+              <button
+                onClick={() => setPendingExportFormat(null)}
+                className="text-aegis-text-muted hover:text-aegis-error p-0.5"
+                title="Cancel export"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
-        </div>
+        )}
 
         {pendingExportFormat && (
           <div className="flex flex-wrap gap-2 mb-2">
@@ -849,6 +751,34 @@ export default function ChatView({
                 <X className="w-3.5 h-3.5" />
               </button>
             </div>
+          </div>
+        )}
+
+        {pendingAttachments.length > 0 && (
+          <div className="flex flex-wrap gap-2 mb-2">
+            {pendingAttachments.map(a => (
+              <div
+                key={a.document_id}
+                className="flex items-center gap-2 bg-aegis-raised border border-aegis-border rounded-xl pl-3 pr-2 py-2"
+              >
+                <FileText className="w-3.5 h-3.5 text-aegis-primary-light flex-shrink-0" />
+                <span className="text-[12px] text-aegis-text-primary truncate max-w-[160px]">{a.filename}</span>
+                {docStatuses[a.document_id] === 'failed' ? (
+                  <XCircle className="w-3.5 h-3.5 text-aegis-error flex-shrink-0" />
+                ) : docStatuses[a.document_id] === 'ready' ? (
+                  <CheckCircle2 className="w-3.5 h-3.5 text-aegis-success flex-shrink-0" />
+                ) : (
+                  <Loader2 className="w-3.5 h-3.5 text-aegis-text-muted animate-spin flex-shrink-0" />
+                )}
+                <button
+                  onClick={() => setPendingAttachments(prev => prev.filter(p => p.document_id !== a.document_id))}
+                  className="text-aegis-text-muted hover:text-aegis-error p-0.5"
+                  title="Remove attachment"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ))}
           </div>
         )}
 
@@ -882,40 +812,7 @@ export default function ChatView({
           </div>
         )}
 
-        {scrapeBarOpen && (
-          <div className="flex items-center gap-2 mb-2 bg-aegis-raised border border-aegis-border rounded-xl px-3 py-2">
-            <Globe className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />
-            <input
-              autoFocus
-              type="url"
-              value={scrapeUrl}
-              onChange={(e) => setScrapeUrl(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') handleScrapeSubmit(); if (e.key === 'Escape') setScrapeBarOpen(false); }}
-              placeholder="https://example.com — paste a URL to scrape"
-              disabled={isScraping}
-              className="flex-1 bg-transparent text-xs text-aegis-text-primary placeholder:text-aegis-text-muted focus:outline-none"
-            />
-            <button
-              onClick={handleScrapeSubmit}
-              disabled={isScraping || !scrapeUrl.trim()}
-              className="text-[12px] font-medium text-white bg-aegis-primary hover:bg-aegis-primary-dark px-3 py-1 rounded-lg transition-colors disabled:opacity-50"
-            >
-              {isScraping ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : 'Scrape'}
-            </button>
-            <button
-              onClick={() => setScrapeBarOpen(false)}
-              className="text-aegis-text-muted hover:text-aegis-text-secondary p-1"
-            >
-              <X className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        )}
-
-        <div className={`relative bg-aegis-raised border rounded-2xl shadow-sm focus-within:ring-1 transition-all ${
-          chatMode === 'agent'
-            ? 'border-aegis-primary/30 focus-within:border-aegis-primary focus-within:ring-aegis-primary/20'
-            : 'border-aegis-border focus-within:border-aegis-primary focus-within:ring-aegis-primary'
-        }`}>
+        <div className="relative bg-aegis-raised border border-aegis-border rounded-2xl shadow-sm focus-within:ring-1 focus-within:border-aegis-primary focus-within:ring-aegis-primary transition-all">
           <textarea
             ref={textareaRef}
             value={inputVal}
@@ -925,7 +822,7 @@ export default function ChatView({
               e.target.style.height = `${Math.min(e.target.scrollHeight, 160)}px`;
             }}
             onKeyDown={handleKeyDown}
-            placeholder={status === 'connected' ? (chatMode === 'agent' ? 'Ask Agent to perform a task...' : 'Message Aegis...') : 'Connecting to backend...'}
+            placeholder={status === 'connected' ? 'Message Aegis...' : 'Connecting to backend...'}
             disabled={status !== 'connected' || isStreaming}
             rows={1}
             className="w-full bg-transparent text-xs text-aegis-text-primary placeholder:text-aegis-text-muted resize-none px-4 pt-3.5 pb-12 focus:outline-none leading-relaxed"
@@ -956,95 +853,43 @@ export default function ChatView({
                 <>
                   <div className="fixed inset-0 z-10" onClick={() => setAttachMenuOpen(false)} />
                   <div className="absolute bottom-full left-0 mb-2 w-72 max-h-[26rem] overflow-y-auto bg-aegis-raised border border-aegis-border rounded-xl shadow-lg py-1.5 z-20">
-                    {/* Chat Mode only — documents/attachments are no longer
-                        handled in Agent Mode at all (backend's _handle_idle
-                        agent branch now nudges to Chat Mode if a message
-                        somehow arrives with one attached, rather than
-                        silently ignoring it). Hidden here so Agent Mode
-                        never offers an upload path that leads nowhere. */}
-                    {chatMode === 'chat' && (
+                    <button
+                      onClick={() => { setAttachMenuOpen(false); fileInputRef.current?.click(); }}
+                      className="w-full flex items-center gap-2.5 px-3.5 py-2 text-[13px] text-aegis-text-primary hover:bg-aegis-overlay transition-colors"
+                    >
+                      <Paperclip className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
+                      <span className="whitespace-nowrap">Upload Document</span>
+                    </button>
+
+                    {/* Export — one "Export" row expands to the PDF/DOCX/XLSX
+                        choices rather than showing all three as separate
+                        top-level rows. Picking a format skips the model
+                        having to guess export intent from free text — it's
+                        attached to the next message like a pending
+                        attachment and applies automatically once sent
+                        (backend's deterministic _classify_export_intent
+                        path, chat.py). */}
+                    <div className="mt-1 pt-1.5 border-t border-aegis-border">
                       <button
-                        onClick={() => { setAttachMenuOpen(false); fileInputRef.current?.click(); }}
+                        onClick={() => setExportSubmenuOpen(v => !v)}
                         className="w-full flex items-center gap-2.5 px-3.5 py-2 text-[13px] text-aegis-text-primary hover:bg-aegis-overlay transition-colors"
                       >
-                        <Paperclip className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
-                        <span className="whitespace-nowrap">Upload Document</span>
+                        <Download className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
+                        <span className="flex-1 text-left whitespace-nowrap">Export</span>
+                        <ChevronDown className={`w-3.5 h-3.5 text-aegis-text-muted flex-shrink-0 transition-transform ${exportSubmenuOpen ? 'rotate-180' : ''}`} />
                       </button>
-                    )}
-
-                    {/* Export — Chat Mode only. One "Export" row expands to
-                        the PDF/DOCX/XLSX choices rather than showing all
-                        three as separate top-level rows. Picking a format
-                        skips the agent having to guess export intent from
-                        free text — it's attached to the next message like a
-                        pending attachment and applies automatically once
-                        sent (backend's deterministic _classify_export_intent
-                        path, chat.py). Agent Mode does have a backend
-                        export_file tool (writes a generated PDF/DOCX/XLSX
-                        straight to a path on disk), but no menu entry point
-                        here yet — its planner picks the tool up from plain
-                        free-text instructions instead (e.g. "export this as
-                        a PDF to Documents/report.pdf"). */}
-                    {chatMode === 'chat' && (
-                      <div className="mt-1 pt-1.5 border-t border-aegis-border">
+                      {exportSubmenuOpen && (['pdf', 'docx', 'xlsx'] as const).map(fmt => (
                         <button
-                          onClick={() => setExportSubmenuOpen(v => !v)}
-                          className="w-full flex items-center gap-2.5 px-3.5 py-2 text-[13px] text-aegis-text-primary hover:bg-aegis-overlay transition-colors"
+                          key={fmt}
+                          onClick={() => { setAttachMenuOpen(false); setPendingExportFormat(fmt); }}
+                          className="w-full flex items-center gap-2.5 pl-9 pr-3.5 py-2 text-[13px] text-aegis-text-primary hover:bg-aegis-overlay transition-colors"
                         >
-                          <Download className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
-                          <span className="flex-1 text-left whitespace-nowrap">Export</span>
-                          <ChevronDown className={`w-3.5 h-3.5 text-aegis-text-muted flex-shrink-0 transition-transform ${exportSubmenuOpen ? 'rotate-180' : ''}`} />
+                          <span className="whitespace-nowrap">{fmt.toUpperCase()}</span>
                         </button>
-                        {exportSubmenuOpen && (['pdf', 'docx', 'xlsx'] as const).map(fmt => (
-                          <button
-                            key={fmt}
-                            onClick={() => { setAttachMenuOpen(false); setPendingExportFormat(fmt); }}
-                            className="w-full flex items-center gap-2.5 pl-9 pr-3.5 py-2 text-[13px] text-aegis-text-primary hover:bg-aegis-overlay transition-colors"
-                          >
-                            <span className="whitespace-nowrap">{fmt.toUpperCase()}</span>
-                          </button>
-                        ))}
-                      </div>
-                    )}
+                      ))}
+                    </div>
 
-                    {/* Tools — installed once via the Marketplace, switched
-                        on/off here per chat (the toggle controls whether the
-                        agent can invoke it). Clicking a row runs its manual
-                        one-off action — e.g. Web Scraping opens the URL bar.
-                        Agent-Mode-only: Chat Mode does no tool calling at
-                        all, so this section (and the scrape bar it can open)
-                        would otherwise be a dead end there. */}
-                    {chatMode === 'agent' && (
-                      <>
-                        <div className="mt-1 pt-1.5 border-t border-aegis-border px-3.5 pb-1 text-[11px] font-semibold text-aegis-text-muted uppercase tracking-wide">
-                          Tools
-                        </div>
-                        {capTools.length === 0 ? (
-                          <button
-                            onClick={() => { setAttachMenuOpen(false); onOpenMarketplace?.(); }}
-                            className="w-full flex items-center gap-2.5 px-3.5 py-2 text-[13px] text-aegis-text-muted hover:bg-aegis-overlay hover:text-aegis-text-primary transition-colors"
-                          >
-                            <Store className="w-4 h-4 flex-shrink-0" />
-                            <span className="whitespace-nowrap">Add tools from Marketplace</span>
-                          </button>
-                        ) : (
-                          capTools.map(tool => (
-                            <div key={tool.id} className="w-full flex items-center gap-2.5 px-3.5 py-2 text-[13px] text-aegis-text-primary hover:bg-aegis-overlay transition-colors">
-                              <button
-                                onClick={() => handleToolClick(tool.id)}
-                                className="flex items-center gap-2.5 flex-1 min-w-0 text-left"
-                              >
-                                <Globe className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
-                                <span className="flex-1 truncate">{tool.name}</span>
-                              </button>
-                              <ToggleSwitch checked={tool.active} onChange={(v) => toggleCapability('tool', tool.id, v)} />
-                            </div>
-                          ))
-                        )}
-                      </>
-                    )}
-
-                    {/* Skills — pure guidance the chat agent (Chat Mode)
+                    {/* Skills — pure guidance the chat agent
                         draws on automatically when relevant, only while on. */}
                     <div className="mt-1 pt-1.5 border-t border-aegis-border px-3.5 pb-1 text-[11px] font-semibold text-aegis-text-muted uppercase tracking-wide">
                       Skills
@@ -1230,15 +1075,6 @@ export default function ChatView({
           Press <span className="font-semibold text-aegis-text-secondary">Enter</span> to send • Aegis can generate errors. Verify important information.
         </p>
       </div>
-
-      {previewAttachment && (
-        <DocumentPreviewModal
-          documentId={previewAttachment.document_id}
-          filename={previewAttachment.filename}
-          fileType={previewAttachment.file_type}
-          onClose={() => setPreviewAttachment(null)}
-        />
-      )}
     </div>
   );
 }

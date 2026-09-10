@@ -2,11 +2,11 @@ import json
 import logging
 from typing import Optional, List
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, text
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 
-from app.db.models import User, ModelRegistry, MCPServer, MCPTool
+from app.db.models import User, ModelRegistry, MCPServer, MCPTool, ChatMessage
 
 logger = logging.getLogger(__name__)
 
@@ -401,19 +401,25 @@ from app.db.models import ChatMessage
 def add_chat_message(
     db: Session, conversation_id: str, role: str, content: str,
     attachments: Optional[list] = None, msg_type: Optional[str] = None,
+    rag_sources: Optional[list] = None,
 ) -> ChatMessage:
     """Adds a new message to the persistent chat history. `attachments` is an
     optional list of {document_id, filename, file_type} dicts — set when this
     message represents an uploaded document, so it renders as an attachment
     chip in the transcript (see get_chat_history_with_attachments). `msg_type`
     of 'tool_call' marks internal-only entries that should replay into the
-    collapsed "Agent is working" card instead of a normal chat bubble."""
+    collapsed "Agent is working" card instead of a normal chat bubble.
+    `rag_sources` is an optional list of {id, content, filename, document_id}
+    dicts — the document chunks actually used to answer THIS turn, if any,
+    so a later turn's weak/empty search can backfill from them (see
+    ChatAgent._backfill_sources_from_history)."""
     msg = ChatMessage(
         conversation_id=conversation_id,
         role=role,
         content=content,
         attachments_json=json.dumps(attachments) if attachments else None,
         msg_type=msg_type,
+        rag_sources_json=json.dumps(rag_sources) if rag_sources else None,
     )
     db.add(msg)
     db.commit()
@@ -461,6 +467,51 @@ def get_chat_history_with_attachments(db: Session, conversation_id: str) -> List
             entry["msg_type"] = m.msg_type
         result.append(entry)
     return result
+
+def search_messages(db: Session, query: str, conversation_id: Optional[str] = None, limit: int = 30) -> List[dict]:
+    """
+    Full-text search over chat message content via chat_messages_fts (see
+    app.db.database's init_db — internal-only tool-call bookkeeping entries
+    are excluded at index time, not here, so they never surface as a
+    result). Query terms are individually double-quoted before being sent
+    to FTS5's MATCH so a raw user string can never be interpreted as FTS5
+    query syntax (column filters, boolean operators, a leading '-') — just
+    literal word matches, ANDed together.
+    """
+    terms = query.strip().split()
+    if not terms:
+        return []
+    fts_query = " ".join('"' + t.replace('"', '""') + '"' for t in terms)
+
+    sql = """
+        SELECT cm.id, cm.conversation_id, cm.role, cm.created_at,
+               snippet(chat_messages_fts, 0, '**', '**', '…', 12) AS snippet
+        FROM chat_messages_fts
+        JOIN chat_messages cm ON cm.id = chat_messages_fts.rowid
+        WHERE chat_messages_fts MATCH :query
+    """
+    params: dict = {"query": fts_query, "limit": limit}
+    if conversation_id:
+        sql += " AND cm.conversation_id = :conversation_id"
+        params["conversation_id"] = conversation_id
+    sql += " ORDER BY rank LIMIT :limit"
+
+    rows = db.execute(text(sql), params).fetchall()
+    return [
+        {
+            "message_id": r.id,
+            "conversation_id": r.conversation_id,
+            "role": r.role,
+            # A raw text() query bypasses the ORM's usual str->datetime
+            # coercion for SQLite, so this is already the driver's plain
+            # string value (SQLAlchemy's ISO8601-ish default) — not a
+            # datetime object to call .isoformat() on.
+            "created_at": r.created_at,
+            "snippet": r.snippet,
+        }
+        for r in rows
+    ]
+
 
 def get_all_sessions(db: Session) -> List[dict]:
     """Retrieves all distinct chat sessions, with the first user message as a preview."""
@@ -571,6 +622,13 @@ def log_setting_change(db: Session, setting_path: str, old_value: str, new_value
         if ids_to_delete:
             db.query(SettingsHistory).filter(SettingsHistory.id.in_(ids_to_delete)).delete(synchronize_session=False)
             db.commit()
+
+def get_mcp_server_by_name(db: Session, server_name: str) -> Optional[MCPServer]:
+    """Looks up a single saved MCP server row by name, connected or not — used by the
+    generic reload path (app.mcp.registry.reconnect_from_saved_config) to re-read its
+    stored config_json regardless of current in-memory connection state."""
+    return db.query(MCPServer).filter(MCPServer.name == server_name).first()
+
 
 def get_all_connected_servers(db: Session) -> List[MCPServer]:
     """Returns all servers marked as connected in the DB."""
@@ -722,3 +780,25 @@ def set_capability_active(db: Session, conversation_id: str, capability_type: st
             conversation_id=conversation_id, capability_type=capability_type, capability_id=capability_id,
         ))
         db.commit()
+
+
+# ── Chat-connected workflows ─────────────────────────────────────────────────
+from app.db.models import Workflow
+
+
+def get_active_chat_workflow(db: Session) -> Optional[Workflow]:
+    """The one workflow (if any) currently connected to power real chat
+    messages — see app.core.workflows.engine.run_chat_workflow and the
+    /set-chat-handler, /unset-chat-handler endpoints in app.api.workflows.
+    At most one row ever has is_chat_handler=True, enforced there."""
+    return db.query(Workflow).filter(Workflow.is_chat_handler == True).first()  # noqa: E712
+
+
+# ─── Token Usage / Analytics ─────────────────────────────────────────────────
+
+from app.db.models import TokenUsage
+from datetime import datetime as _datetime, timedelta as _timedelta
+
+
+# ── Per-conversation Tool/Skill activation ──────────────────────────────────
+from app.db.models import ConversationDisabledCapability

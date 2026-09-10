@@ -194,6 +194,10 @@ class MCPServerRegistry:
         """Which connected server (== its catalog key) provides this tool, if any."""
         return self._tool_to_server.get(tool_name)
 
+    def get_server_for_tool(self, tool_name: str) -> Optional[str]:
+        """Which connected server (== its catalog key) provides this tool, if any."""
+        return self._tool_to_server.get(tool_name)
+
     def call_tool(self, tool_name: str, arguments: dict) -> str:
         """Routes a tool call to the server providing it."""
         server_name = self._tool_to_server.get(tool_name)
@@ -216,6 +220,50 @@ class MCPServerRegistry:
                 "tools_count": len(client.cached_tools)
             }
         return status
+
+
+def reconnect_from_saved_config(db: Session, server: "MCPServer") -> List[dict]:
+    """
+    (Re-)connects a saved MCPServer row from its stored config_json, dispatching on
+    config["type"] the same way for every caller — main.py's startup auto-restore and
+    the generic /api/connectors/{name}/reload endpoint both call this instead of each
+    keeping their own copy of the catalog/oauth/custom dispatch logic.
+
+    Raises on a missing/unparseable config_json or an unknown config type — callers
+    decide how to surface that (log-and-skip on startup, a 4xx from the reload route).
+    """
+    import json as _json
+    from app.mcp.catalog import resolve_connector_command
+
+    if not server.config_json:
+        raise ValueError(f"Server '{server.name}' has no saved config_json to reconnect from.")
+
+    config = _json.loads(server.config_json)
+    config_type = config.get("type")
+
+    if config_type == "catalog":
+        command = resolve_connector_command(config["server_name"], config.get("input_params") or {})
+        return mcp_registry.connect_server(
+            server_name=config["server_name"],
+            command=command,
+            env=config.get("env"),
+            db=db,
+            config_json=config,
+        )
+    elif config_type in ("oauth", "custom"):
+        # OAuth servers (GitHub, Slack, Notion, ...) store their resolved
+        # command + access token (in env) at connect time — same shape as
+        # a custom server from here on, just re-launched verbatim.
+        server_name = config.get("service_name") or config.get("server_name")
+        return mcp_registry.connect_server(
+            server_name=server_name,
+            command=config["command"],
+            env=config.get("env"),
+            db=db,
+            config_json=config,
+        )
+    else:
+        raise ValueError(f"Unknown config type '{config_type}' for server '{server.name}'.")
 
 
 # Global singleton registry instance

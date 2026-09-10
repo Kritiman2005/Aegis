@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   Link2,
+  Plug,
   Cpu,
   Database,
   MessageSquarePlus,
@@ -13,10 +14,37 @@ import {
   Store,
   LogOut,
   Loader2,
+  Workflow,
+  Search,
+  X,
 } from 'lucide-react';
 import { AegisMark } from './AegisLogo';
 
-export type TabType = 'chat' | 'connectors' | 'llms' | 'discover' | 'history' | 'sync_detail' | 'model_hub' | 'context' | 'analytics' | 'marketplace';
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
+
+interface SearchResult {
+  message_id: number;
+  conversation_id: string;
+  role: string;
+  created_at: string;
+  snippet: string;
+}
+
+// Snippets come straight from stored chat message content (via SQLite's
+// snippet()), which can legitimately contain "<", "&", etc. if a user ever
+// pasted HTML/code into a chat — escape it before the ** -> <mark> swap so
+// dangerouslySetInnerHTML only ever renders tags this function itself adds.
+function highlightSnippet(snippet: string): string {
+  const escaped = snippet
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+  return escaped.replace(/\*\*(.+?)\*\*/g, '<mark>$1</mark>');
+}
+
+export type TabType = 'chat' | 'connectors' | 'mcp_servers' | 'workflows' | 'llms' | 'discover' | 'history' | 'sync_detail' | 'model_hub' | 'context' | 'analytics' | 'marketplace';
 
 export interface AccountStatus {
   logged_in: boolean;
@@ -41,7 +69,9 @@ interface SidebarProps {
 }
 
 const NAV_ITEMS = [
-  { id: 'connectors'  as TabType, label: 'Connectors', icon: Link2 },
+  { id: 'workflows'    as TabType, label: 'Workflows', icon: Workflow },
+  { id: 'connectors'   as TabType, label: 'Connectors', icon: Link2 },
+  { id: 'mcp_servers'  as TabType, label: 'MCP Servers', icon: Plug },
   { id: 'marketplace' as TabType, label: 'Marketplace', icon: Store },
   { id: 'llms'        as TabType, label: 'LLMs',        icon: Cpu },
   { id: 'context'     as TabType, label: 'Context & Memory', icon: Database },
@@ -62,6 +92,29 @@ export default function Sidebar({
 }: SidebarProps) {
   const [recentsOpen, setRecentsOpen] = useState(true);
   const navItems = NAV_ITEMS.filter(item => item.id !== 'connectors' || connectorsEnabled);
+
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searching, setSearching] = useState(false);
+
+  // Debounced full-text search over chat history (app.db.crud.search_messages)
+  // — replaces the Recents list with matching messages while a query is active.
+  useEffect(() => {
+    const q = searchQuery.trim();
+    if (!q) { setSearchResults([]); setSearching(false); return; }
+    setSearching(true);
+    const t = setTimeout(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/chat/search?q=${encodeURIComponent(q)}`);
+        if (res.ok) setSearchResults((await res.json()).results || []);
+      } catch (e) {
+        // backend not reachable — leave previous results as-is
+      } finally {
+        setSearching(false);
+      }
+    }, 300);
+    return () => clearTimeout(t);
+  }, [searchQuery]);
 
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
@@ -130,7 +183,46 @@ export default function Sidebar({
           New Chat
         </button>
 
-        {/* ── Recents Section ─────────────────────────────────────────── */}
+        {/* Search chat history */}
+        <div className="pt-2 relative">
+          <Search className="w-3.5 h-3.5 text-aegis-sidebar-text-muted absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+          <input
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+            placeholder="Search chats…"
+            className="w-full bg-aegis-sidebar-raised border border-transparent focus:border-aegis-primary/40 rounded-lg pl-7 pr-7 py-1.5 text-[12px] text-aegis-sidebar-text placeholder:text-aegis-sidebar-text-muted focus:outline-none transition-colors"
+          />
+          {searchQuery && (
+            <button
+              onClick={() => setSearchQuery('')}
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-aegis-sidebar-text-muted hover:text-aegis-sidebar-text"
+            >
+              {searching ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <X className="w-3.5 h-3.5" />}
+            </button>
+          )}
+        </div>
+
+        {searchQuery.trim() ? (
+          <div className="mt-1 space-y-0.5">
+            {searchResults.length === 0 ? (
+              <p className="px-3 py-2 text-[12px] text-aegis-sidebar-text-muted">{searching ? 'Searching…' : 'No matches.'}</p>
+            ) : (
+              searchResults.map(r => (
+                <button
+                  key={r.message_id}
+                  onClick={() => { onSelectSession?.(r.conversation_id); setActiveTab('chat'); setSearchQuery(''); }}
+                  className="w-full text-left px-3 py-2 rounded-lg hover:bg-aegis-sidebar-raised transition-colors"
+                >
+                  <div
+                    className="text-[12px] text-aegis-sidebar-text-muted truncate [&_mark]:bg-transparent [&_mark]:text-aegis-primary-light [&_mark]:font-semibold"
+                    dangerouslySetInnerHTML={{ __html: highlightSnippet(r.snippet) }}
+                  />
+                </button>
+              ))
+            )}
+          </div>
+        ) : (
+        /* ── Recents Section ─────────────────────────────────────────── */
         <div className="pt-2">
           <button
             onClick={() => setRecentsOpen(v => !v)}
@@ -192,6 +284,7 @@ export default function Sidebar({
             </div>
           )}
         </div>
+        )}
       </nav>
 
       {/* ── User Footer ─────────────────────────────────────────────────── */}

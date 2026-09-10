@@ -39,6 +39,7 @@ protocol.registerSchemesAsPrivileged([
 
 import path from 'path';
 import http from 'http';
+import fs from 'fs';
 import { spawn, ChildProcess } from 'child_process';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -68,6 +69,34 @@ const ASSETS_ROOT = IS_DEV
 // dev-mode dock icon below) — the packaged .app/.icns is what actually
 // brands the Dock/Finder icon on mac, this is just the in-window one.
 const APP_ICON_PATH = path.join(ASSETS_ROOT, process.platform === 'win32' ? 'icon.ico' : 'icon.png');
+
+// app.getPath('userData') defaults to app.name, which Electron reads from
+// package.json's "name" field ("aegis-desktop") — NOT electron-builder's
+// build.productName ("Aegis") used for the installer, Start Menu entry, and
+// window title. Left at the default, every user's actual data folder was
+// %APPDATA%\aegis-desktop (or the macOS/Linux equivalent) — an internal npm
+// package name nobody sees anywhere else in the app, confusing for anyone
+// trying to find, back up, or clear their own data by the name they
+// actually know it by. Must be called before anything reads
+// app.getPath('userData') for the first time — spawnSidecar() below is that
+// first read, so this runs at module load, well before app.whenReady().
+app.setName('Aegis');
+
+// One-time migration for anyone who already has data under the pre-fix
+// default path above — renamed, not recreated, so an existing install's
+// chat history, downloaded models, and embeddings aren't silently orphaned
+// by this rename. Must run before spawnSidecar()'s first read of
+// app.getPath('userData'), same reason as setName() above.
+try {
+  const oldUserDataPath = path.join(app.getPath('appData'), 'aegis-desktop');
+  const newUserDataPath = app.getPath('userData');
+  if (fs.existsSync(oldUserDataPath) && !fs.existsSync(newUserDataPath)) {
+    fs.renameSync(oldUserDataPath, newUserDataPath);
+    console.log(`[Aegis] Migrated data folder: ${oldUserDataPath} -> ${newUserDataPath}`);
+  }
+} catch (err) {
+  console.error('[Aegis] Failed to migrate old aegis-desktop data folder:', err);
+}
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -370,6 +399,12 @@ app.whenReady().then(async () => {
   Menu.setApplicationMenu(buildAppMenu());
   configureCSP();
   registerIpcHandlers();
+
+  // macOS dock icon: only needed in dev — a packaged .app already carries
+  // its icon from build.mac.icon (assets/icon.icns) via electron-builder.
+  if (IS_DEV && process.platform === 'darwin' && app.dock) {
+    app.dock.setIcon(APP_ICON_PATH);
+  }
 
   // macOS dock icon: only needed in dev — a packaged .app already carries
   // its icon from build.mac.icon (assets/icon.icns) via electron-builder.

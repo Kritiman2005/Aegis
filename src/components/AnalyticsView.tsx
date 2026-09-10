@@ -165,7 +165,7 @@ export default function AnalyticsView() {
   }, [fetchAnalytics]);
 
   return (
-    <div className="flex-1 flex flex-col bg-aegis-base overflow-hidden">
+    <div className="flex-1 overflow-y-auto bg-aegis-base">
       <div className="px-8 pt-8 pb-5">
         <div className="flex items-center gap-3 mb-1">
           <BarChart3 className="w-6 h-6 text-aegis-primary" />
@@ -174,7 +174,7 @@ export default function AnalyticsView() {
         <p className="text-sm text-aegis-text-secondary">Real token usage, computed from your local model's own tokenizer.</p>
       </div>
 
-      <div className="flex-1 overflow-y-auto px-8 pb-8 space-y-4">
+      <div className="px-8 pb-8 space-y-4">
         {loading ? (
           <p className="text-sm text-aegis-text-muted">Loading...</p>
         ) : !data ? (

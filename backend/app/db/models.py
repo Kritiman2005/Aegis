@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Text, Boolean, BigInteger, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Text, Boolean, BigInteger, DateTime, ForeignKey, Float, Float
 from sqlalchemy.orm import relationship
 from app.db.database import Base
 
@@ -36,6 +36,14 @@ class ModelRegistry(Base):
     context_length = Column(Integer, default=4096)
     is_active = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Vision support: a model is multimodal only once its paired mmproj (CLIP
+    # vision tower) file has also finished downloading — see llm_manager.py's
+    # MTMDChatHandler wiring, which needs mmproj_path to build a chat_handler.
+    is_vision = Column(Boolean, default=False)
+    mmproj_filename = Column(String, nullable=True)
+    mmproj_path = Column(String, nullable=True)
+    mmproj_status = Column(String, nullable=True)  # 'downloading', 'downloaded', 'failed'
 
     # Vision support: a model is multimodal only once its paired mmproj (CLIP
     # vision tower) file has also finished downloading — see llm_manager.py's
@@ -120,6 +128,13 @@ class UserDocument(Base):
     # longer vision-capable by the time the message is actually sent, rather
     # than silently answering as if the image were never attached.
     ocr_skipped_for_vision = Column(Boolean, default=False)
+    # True when upload-time OCR was skipped because a vision model was
+    # active then (see api/documents.py's skip_ocr) — lets
+    # ChatAgent._get_document_context (chat.py) notice, at send time, that
+    # this image has NO searchable content at all if the active model is no
+    # longer vision-capable by the time the message is actually sent, rather
+    # than silently answering as if the image were never attached.
+    ocr_skipped_for_vision = Column(Boolean, default=False)
     # SHA-256 of the raw uploaded bytes — lets a re-upload of the exact same
     # file within the same conversation reuse the existing row/embeddings
     # instead of re-ingesting a duplicate (see api/documents.py's upload
@@ -127,6 +142,110 @@ class UserDocument(Base):
     # legitimately exist once per conversation, just not more than once
     # within one.
     content_hash = Column(String, index=True, nullable=True)
+
+class Workflow(Base):
+    """
+    A user-designed workflow graph (n8n-style canvas) — replaces Agent Mode's
+    LLM-driven tool selection: the user wires which tool runs at each step by
+    hand, so there's no "guess the right tool from a menu" step for a local
+    model to hallucinate on. graph_json stores React Flow's own {nodes, edges}
+    shape verbatim (no backend-side translation layer) — see
+    app.core.workflows.engine for how it's interpreted at run time.
+    """
+    __tablename__ = "workflows"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    graph_json = Column(Text, nullable=False)  # JSON: {"nodes": [...], "edges": [...]}
+    # At most one workflow may have this set — it becomes the live handler
+    # for real chat messages (see app.core.workflows.engine.run_chat_workflow
+    # and the /set-chat-handler, /unset-chat-handler endpoints in
+    # app.api.workflows). False for every workflow = chat uses the built-in
+    # ChatAgent pipeline exactly as before this feature existed.
+    is_chat_handler = Column(Boolean, default=False, nullable=False)
+    # Same idea as is_chat_handler, but for document uploads — at most one
+    # workflow may have this set; it becomes the live handler run by
+    # app.core.workflows.engine.run_ingestion_workflow in place of the
+    # built-in app.core.rag.processor.ingest_document for every future
+    # upload (see app.api.documents's upload handler and the
+    # /set-ingestion-handler, /unset-ingestion-handler endpoints).
+    is_ingestion_handler = Column(Boolean, default=False, nullable=False)
+    # Null for a user-authored workflow. Set to app.core.workflows.seed's
+    # SEED_VERSION for the built-in "Aegis Default Chat Pipeline" — lets
+    # startup detect an old copy of that seed still sitting in an existing
+    # install and overwrite it with the current shape (see seed.py) instead
+    # of silently leaving a stale demo behind forever just because a row
+    # with that name already exists.
+    seed_version = Column(Integer, nullable=True)
+    # Null for a user-authored workflow. A stable, never-shown identifier
+    # for one of seed.py's built-in demo workflows (e.g.
+    # "default_chat_pipeline") — distinct from `name`, which is a plain
+    # editable text field on the canvas toolbar. Looking a seed row up by
+    # `name` alone breaks the moment a user renames it (even temporarily,
+    # then back): the next startup's by-name lookup misses the renamed row
+    # and inserts a fresh duplicate under the canonical name, permanently
+    # orphaning the original. seed_key lookups survive that; see seed.py's
+    # module docstring for the one-time adoption/cleanup of any duplicate
+    # this already caused on an existing install.
+    seed_key = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class InstalledDatabase(Base):
+    """
+    A database or vector store the user installed from the Marketplace's
+    Databases category, for use from a workflow's "database"/"vector" node
+    (see app.core.workflows.engine and app.core.dbengines). engine_id names
+    one entry in app.core.dbengines.registry's catalog (e.g. "sqlite",
+    "duckdb", "qdrant", "lancedb", "chromadb") — sqlite/qdrant run in-process
+    (already bundled), everything else runs through a portable `uv run
+    --with <package>` subprocess downloaded on first use, same mechanism
+    app.mcp.runtime_manager already uses for MCP servers.
+    """
+    __tablename__ = "installed_databases"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)              # user-given, shown in the workflow node picker
+    engine_id = Column(String, nullable=False)          # see app.core.dbengines.registry
+    category = Column(String, nullable=False)           # "relational" | "vector"
+    storage_path = Column(String, nullable=False)       # file/dir under AEGIS_DATA_DIR/databases/<uuid>
+    config_json = Column(Text, nullable=True)           # relational: {"schema": "<DDL>"} ; vector: {"embedding_model", "distance", "dim"}
+    status = Column(String, default="installing")        # 'installing' | 'ready' | 'failed'
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    # True only for the one auto-registered row representing Aegis's own
+    # bundled hybrid document store (engine_id "aegis_hybrid" — see
+    # app.core.workflows.engine's module docstring and
+    # app.api.marketplace_databases, which refuses to let this be deleted).
+    # False (the default) for everything a user installs themselves.
+    is_builtin = Column(Boolean, default=False, nullable=False)
+
+
+class EmbeddingModelRegistry(Base):
+    """
+    An embedding model downloaded from the Marketplace's Embedding Models
+    category (app.api.marketplace_embeddings) — one of fastembed's own
+    supported dense text-embedding models (app.core.embeddings.registry).
+    Each gets its own cache_dir (AEGIS_DATA_DIR/embedding_models/<uuid>)
+    rather than sharing fastembed's default cache, so deleting one is a
+    plain rmtree with no HuggingFace cache-layout guessing. A workflow
+    "vector" node picks one by model_id (data.embeddingModel) — see
+    app.core.embeddings.manager.get_embedder.
+    """
+    __tablename__ = "embedding_models"
+
+    id = Column(Integer, primary_key=True, index=True)
+    model_id = Column(String, unique=True, nullable=False)   # fastembed catalog id, e.g. "BAAI/bge-base-en-v1.5"
+    display_name = Column(String, nullable=False)
+    dim = Column(Integer, nullable=False)
+    size_gb = Column(Float, nullable=True)
+    cache_dir = Column(String, nullable=False)
+    status = Column(String, default="downloading")  # 'downloading' | 'downloaded' | 'failed'
+    error_message = Column(Text, nullable=True)
+    is_active = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 
 class ScheduledJob(Base):
     """
@@ -161,11 +280,22 @@ class ChatMessage(Base):
     # attachment chip in the transcript instead of living only in the
     # separate Files page. Null/empty for ordinary text messages.
     attachments_json = Column(Text, nullable=True)
+    # JSON array of {document_id, filename, file_type} — set when this message
+    # represents (or includes) an uploaded document, so it renders as an
+    # attachment chip in the transcript instead of living only in the
+    # separate Files page. Null/empty for ordinary text messages.
+    attachments_json = Column(Text, nullable=True)
     # 'tool_call' marks internal-only entries (e.g. execution-result summaries
     # kept for LLM memory) that should replay into the collapsed "Agent is
     # working" card on reload instead of a normal top-level chat bubble.
     # Null for ordinary user-visible messages.
     msg_type = Column(String, nullable=True)
+    # JSON array of {id, content, filename, document_id} — the RAG chunks
+    # actually used to answer THIS assistant turn (null when none were
+    # used). Lets a later turn's empty/weak search backfill from these
+    # instead of leaving a vague follow-up ("what about the other part?")
+    # with no grounding at all — see ChatAgent._backfill_sources_from_history.
+    rag_sources_json = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class TokenUsage(Base):
@@ -198,6 +328,8 @@ class ConversationDisabledCapability(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     conversation_id = Column(String, index=True, nullable=False)
+    capability_type = Column(String, nullable=False)  # 'tool' | 'skill'
+    capability_id = Column(String, nullable=False)
     capability_type = Column(String, nullable=False)  # 'tool' | 'skill'
     capability_id = Column(String, nullable=False)
 
@@ -265,3 +397,24 @@ class OnboardingState(Base):
 
     id = Column(Integer, primary_key=True, default=1)
     welcome_seen = Column(Boolean, default=False)
+
+
+class UserCustomTable(Base):
+    """
+    Tracks a table a user created themselves through the "Aegis Database"
+    workflow node's table browser (see app.core.aegis_db_browser) —
+    distinct from every real Aegis table (User, Workflow, ChatMessage,
+    ...), which are never rows here. Existing as its own registry (rather
+    than inferring "user table" from some naming convention) is what lets
+    aegis_db_browser.drop_table refuse to ever drop anything but a table a
+    user genuinely created, and lets create_table check a name against
+    every real table (Base.metadata.tables) AND this registry before
+    ever running CREATE TABLE, so a user table can never collide with or
+    shadow Aegis's own schema.
+    """
+    __tablename__ = "user_custom_tables"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, nullable=False)
+    columns_json = Column(Text, nullable=False)  # JSON: [{"name": ..., "type": "text"|"integer"|"real"|"boolean", "nullable": bool}, ...]
+    created_at = Column(DateTime, default=datetime.utcnow)

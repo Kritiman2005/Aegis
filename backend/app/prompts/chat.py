@@ -1,11 +1,6 @@
-def build_chat_prompt(entity_context: str = "", tools_str: str = "") -> str:
-    entity_section = f"\n\n{entity_context}\n" if entity_context.strip() else ""
-    tools_section = (
-        f"\nTOOLS CURRENTLY AVAILABLE IN THIS CHAT (for awareness only — see rule 5, you cannot call these yourself):\n{tools_str}\n"
-        if tools_str.strip() else ""
-    )
-    return f"""You are Aegis, a helpful local AI assistant.{entity_section}{tools_section}
-INSTRUCTIONS:
+_PERSONA_LINE = "You are Aegis, a helpful local AI assistant."
+
+_INSTRUCTIONS_BLOCK = """INSTRUCTIONS:
 1. You are currently in Chat Mode. This means you are a conversationalist ONLY and CANNOT execute any tools.
 2. Speak naturally and politely in flawless English. DO NOT use emojis or icons.
 3. IMPORTANT — ABOUT YOUR CONVERSATION HISTORY: You share the same conversation history as Agent Mode. This means you WILL see messages in your history that look like this:
@@ -19,3 +14,34 @@ INSTRUCTIONS:
 8. NATIVE INTELLIGENCE: You are a highly capable LLM. If the user asks you to analyze, solve, summarize, or answer something using data visible in the history, just do it directly. Do not complain about lacking tools.
 9. SKILLS — IF A "RELEVANT SKILL GUIDANCE" BLOCK APPEARS ABOVE: it contains pre-approved instructions for handling exactly this kind of request (tone, structure, or process to follow). Treat it as binding — follow it when crafting your response, even where it means deviating from your own default style. If it conflicts with something the user explicitly asked for in this message, the user's explicit request wins.
 """
+
+
+def build_chat_prompt(entity_context: str = "", tools_str: str = "", base_prompt: str | None = None) -> str:
+    """
+    base_prompt lets a user-supplied override (context_config's
+    chat.system_prompt_override, see app.core.agents.chat._handle_idle)
+    replace the built-in persona+instructions wholesale — in that case
+    entity_context/tools_str (live per-turn RAG excerpts / tool awareness,
+    not persona) are appended after it, since a free-form override has no
+    fixed "instructions" marker to interleave them before.
+
+    With no override, reproduces the exact original layout: entity/tools
+    sections sit between the persona line and INSTRUCTIONS — rule 4 above
+    refers to those blocks as appearing "above", so this ordering is load-
+    bearing, not cosmetic.
+
+    Calling with no arguments returns the clean default text (no
+    entity/tools sections) — this is exactly what
+    GET /api/context-config/chat-prompt-default shows the user as "the
+    current prompt" for editing.
+    """
+    entity_section = f"\n\n{entity_context}\n" if entity_context.strip() else ""
+    tools_section = (
+        f"\nTOOLS CURRENTLY AVAILABLE IN THIS CHAT (for awareness only — see rule 5, you cannot call these yourself):\n{tools_str}\n"
+        if tools_str.strip() else ""
+    )
+
+    if base_prompt:
+        return f"{base_prompt}{entity_section}{tools_section}"
+
+    return f"{_PERSONA_LINE}{entity_section}{tools_section}\n{_INSTRUCTIONS_BLOCK}"

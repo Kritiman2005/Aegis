@@ -21,6 +21,15 @@ DEFAULTS: Dict[str, Any] = {
         "max_rag_chunks": 5,
         "max_output_tokens": 5120,
         "max_result_snippet": 2000,
+        # "" = use app.prompts.chat's built-in persona+instructions. Set by
+        # the Workflows "Default Pipeline" LLM card / a future Settings UI.
+        "system_prompt_override": "",
+        # Mirrors app.core.rag.processor.chunk_text's own defaults — kept
+        # here so ingest_document() can read a user-tunable value instead
+        # of the function's hardcoded ones. Only affects documents
+        # uploaded after the change; existing embeddings aren't redone.
+        "chunk_size": 300,
+        "chunk_overlap": 50,
     },
     "planner": {
         "max_history_messages": 6,

@@ -47,6 +47,18 @@ backend/app/whisper_bundled/
 # when AEGIS_DATA_DIR isn't set (e.g. running the backend directly outside
 # Electron) — never committed either way.
 browsers/
+# Portable Node.js / uv runtimes auto-downloaded for MCP servers whose
+# command (npx/uvx) isn't already installed — same AEGIS_DATA_DIR-or-repo-
+# root fallback as browsers/ above (see app/mcp/runtime_manager.py).
+backend/runtimes/
+# Whisper model — downloaded by scripts/download_whisper_model.py at build
+# time (see app/core/transcription.py), not committed.
+backend/app/whisper_bundled/
+# Playwright's Chromium binary — downloaded on demand into AEGIS_DATA_DIR
+# normally (see app/core/scraper.py), but falls back to this repo-root path
+# when AEGIS_DATA_DIR isn't set (e.g. running the backend directly outside
+# Electron) — never committed either way.
+browsers/
 
 # ─── Environment Variables ───────────────────────────────
 .env

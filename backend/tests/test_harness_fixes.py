@@ -1,18 +1,18 @@
 """
 Regression tests for the harness-layer fixes made to ChatAgent/ExecutorAgent:
 
-1. get_searched_tools no longer makes an LLM call to rank/search tools
-   (MCP removal made that ranking pointless — see chat.py's
-   _COUNTING_HINT_RE comment) and derives is_counting via a cheap regex.
+1. get_searched_tools makes no LLM call to rank/search tools — it derives
+   is_counting via a cheap regex, and falls back to mcp_registry's FTS5
+   index (not an LLM ranking pass) only once the combined tool count would
+   overflow the planner's context budget.
 2. The two Chat Mode classifiers (export-intent, compound-question) are
    merged into one LLM call when both cheap gates fire in the same turn.
-3. Per-step argument generation in execute_plan gets a bounded retry with
-   a reinforced instruction before aborting the whole plan, mirroring the
-   planner's own retry loop.
-4. _call_llm_text detects a chat answer that degenerated into raw JSON,
+3. _call_llm_text detects a chat answer that degenerated into raw JSON,
    stops forwarding it live, and regenerates with a corrective
    instruction — falling back to best-effort text extraction rather than
    ever surfacing the raw JSON.
+4. ExecutorAgent.generate_arguments correctly plumbs an optional
+   retry_note into the prompt when one is supplied.
 
 None of these tests load a real GGUF model — every LLM call is a FakeLLM
 double, so the suite stays fast and deterministic. See
@@ -26,7 +26,6 @@ from app.core.agents.chat import (
     ChatAgent,
     _looks_like_pure_json,
     _extract_text_from_json_leak,
-    _sanitize_one_shot_text,
 )
 from app.core.agents.executor import ExecutorAgent
 
@@ -321,159 +320,3 @@ def test_generate_arguments_without_retry_note_omits_it(monkeypatch):
 
     sent_user_message = fake.calls[0]["messages"][-1]["content"]
     assert "[SYSTEM]" not in sent_user_message
-
-
-# ── execute_plan: per-step retry on invalid arguments ───────────────────────
-
-@pytest.mark.asyncio
-async def test_execute_plan_retries_invalid_arguments_before_succeeding(monkeypatch):
-    from app.core.agents.chat import AgentState
-
-    agent = make_agent()
-
-    # First attempt: missing the required "query" field (fails jsonschema
-    # validation). Second attempt (the retry this fix added): valid.
-    fake_executor_llm = FakeLLM([
-        json.dumps({}),
-        json.dumps({"query": "invoice"}),
-    ])
-    monkeypatch.setattr(agent.executor, "get_llm", lambda model_name=None: fake_executor_llm)
-    monkeypatch.setattr(agent.executor, "_log_token_usage", lambda *a, **kw: None)
-
-    # Isolate this test to the argument-generation retry loop — don't
-    # actually touch the filesystem for tool execution.
-    async def fake_exec_fs_tool(tool_name, arguments):
-        assert arguments == {"query": "invoice"}
-        return {"success": True, "text": "invoice.pdf"}
-
-    monkeypatch.setattr(agent, "_execute_filesystem_tool", fake_exec_fs_tool)
-
-    agent.state = AgentState.EXECUTING
-    agent.plan = [{
-        "step_id": "step_1",
-        "tool": "search_local_files",
-        "arguments": {},
-        "reason": "find the invoice",
-    }]
-
-    events = [e async for e in agent.execute_plan(token_callback=None)]
-
-    assert len(fake_executor_llm.calls) == 2  # one bad attempt + one retry
-    retry_user_message = fake_executor_llm.calls[1]["messages"][-1]["content"]
-    assert "invalid" in retry_user_message.lower()
-
-    failed = [e for e in events if e.get("status") == "failed"]
-    assert not failed, f"plan should have succeeded after the retry, got: {failed}"
-    assert any("Execution complete" in e.get("text", "") for e in events)
-
-
-@pytest.mark.asyncio
-async def test_execute_plan_aborts_after_exhausting_retries(monkeypatch):
-    from app.core.agents.chat import AgentState
-
-    agent = make_agent()
-
-    # Both attempts invalid (missing required "query") — should abort
-    # after the second, not loop forever or hang the plan.
-    fake_executor_llm = FakeLLM([
-        json.dumps({}),
-        json.dumps({}),
-    ])
-    monkeypatch.setattr(agent.executor, "get_llm", lambda model_name=None: fake_executor_llm)
-    monkeypatch.setattr(agent.executor, "_log_token_usage", lambda *a, **kw: None)
-
-    agent.state = AgentState.EXECUTING
-    agent.plan = [{
-        "step_id": "step_1",
-        "tool": "search_local_files",
-        "arguments": {},
-        "reason": "find the invoice",
-    }]
-
-    events = [e async for e in agent.execute_plan(token_callback=None)]
-
-    assert len(fake_executor_llm.calls) == 2  # bounded — doesn't retry forever
-    assert agent.state == AgentState.IDLE
-    assert agent.plan is None
-    assert any(e.get("status") == "failed" for e in events)
-
-
-# ── _sanitize_one_shot_text: the planner's direct_response/clarifying_ ────
-# question/reason fields, which don't stream and can't cheaply regenerate.
-
-@pytest.mark.parametrize("leak,fallback,expected", [
-    ('{"answer": "Paris is the capital."}', "fallback", "Paris is the capital."),
-    ("Paris is the capital.", "fallback", "Paris is the capital."),
-    ("", "fallback", ""),
-    ('{"a": 1}', "fallback", "fallback"),  # nothing extractable
-])
-def test_sanitize_one_shot_text(leak, fallback, expected):
-    assert _sanitize_one_shot_text(leak, fallback=fallback) == expected
-
-
-def test_sanitize_one_shot_text_handles_none():
-    assert _sanitize_one_shot_text(None, fallback="fallback") is None
-
-
-# ── Agent Mode: direct_response / clarifying_question / step reason ───────
-# never reach the user as raw JSON either, mirroring the Chat Mode fix.
-
-async def _no_document_context(self, message, attachments, status_callback=None):
-    return ""
-
-
-@pytest.mark.asyncio
-async def test_agent_mode_direct_response_json_leak_is_sanitized(monkeypatch):
-    agent = make_agent(connection_id="test_direct_response_leak")
-    monkeypatch.setattr(ChatAgent, "_get_document_context", _no_document_context)
-    # _handle_idle's own early "is a model even downloaded" gate runs before
-    # mode branching and checks self.get_llm() directly — not exercised by
-    # the mocked planner below, so it must be satisfied on its own or this
-    # test only passes on a machine that happens to have a real model
-    # registered (never on a fresh checkout/CI DB).
-    monkeypatch.setattr(agent, "get_llm", lambda model_name=None: FakeLLM([]))
-
-    leaked_direct_response = json.dumps({"answer": "The capital of France is Paris."})
-    monkeypatch.setattr(
-        agent.planner, "generate_plan",
-        lambda *a, **kw: json.dumps({"plan": [], "direct_response": leaked_direct_response}),
-    )
-
-    result = await agent.handle_message("what is the capital of France?", mode="agent")
-
-    assert result == "The capital of France is Paris."
-    assert "{" not in result
-
-
-@pytest.mark.asyncio
-async def test_agent_mode_clarifying_question_json_leak_is_sanitized(monkeypatch):
-    agent = make_agent(connection_id="test_clarifying_question_leak")
-    monkeypatch.setattr(ChatAgent, "_get_document_context", _no_document_context)
-    monkeypatch.setattr(agent, "get_llm", lambda model_name=None: FakeLLM([]))
-
-    leaked_question = json.dumps({"question": "Which folder should I search in?"})
-    monkeypatch.setattr(
-        agent.planner, "generate_plan",
-        lambda *a, **kw: json.dumps({"plan": [], "clarifying_question": leaked_question}),
-    )
-
-    result = await agent.handle_message("find my invoice", mode="agent")
-
-    assert result == "Which folder should I search in?"
-    assert "{" not in result
-
-
-@pytest.mark.asyncio
-async def test_agent_mode_direct_response_normal_text_passes_through(monkeypatch):
-    agent = make_agent(connection_id="test_direct_response_normal")
-    monkeypatch.setattr(ChatAgent, "_get_document_context", _no_document_context)
-    monkeypatch.setattr(agent, "get_llm", lambda model_name=None: FakeLLM([]))
-
-    monkeypatch.setattr(
-        agent.planner, "generate_plan",
-        lambda *a, **kw: json.dumps({"plan": [], "direct_response": "The capital of France is Paris."}),
-    )
-
-    result = await agent.handle_message("what is the capital of France?", mode="agent")
-
-    assert result == "The capital of France is Paris."

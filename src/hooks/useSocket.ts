@@ -44,14 +44,10 @@ export type ConnectionStatus =
   | 'error';
 
 interface ServerPayload {
-  type: 'connected' | 'token' | 'done' | 'error' | 'pong' | 'history' | 'toast' | 'status' | 'step_result' | 'document_progress';
+  type: 'connected' | 'token' | 'done' | 'error' | 'pong' | 'history' | 'toast' | 'status' | 'document_progress';
   content?: string;
   connection_id?: string;
   history?: Array<{ role: string; content: string; attachments?: Attachment[] }>;
-  agent_state?: string;
-  node_id?: string;
-  status?: string;
-  tool?: string;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -79,11 +75,6 @@ export function useSocket() {
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamingContent, setStreamingContent] = useState('');
-  // The backend agent's own state for this conversation (IDLE unless a
-  // plan/cookie/pagination prompt is paused mid-flight) — reported once on
-  // the "history" message so the UI can tell whether the conversation it's
-  // opening was actually left in Agent Mode with something still pending.
-  const [agentState, setAgentState] = useState<string>('IDLE');
   // A single transient "what's happening right now" line (e.g. "Searching
   // your documents...") — replaced in place as each stage reports in, never
   // appended as its own permanent message. Cleared the moment real content
@@ -93,8 +84,8 @@ export function useSocket() {
   const statusClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Chat-turn stages clear statusText themselves the moment a real event
-  // (token/step_result/done/error) arrives. A document/scrape upload has no
-  // such follow-up event once it reaches a terminal state ("✅ ready" / "❌
+  // (token/done/error) arrives. A document/scrape upload has no such
+  // follow-up event once it reaches a terminal state ("✅ ready" / "❌
   // failed"), so that line would otherwise sit there forever — this debounced
   // timer clears it a few seconds after the *last* update, giving the reader
   // enough time to see the terminal message without it becoming a permanent
@@ -112,10 +103,6 @@ export function useSocket() {
   const bufferRef = useRef("");
   const streamingContentRef = useRef("");
   const rafPending = useRef(false);
-
-  const [activeNodeId, setActiveNodeId] = useState<string | null>(null);
-  const [completedNodeIds, setCompletedNodeIds] = useState<Set<string>>(new Set());
-  const [failedNodeIds, setFailedNodeIds] = useState<Set<string>>(new Set());
 
   const socketRef = useRef<WebSocket | null>(null);
   // Mirror the Redux session ID into a ref for stable access inside WebSocket callbacks
@@ -265,7 +252,6 @@ export function useSocket() {
               attachments: m.attachments,
               msgType: m.msg_type as MessageType | undefined,
             })));
-            setAgentState(payload.agent_state || 'IDLE');
           }
           break;
 
@@ -274,26 +260,9 @@ export function useSocket() {
           // status line has served its purpose.
           setStatusText(null);
 
-          if (payload.node_id) {
-            if (payload.status === 'running') {
-              setActiveNodeId(payload.node_id);
-            } else if (payload.status === 'completed') {
-              setCompletedNodeIds(prev => new Set(prev).add(payload.node_id as string));
-              setActiveNodeId(null);
-            } else if (payload.status === 'failed') {
-              setFailedNodeIds(prev => new Set(prev).add(payload.node_id as string));
-              setActiveNodeId(null);
-            }
-          }
-
           if (!streamingIdRef.current) {
             streamingIdRef.current = generateId();
             setIsStreaming(true);
-            
-            if (!payload.node_id) {
-              setCompletedNodeIds(new Set());
-              setFailedNodeIds(new Set());
-            }
           }
 
           if (payload.content) {
@@ -307,31 +276,6 @@ export function useSocket() {
                 rafPending.current = false;
               });
             }
-          }
-          break;
-
-        case 'step_result':
-          // A single tool has finished executing. Flush any current streaming
-          // content and immediately render the result as its own message so the
-          // user sees live progress without waiting for the full plan to complete.
-          setStatusText(null);
-          if (streamingContentRef.current || bufferRef.current) {
-            finalizeRef.current('thought');
-          }
-          if (payload.content) {
-            appendMessageRef.current({
-              id: generateId(),
-              role: 'assistant',
-              msgType: 'tool_call',
-              content: payload.content,
-              timestamp: new Date(),
-              isStreaming: false,
-            });
-          }
-          // Mark the node as completed in the WorkflowCanvas DAG
-          if (payload.node_id) {
-            setCompletedNodeIds(prev => new Set(prev).add(payload.node_id as string));
-            setActiveNodeId(null);
           }
           break;
 
@@ -444,7 +388,7 @@ export function useSocket() {
   // ── Public API ───────────────────────────────────────────────────────────────
 
   const sendMessage = useCallback(
-    (content: string, msgType: string = 'message', mode: string = 'chat', userPrompt?: string, attachments?: Attachment[], exportFormat?: string): boolean => {
+    (content: string, msgType: string = 'message', userPrompt?: string, attachments?: Attachment[], exportFormat?: string): boolean => {
       const trimmed = content.trim();
       // Claude-style: a message can be attachments alone with no typed text.
       if (!trimmed && !(attachments && attachments.length > 0)) return false;
@@ -488,7 +432,7 @@ export function useSocket() {
       }
 
       socketRef.current.send(
-        JSON.stringify({ type: msgType, content: trimmed, mode, user_prompt: userPrompt, attachments, export_format: exportFormat })
+        JSON.stringify({ type: msgType, content: trimmed, user_prompt: userPrompt, attachments, export_format: exportFormat })
       );
       return true;
     },
@@ -514,12 +458,6 @@ export function useSocket() {
     // Reset history flag so the new session's history gets loaded
     historyLoadedRef.current = false;
     setStatusText(null);
-    // A fresh/empty conversation never gets a "history" message at all (see
-    // the backend's `if full_history:` guard), so without this reset a new
-    // chat would inherit whatever agentState the *previous* conversation
-    // last reported — stale, and specifically the wrong direction to leak
-    // (turning Agent Mode's confirmation UI back on for an unrelated chat).
-    setAgentState('IDLE');
 
     if (newSessionId) {
       // Load a historical session — dispatch to Redux (store subscriber writes to localStorage)
@@ -555,10 +493,6 @@ export function useSocket() {
     isStreaming,
     streamingContent,
     statusText,
-    agentState,
-    activeNodeId,
-    completedNodeIds,
-    failedNodeIds,
     sendMessage,
     cancelGeneration,
     clearMessages,

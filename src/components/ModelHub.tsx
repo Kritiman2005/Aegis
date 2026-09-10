@@ -635,7 +635,7 @@ function ModelCard({
   return (
     <button
       onClick={onOpen}
-      className="text-left bg-aegis-raised rounded-2xl border border-aegis-border hover:border-aegis-primary/40 transition-all p-5 flex flex-col gap-3"
+      className="text-left bg-aegis-raised rounded-2xl border border-aegis-border shadow-sm hover:border-aegis-primary/40 hover:shadow-lg hover:-translate-y-1 transition-all duration-200 p-5 flex flex-col gap-3"
     >
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-3 min-w-0">
@@ -862,7 +862,7 @@ export default function ModelHub() {
   const gridError = isSearching ? searchError : (activeCategory !== 'all' ? categoryError[activeCategory] : null);
 
   return (
-    <div className="flex-1 flex flex-col bg-aegis-base overflow-hidden">
+    <div className="flex-1 overflow-y-auto bg-aegis-base">
       {/* Header */}
       <div className="px-8 pt-8 pb-5">
         <div className="flex items-center gap-3 mb-1">
@@ -907,7 +907,7 @@ export default function ModelHub() {
       )}
 
       {/* Grid */}
-      <div className="flex-1 overflow-y-auto px-8 pb-8">
+      <div className="px-8 pb-8">
         {loadingGrid && displayedModels.length === 0 ? (
           <div className="flex items-center gap-2 text-sm text-aegis-text-secondary py-12 justify-center">
             <Loader2 className="w-4 h-4 animate-spin" /> Loading models...

@@ -1,8 +1,10 @@
 """
 Aegis — WebSocket Endpoint (/ws)
 
-Handles the persistent WebSocket connection from the Next.js frontend.
-Integrated with the Agentic MCP Workflow state machine.
+Handles the persistent WebSocket connection from the Next.js frontend for
+Chat Mode. Workflow runs (app.core.workflows.engine) broadcast their own
+progress over the same connection manager but don't go through this
+request/response loop — see app/api/workflows.py.
 """
 
 import asyncio
@@ -15,42 +17,13 @@ import anyio
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from app.core.connection_manager import manager
-from app.core.agents import ChatAgent, AgentState
+from app.core.agents import ChatAgent
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["WebSocket"])
 
 # Store active agent sessions per connection
 agent_sessions: Dict[str, ChatAgent] = {}
-
-import time
-async def watch_timeouts():
-    """
-    Background task to cancel pending states that sit idle for > 5 minutes.
-    Covers every state that blocks the dispatcher on a specific reply —
-    WAITING_LOOP_CONTINUATION included, since missing it means a user who
-    abandons a "continue fetching?" prompt leaves that session stuck
-    forever: every future message, even an unrelated new request, keeps
-    getting swallowed into that stale handler with no way out.
-    """
-    while True:
-        await asyncio.sleep(10)
-        now = time.time()
-        for cid, session in list(agent_sessions.items()):
-            if session.state in [
-                AgentState.WAITING_CONFIRMATION, AgentState.WAITING_LOOP_CONTINUATION,
-            ]:
-                if now - session.state_entered_at > 300: # 5 minutes
-                    session.state = AgentState.IDLE
-                    session.plan = None
-                    session._pagination_state = {}
-                    try:
-                        await manager.send_json(cid, {
-                            "type": "toast",
-                            "content": "Action expired, please re-ask."
-                        })
-                    except Exception as e:
-                        logger.error(f"Failed to send timeout toast to {cid}: {e}")
 
 # ─── WebSocket Endpoint ───────────────────────────────────────────────────────
 
@@ -59,7 +32,7 @@ async def websocket_endpoint(
     websocket: WebSocket,
     client_id: str = Query(default_factory=lambda: str(uuid.uuid4())),
 ) -> None:
-    """Main WebSocket endpoint with Stateful Agent loop."""
+    """Main WebSocket endpoint for Chat Mode's message loop."""
     connection_id = client_id
     await manager.connect(websocket, connection_id)
     
@@ -100,29 +73,9 @@ async def websocket_endpoint(
                 await websocket.send_json({
                     "type": "history",
                     "history": full_history,
-                    # Lets the frontend restore Agent Mode (and re-enable the
-                    # plan-confirmation buttons) when reopening a conversation
-                    # that has a paused Agent Mode task — chatMode is otherwise
-                    # a UI-local toggle with no memory of which mode a given
-                    # conversation was actually in. Any state other than IDLE
-                    # only ever happens in Agent Mode (Chat Mode never calls
-                    # tools), so it's an unambiguous signal.
-                    "agent_state": session.state,
                 })
         except Exception as e:
             logger.warning(f"Failed to load/send history for {connection_id}: {e}")
-
-        # Reconnect resilience: if the client dropped its WebSocket during LLM inference
-        # (e.g. React Strict Mode remount, brief network blip), the plan response was
-        # cached in session._pending_response. Replay it now so the client sees the card.
-        if session._pending_response and session.state == AgentState.WAITING_CONFIRMATION:
-            logger.info(f"[WS:{connection_id[:8]}] Replaying cached plan response after reconnect.")
-            try:
-                await websocket.send_json({"type": "token", "content": session._pending_response})
-                await websocket.send_json({"type": "done", "content": ""})
-            except Exception as e:
-                logger.warning(f"[WS:{connection_id[:8]}] Failed to replay pending response: {e}")
-
 
         while True:
             raw = await websocket.receive_text()
@@ -138,7 +91,8 @@ async def websocket_endpoint(
 
             msg_type = payload.get("type", "message")
             content = payload.get("content", "")
-            mode = payload.get("mode", "chat")
+            attachments = payload.get("attachments") or None
+            export_format = payload.get("export_format") or None
             attachments = payload.get("attachments") or None
             export_format = payload.get("export_format") or None
 
@@ -164,7 +118,7 @@ async def websocket_endpoint(
                     await manager.send_json(connection_id, {"type": "done", "content": ""})
                 continue
 
-            # ── Handle User Message (Agent Workflow) ─────────────────────────
+            # ── Handle User Message ───────────────────────────────────────────
             # Allow attachment-only sends (no typed text) — Claude-style: a
             # user can just attach a file and hit send with nothing typed.
             if msg_type == "message" and (content.strip() or attachments):
@@ -173,7 +127,7 @@ async def websocket_endpoint(
                 if getattr(session, 'is_processing', False):
                     await manager.send_json(connection_id, {
                         "type": "toast",
-                        "content": "Agent is currently busy processing another request."
+                        "content": "Aegis is currently busy processing another request."
                     })
                     continue
 
@@ -194,7 +148,7 @@ async def websocket_endpoint(
                 if hasattr(session, "cancel_event"):
                     session.cancel_event.clear()
 
-                async def process_message_task(msg_content: str, msg_mode: str, msg_attachments=attachments, msg_export_format=export_format):
+                async def process_message_task(msg_content: str, msg_attachments=attachments, msg_export_format=export_format):
                     def superseded() -> bool:
                         # True once a cancel (or a newer message) has moved
                         # the session on from this task — its eventual
@@ -242,16 +196,49 @@ async def websocket_endpoint(
                                 "content": msg
                             })
 
-                        # Process the message through the state machine
                         await send_status("Analyzing request...")
-                        response_text = await session.handle_message(
-                            msg_content,
-                            msg_mode,
-                            token_callback=send_token_sync,
-                            status_callback=send_status,
-                            attachments=msg_attachments,
-                            export_format=msg_export_format,
-                        )
+
+                        def _get_active_chat_workflow_id():
+                            from app.db.database import SessionLocal
+                            from app.db.crud import get_active_chat_workflow
+                            db = SessionLocal()
+                            try:
+                                wf = get_active_chat_workflow(db)
+                                return wf.id if wf else None
+                            finally:
+                                db.close()
+
+                        active_workflow_id = await anyio.to_thread.run_sync(_get_active_chat_workflow_id)
+
+                        if active_workflow_id is not None:
+                            # A workflow is connected as the chat handler (see
+                            # app.api.workflows's /set-chat-handler) — run it
+                            # instead of the built-in pipeline for this turn.
+                            # Persisting the user message / assistant reply
+                            # ourselves here mirrors exactly what
+                            # ChatAgent._handle_idle does internally, since
+                            # run_chat_workflow bypasses it entirely.
+                            from app.core.workflows.engine import run_chat_workflow, WorkflowError
+                            await session._append_history("user", msg_content, attachments=msg_attachments)
+                            turn_history = await session._get_history()
+                            turn_history = turn_history[:-1] if turn_history else []
+                            try:
+                                response_text = await run_chat_workflow(
+                                    session, active_workflow_id, msg_content, turn_history, msg_attachments,
+                                    connection_id, send_token_sync, export_format=msg_export_format,
+                                )
+                                await session._append_history("assistant", response_text)
+                            except WorkflowError as e:
+                                response_text = f"⚠ {e}"
+                                await session._append_history("assistant", response_text)
+                        else:
+                            response_text = await session.handle_message(
+                                msg_content,
+                                token_callback=send_token_sync,
+                                status_callback=send_status,
+                                attachments=msg_attachments,
+                                export_format=msg_export_format,
+                            )
 
                         # Stop the token sender task
                         loop.call_soon_threadsafe(token_queue.put_nowait, None)
@@ -285,41 +272,6 @@ async def websocket_endpoint(
                                 "type": "done",
                                 "content": "",
                             })
-                        
-                        if session.state == AgentState.EXECUTING:
-                            # Stream the execution progress token by token
-                            async for progress in session.execute_plan(token_callback=send_token_sync):
-                                if superseded():
-                                    logger.info(f"[WS:{connection_id[:8]}] Cancelled mid-execution; stopping plan stream for generation {my_generation_id}.")
-                                    break
-                                if isinstance(progress, dict):
-                                    if progress.get("type") == "step_result":
-                                        await manager.send_json(connection_id, {
-                                            "type": "step_result",
-                                            "content": progress.get("text", ""),
-                                            "node_id": progress.get("node_id"),
-                                            "status": progress.get("status"),
-                                            "tool": progress.get("tool"),
-                                        })
-                                    else:
-                                        await manager.send_json(connection_id, {
-                                            "type": "token",
-                                            "content": progress.get("text", ""),
-                                            "node_id": progress.get("node_id"),
-                                            "status": progress.get("status")
-                                        })
-                                else:
-                                    await manager.send_json(connection_id, {
-                                        "type": "token",
-                                        "content": progress
-                                    })
-
-                            # End stream when execution finishes
-                            if not superseded():
-                                await manager.send_json(connection_id, {
-                                    "type": "done",
-                                    "content": "",
-                                })
 
                     except Exception as e:
                         logger.error(f"Error processing message: {e}", exc_info=True)
@@ -338,7 +290,7 @@ async def websocket_endpoint(
                         if not superseded():
                             session.is_processing = False
 
-                asyncio.create_task(process_message_task(content, mode))
+                asyncio.create_task(process_message_task(content))
 
             # ── Handle Memory Saving Paths ─────────────────────────────────────
             elif msg_type == "save_whole_message" and content.strip():
@@ -365,53 +317,6 @@ async def websocket_endpoint(
                     await manager.send_json(connection_id, {"type": "done", "content": ""})
                 except Exception as exc:
                     logger.error(f"[WS:{connection_id[:8]}] Extraction error: {exc}")
-                    await manager.send_json(connection_id, {"type": "error", "content": str(exc)})
-
-            elif msg_type == "schedule_plan":
-                logger.info(f"[WS:{connection_id[:8]}] Scheduling Plan")
-                try:
-                    cron_expr = payload.get("cron", "every_1_hour")
-                    # Ensure the session has a pending plan
-                    if session.state.name != "WAITING_CONFIRMATION" or not session.plan:
-                        raise ValueError("No active plan waiting for confirmation to schedule.")
-                    
-                    # Save to ScheduledJob table
-                    from app.db.database import SessionLocal
-                    from app.db.models import ScheduledJob
-                    from datetime import datetime
-                    
-                    db = SessionLocal()
-                    from app.core.scheduler import scheduler_daemon
-                    next_run = scheduler_daemon._calculate_next_run(cron_expr, datetime.utcnow())
-                    
-                    job = ScheduledJob(
-                        conversation_id=connection_id,
-                        cron_expression=cron_expr,
-                        frozen_plan_json=json.dumps(session.plan),
-                        status="active",
-                        next_run_at=next_run
-                    )
-                    db.add(job)
-                    db.commit()
-                    db.refresh(job)
-                    db.close()
-                    
-                    # Clear session state
-                    session.plan = None
-                    session.state = session.state.IDLE
-                    
-                    await manager.send_json(connection_id, {
-                        "type": "toast",
-                        "content": f"Plan successfully scheduled! (Job ID: {job.id})"
-                    })
-                    
-                    await manager.send_json(connection_id, {
-                        "type": "token",
-                        "content": f"\n\n**Scheduled!** I'll run this plan `{cron_expr}` in the background. What's next?"
-                    })
-                    await manager.send_json(connection_id, {"type": "done", "content": ""})
-                except Exception as exc:
-                    logger.error(f"[WS:{connection_id[:8]}] Schedule error: {exc}")
                     await manager.send_json(connection_id, {"type": "error", "content": str(exc)})
 
     except WebSocketDisconnect:

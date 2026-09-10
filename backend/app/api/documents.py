@@ -2,6 +2,7 @@ from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, B
 from fastapi.responses import FileResponse
 from typing import List, Dict, Any, Optional
 import hashlib
+import hashlib
 import mimetypes
 import os
 import threading
@@ -52,6 +53,34 @@ def _guess_media_type(filename: str) -> str:
     guessed, _ = mimetypes.guess_type(filename)
     return guessed or "application/octet-stream"
 
+# mimetypes.guess_type() consults the Windows registry as a supplement to
+# its built-in table on that platform — on a machine where an extension was
+# never associated with a MIME type (common for .pdf on a clean/minimal
+# Windows install with no PDF software ever registered, or when other
+# software has overwritten the association), it silently returns (None,
+# None), which get_document_raw() below then falls back to
+# "application/octet-stream" for. A browser <iframe> given
+# application/octet-stream never invokes its native PDF/image viewer
+# regardless of Content-Disposition: inline — it just shows nothing, which
+# is exactly the blank-preview symptom this dict exists to prevent. Listed
+# explicitly (bypassing the OS lookup entirely) for every format this app
+# actually serves through /raw, so preview rendering can't depend on
+# whatever happens to be in a given user's Windows registry.
+_EXPLICIT_MIME_TYPES = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".txt": "text/plain",
+    ".md": "text/plain",
+    ".csv": "text/csv",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+
 # A document's very first ingestion can legitimately need to download the
 # embedding/reranker models (a few hundred MB total) if they weren't already
 # warmed by main.py's startup preload — slow but survivable on a slow
@@ -74,6 +103,17 @@ _INGEST_TIMEOUT_SECONDS = 180
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
 _UPLOAD_COPY_CHUNK_SIZE = 1024 * 1024
 
+# No cap existed at all before this — a user could upload an arbitrarily
+# large file (disk/memory risk on its own), and it fed straight into
+# extraction/chunking/embedding with no bound on how long that would take,
+# which is exactly what could make an otherwise-legitimate huge PDF/DOCX
+# collide with _INGEST_TIMEOUT_SECONDS above and get killed as if it were a
+# hung network download. Checked incrementally while streaming to disk
+# (not from a Content-Length header, which a client can omit or lie about)
+# so an oversized upload is rejected before it's ever fully written.
+_MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
+_UPLOAD_COPY_CHUNK_SIZE = 1024 * 1024
+
 BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
 _data_dir = os.environ.get("AEGIS_DATA_DIR")
 UPLOAD_DIR = Path(_data_dir) / "uploads" if _data_dir else BASE_DIR / "uploads"
@@ -81,6 +121,22 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 import logging
 logger = logging.getLogger(__name__)
+
+
+def _get_active_ingestion_workflow_id() -> Optional[int]:
+    """The one workflow (if any) connected as the live ingestion handler
+    (Workflow.is_ingestion_handler — see app.api.workflows's
+    /set-ingestion-handler). A fresh SessionLocal since this runs inside
+    process_upload_task's own worker thread, not the request's session."""
+    from app.db.database import SessionLocal
+    from app.db.models import Workflow
+    db = SessionLocal()
+    try:
+        row = db.query(Workflow).filter(Workflow.is_ingestion_handler == True).first()  # noqa: E712
+        return row.id if row else None
+    finally:
+        db.close()
+
 
 def process_upload_task(doc_id: int, file_path: str, file_type: str, filename: str) -> tuple[bool, str | None]:
     """
@@ -118,7 +174,20 @@ def process_upload_task(doc_id: int, file_path: str, file_type: str, filename: s
 
         def _run():
             try:
-                ingest_document(doc_id, file_path, file_type, filename)
+                active_workflow_id = _get_active_ingestion_workflow_id()
+                if active_workflow_id is not None:
+                    # A workflow is connected as the ingestion handler (see
+                    # app.api.workflows's /set-ingestion-handler) — run it
+                    # instead of the built-in pipeline for this document.
+                    # asyncio.run is safe here specifically because this
+                    # closure already runs on its own dedicated worker
+                    # Thread (see the comment below) with no existing event
+                    # loop of its own.
+                    import asyncio
+                    from app.core.workflows.engine import run_ingestion_workflow
+                    asyncio.run(run_ingestion_workflow(doc_id, file_path, filename, file_type))
+                else:
+                    ingest_document(doc_id, file_path, file_type, filename)
                 result["ok"] = True
             except Exception as e:
                 result["ok"] = False
@@ -150,6 +219,18 @@ def process_upload_task(doc_id: int, file_path: str, file_type: str, filename: s
         return False, str(e)
     finally:
         db.close()
+
+# Audio/video upload+transcription was removed — faster-whisper transcription
+# stays only for the composer's live mic button (app/core/transcription.py,
+# app/api/voice.py), which is unaffected by this. Rejected explicitly here
+# rather than left to fail downstream in extract_text(), so the user gets an
+# immediate, clear reason instead of a document stuck in "processing" until
+# ingestion gets to it.
+_REJECTED_AUDIO_VIDEO_EXTENSIONS = {
+    "mp3", "wav", "m4a", "ogg", "flac", "aac", "wma",
+    "mp4", "mov", "mkv", "webm", "avi",
+}
+
 
 # Audio/video upload+transcription was removed — faster-whisper transcription
 # stays only for the composer's live mic button (app/core/transcription.py,
@@ -350,6 +431,45 @@ async def list_documents(conversation_id: Optional[str] = None, db = Depends(get
     } for d in docs]
 
 
+def _purge_document(db, doc: UserDocument) -> None:
+    """
+    Removes one document's file on disk and its indexed Qdrant chunks, and
+    stages its DB row for deletion (caller commits — batched callers like
+    delete_documents_for_conversation below delete several docs under one
+    commit instead of one per row).
+    """
+    file_path = Path(doc.file_path)
+    if file_path.exists():
+        try:
+            file_path.unlink()
+        except OSError as e:
+            logger.warning(f"Could not remove file {file_path} for document {doc.id}: {e}")
+
+    try:
+        delete_document_points(doc.id)
+    except Exception as e:
+        logger.warning(f"Could not remove Qdrant points for document {doc.id}: {e}")
+
+    db.delete(doc)
+
+
+def delete_documents_for_conversation(db, conversation_id: str) -> int:
+    """
+    Sweeps up every document (file on disk, Qdrant chunks, DB row) that
+    belongs to a conversation — called when the conversation itself is
+    deleted (app/api/chat.py's delete_session). Without this, a deleted
+    chat's uploaded documents kept their file on disk and their embeddings
+    in Qdrant forever, unreachable by any conversation_id but never cleaned
+    up — a storage leak that grows with every chat a user deletes.
+    """
+    docs = db.query(UserDocument).filter(UserDocument.conversation_id == conversation_id).all()
+    for doc in docs:
+        _purge_document(db, doc)
+    if docs:
+        db.commit()
+    return len(docs)
+
+
 @router.get("/{document_id}/raw")
 async def get_document_raw(document_id: int, download: bool = False, db = Depends(get_db)):
     """
@@ -420,45 +540,6 @@ async def get_document_text(document_id: int, db = Depends(get_db)):
         "text": text[:_PREVIEW_MAX_CHARS],
         "truncated": truncated,
     }
-
-
-def _purge_document(db, doc: UserDocument) -> None:
-    """
-    Removes one document's file on disk and its indexed Qdrant chunks, and
-    stages its DB row for deletion (caller commits — batched callers like
-    delete_documents_for_conversation below delete several docs under one
-    commit instead of one per row).
-    """
-    file_path = Path(doc.file_path)
-    if file_path.exists():
-        try:
-            file_path.unlink()
-        except OSError as e:
-            logger.warning(f"Could not remove file {file_path} for document {doc.id}: {e}")
-
-    try:
-        delete_document_points(doc.id)
-    except Exception as e:
-        logger.warning(f"Could not remove Qdrant points for document {doc.id}: {e}")
-
-    db.delete(doc)
-
-
-def delete_documents_for_conversation(db, conversation_id: str) -> int:
-    """
-    Sweeps up every document (file on disk, Qdrant chunks, DB row) that
-    belongs to a conversation — called when the conversation itself is
-    deleted (app/api/chat.py's delete_session). Without this, a deleted
-    chat's uploaded documents kept their file on disk and their embeddings
-    in Qdrant forever, unreachable by any conversation_id but never cleaned
-    up — a storage leak that grows with every chat a user deletes.
-    """
-    docs = db.query(UserDocument).filter(UserDocument.conversation_id == conversation_id).all()
-    for doc in docs:
-        _purge_document(db, doc)
-    if docs:
-        db.commit()
-    return len(docs)
 
 
 @router.delete("/{document_id}")

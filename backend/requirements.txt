@@ -1,2 +1,12 @@
 psutil
 python-docx
+httpx
+certifi
+trafilatura
+rapidocr-onnxruntime
+pdfplumber
+pypdf
+pdfminer.six
+docx2txt
+mammoth
+python-docx
