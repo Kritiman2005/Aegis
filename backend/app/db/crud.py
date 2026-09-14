@@ -751,7 +751,7 @@ def get_token_usage_by_source(db: Session) -> List[dict]:
     return [{"source": r[0], "tokens": r[1]} for r in rows]
 
 
-# ── Per-conversation Tool/Skill activation ──────────────────────────────────
+# ── Per-conversation Tool activation ────────────────────────────────────────
 from app.db.models import ConversationDisabledCapability
 
 
@@ -800,5 +800,5 @@ from app.db.models import TokenUsage
 from datetime import datetime as _datetime, timedelta as _timedelta
 
 
-# ── Per-conversation Tool/Skill activation ──────────────────────────────────
+# ── Per-conversation Tool activation ────────────────────────────────────────
 from app.db.models import ConversationDisabledCapability

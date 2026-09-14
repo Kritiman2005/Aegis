@@ -839,13 +839,31 @@ def _scale_prefetch_limit(total_chunks: int) -> int:
     return min(_MAX_PREFETCH_LIMIT, max(_MIN_PREFETCH_LIMIT, total_chunks // 5))
 
 
-def hybrid_search(query: str, conversation_id: str, top_k: int = 5) -> List[Dict[str, Any]]:
+_MIN_RERANK_SCORE = 0.01
+# Empirically calibrated against BAAI/bge-reranker-base (see rerank=True's
+# comment below) — re-derived from scratch if the reranker model ever
+# changes, since a different model's raw score scale won't share this
+# cutoff.
+
+
+def hybrid_search(
+    query: str, conversation_id: str, top_k: int = 5,
+    mode: str = "hybrid", rerank: bool = True,
+) -> List[Dict[str, Any]]:
     """
-    1. Qdrant Native Hybrid Search (Fusion)
+    1. Qdrant search — "hybrid" (dense+sparse RRF fusion, the default and
+       the only mode that used to exist), "semantic" (dense-only), or
+       "bm25" (sparse-only, Qdrant's own term-frequency sparse vectors —
+       not literally Okapi BM25, but the same "exact keyword match" role).
     2. Filter by Conversation ID
-    3. Rerank via CrossEncoder to get Top K
+    3. Optionally rerank via CrossEncoder to get Top K
+
+    mode/rerank are exposed as real choices on the workflow "vector" node's
+    search config (see WorkflowsView.tsx) — every other caller (Chat Mode's
+    own built-in document search) leaves both at their default, unchanged
+    behavior.
     """
-    logger.info(f"Running Qdrant hybrid search for query: {query}")
+    logger.info(f"Running Qdrant {mode} search for query: {query}")
 
     # We must first fetch the user's document IDs for this conversation
     from app.db.database import SessionLocal
@@ -857,9 +875,6 @@ def hybrid_search(query: str, conversation_id: str, top_k: int = 5) -> List[Dict
     valid_doc_ids = [d.id for d in docs]
     if not valid_doc_ids:
         return []
-
-    query_dense = list(get_dense_model().embed([query]))[0]
-    query_sparse = list(get_sparse_model().embed([query]))[0]
 
     from qdrant_client import models  # lazy import — qdrant_client no longer imported at module level
 
@@ -878,32 +893,58 @@ def hybrid_search(query: str, conversation_id: str, top_k: int = 5) -> List[Dict
         ).count
     prefetch_limit = _scale_prefetch_limit(total_chunks)
 
-    # Query Qdrant with Reciprocal Rank Fusion (RRF) implicitly by querying both
-    # Qdrant's query_points automatically fuses multiple prefetches
-    with _qdrant_lock:
-        results = get_qdrant_client().query_points(
-            collection_name=COLLECTION_NAME,
-            prefetch=[
-                models.Prefetch(
-                    query=query_dense.tolist(),
-                    using="text-dense",
-                    limit=prefetch_limit,
-                    filter=doc_filter
+    if mode == "semantic":
+        query_dense = list(get_dense_model().embed([query]))[0]
+        with _qdrant_lock:
+            results = get_qdrant_client().query_points(
+                collection_name=COLLECTION_NAME,
+                query=query_dense.tolist(),
+                using="text-dense",
+                query_filter=doc_filter,
+                limit=prefetch_limit,
+            )
+    elif mode == "bm25":
+        query_sparse = list(get_sparse_model().embed([query]))[0]
+        with _qdrant_lock:
+            results = get_qdrant_client().query_points(
+                collection_name=COLLECTION_NAME,
+                query=models.SparseVector(
+                    indices=query_sparse.indices.tolist(),
+                    values=query_sparse.values.tolist()
                 ),
-                models.Prefetch(
-                    query=models.SparseVector(
-                        indices=query_sparse.indices.tolist(),
-                        values=query_sparse.values.tolist()
+                using="text-sparse",
+                query_filter=doc_filter,
+                limit=prefetch_limit,
+            )
+    else:
+        # "hybrid" (default) — Reciprocal Rank Fusion (RRF) across both
+        # prefetches; Qdrant's query_points automatically fuses them.
+        query_dense = list(get_dense_model().embed([query]))[0]
+        query_sparse = list(get_sparse_model().embed([query]))[0]
+        with _qdrant_lock:
+            results = get_qdrant_client().query_points(
+                collection_name=COLLECTION_NAME,
+                prefetch=[
+                    models.Prefetch(
+                        query=query_dense.tolist(),
+                        using="text-dense",
+                        limit=prefetch_limit,
+                        filter=doc_filter
                     ),
-                    using="text-sparse",
-                    limit=prefetch_limit,
-                    filter=doc_filter
-                )
-            ],
-            query=models.FusionQuery(fusion=models.Fusion.RRF),
-            limit=prefetch_limit
-        )
-    
+                    models.Prefetch(
+                        query=models.SparseVector(
+                            indices=query_sparse.indices.tolist(),
+                            values=query_sparse.values.tolist()
+                        ),
+                        using="text-sparse",
+                        limit=prefetch_limit,
+                        filter=doc_filter
+                    )
+                ],
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
+                limit=prefetch_limit
+            )
+
     unique_chunks = []
     for point in results.points:
         unique_chunks.append({
@@ -913,39 +954,62 @@ def hybrid_search(query: str, conversation_id: str, top_k: int = 5) -> List[Dict
             "filename": point.payload.get("filename"),
             "fusion_score": point.score
         })
-        
+
     if not unique_chunks:
         return []
-        
-    # Rerank
-    logger.info(f"Reranking {len(unique_chunks)} fused chunks...")
-    reranker = get_reranker()
-    pairs = [[query, chunk["content"]] for chunk in unique_chunks]
+
+    if not rerank:
+        # No CrossEncoder pass — trust Qdrant's own similarity/fusion score
+        # ordering (already descending) and just take the top K.
+        return unique_chunks[:top_k]
+
+    return rerank_chunks(query, unique_chunks, top_k=top_k)
+
+
+def rerank_chunks(
+    query: str, chunks: List[Dict[str, Any]], top_k: int = 5, reranker: Any = None,
+) -> List[Dict[str, Any]]:
+    """
+    Cross-encoder rerank + relevance-floor filter — extracted out of
+    hybrid_search's own rerank=True tail so a Workflow's "reranker" node
+    (app.core.workflows.engine._run_reranker_node) applies the exact same
+    scoring and noise cutoff against a Marketplace-downloaded model
+    (app.core.rerankers.get_cross_encoder), not a reimplementation that
+    could quietly drift from this one.
+
+    reranker defaults to the bundled CrossEncoder (get_reranker()) when
+    unset — hybrid_search's own call site never passes one, so its
+    behavior here is unchanged from before this was extracted.
+    """
+    if not chunks:
+        return []
+    reranker = reranker or get_reranker()
+    logger.info(f"Reranking {len(chunks)} candidates...")
+    pairs = [[query, chunk.get("content") or (chunk.get("payload") or {}).get("content") or (chunk.get("payload") or {}).get("text") or ""] for chunk in chunks]
     scores = reranker.predict(pairs)
 
-    for i, chunk in enumerate(unique_chunks):
+    for i, chunk in enumerate(chunks):
         chunk["rerank_score"] = float(scores[i])
-    unique_chunks.sort(key=lambda x: x["rerank_score"], reverse=True)
+    chunks.sort(key=lambda x: x["rerank_score"], reverse=True)
 
-    # Empirically calibrated against this exact model (BAAI/bge-reranker-
-    # base), not assumed — and re-derived from scratch when the reranker
-    # was upgraded from cross-encoder/ms-marco-MiniLM-L-6-v2, since that
-    # model output raw unbounded logits (-1.29 for a genuine match, -7.9 to
-    # -11.2 for noise) while this one outputs sigmoid-normalized scores in
-    # [0, 1] — the old -6.0 cutoff would have been meaningless here (it
-    # sits below the entire possible range, letting everything through).
-    # Real test queries against real document content: clearly off-topic
-    # queries and vague non-factual ones ("what is this", "summarize")
-    # scored 0.00003-0.0006; a genuine but loosely-worded paraphrase
-    # ("cancellation policy" for a termination clause) scored 0.038; a
-    # strong direct match scored 0.99+. 0.01 sits with a >15x margin above
-    # the true noise ceiling while still keeping loose paraphrases — the
-    # same "clearly separated band" philosophy as the original threshold,
-    # just re-measured for this model's actual score scale. Below this
-    # cutoff, every remaining candidate is closer to "unrelated" than
-    # "on-topic", so returning them as "Relevant excerpts" would just be
-    # confidently wrong — an empty result here correctly falls through to
-    # the "no relevant chunks" path in chat.py rather than injecting noise.
-    _MIN_RERANK_SCORE = 0.01
-    relevant = [c for c in unique_chunks if c["rerank_score"] >= _MIN_RERANK_SCORE]
+    # Empirically calibrated against the bundled model (BAAI/bge-reranker-
+    # base) — re-derived from scratch if that default ever changes, since a
+    # different model's raw score scale won't share this cutoff. A
+    # Marketplace-downloaded reranker (a custom `reranker` passed in) uses
+    # this same cutoff too — sigmoid-normalized cross-encoders share the
+    # same [0, 1] scale, so it's a reasonable shared floor rather than one
+    # hand-tuned per model.
+    #
+    # Real test queries against real document content, on the bundled
+    # model: clearly off-topic queries and vague non-factual ones ("what is
+    # this", "summarize") scored 0.00003-0.0006; a genuine but loosely-
+    # worded paraphrase ("cancellation policy" for a termination clause)
+    # scored 0.038; a strong direct match scored 0.99+. 0.01 sits with a
+    # >15x margin above the true noise ceiling while still keeping loose
+    # paraphrases. Below this cutoff, every remaining candidate is closer
+    # to "unrelated" than "on-topic", so returning them as "Relevant
+    # excerpts" would just be confidently wrong — an empty result here
+    # correctly falls through to the "no relevant chunks" path rather than
+    # injecting noise.
+    relevant = [c for c in chunks if c["rerank_score"] >= _MIN_RERANK_SCORE]
     return relevant[:top_k]

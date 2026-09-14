@@ -15,19 +15,27 @@ app.core.feature_flags.CONNECTORS_ENABLED, not about hiding it entirely:
   to hide those behind the same flag. `auth_router`/`oauth_router` (the
   actual `/auth/{service}/login` OAuth dance) stay separately gated in
   main.py — that part really does need the broker.
-- `custom_mcp_router`: generic user-supplied MCP servers (a raw
-  command/args/env the user provides directly, or a future SSE/streamable
-  url — see http_client.py). No OAuth involved at all.
+- `custom_mcp_router`: everything that isn't a curated catalog entry — a raw
+  stdio command/args/env the user provides directly (see http_client.py's
+  sibling module, stdio_client.py), a hosted server connected by URL over
+  Streamable HTTP (http_client.py — no OAuth, only a static header value
+  the user pastes in themselves), a live search of the public MCP Registry
+  (registry_client.py), or a server installed straight from a GitHub repo
+  (github_installer.py). No OAuth involved anywhere in this router.
 
 Allows the frontend to:
 1. Fetch the catalog, oauth entries filtered out while CONNECTORS_ENABLED is off (`GET /api/connectors/catalog`)
 2. Connect a non-oauth catalog item, auto-downloading whatever runtime its command needs (`POST /api/connectors/catalog/connect`)
 3. Connect arbitrary custom stdio MCP servers (`POST /api/connectors/connect`)
-4. List active status, reload, and disconnect servers
+4. Connect a hosted server over Streamable HTTP (`POST /api/connectors/remote/connect`)
+5. Search the public MCP Registry (`GET /api/connectors/registry/search`)
+6. Inspect and install a server from a GitHub repo (`POST /api/connectors/github/detect`, `POST /api/connectors/github/install`)
+7. List active status, reload, and disconnect servers
 """
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Dict, List, Optional
 from pydantic import BaseModel
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
@@ -38,6 +46,8 @@ from app.core.feature_flags import CONNECTORS_ENABLED
 from app.db.database import SessionLocal, get_db
 from app.mcp.registry import mcp_registry, reconnect_from_saved_config
 from app.mcp.runtime_manager import ensure_runtime
+from app.mcp import registry_client as mcp_registry_client
+from app.mcp import github_installer
 from app.mcp.catalog import (
     get_catalog_list,
     get_catalog_for_audience,
@@ -62,6 +72,27 @@ class ConnectCatalogRequest(BaseModel):
 class ConnectCustomServerRequest(BaseModel):
     server_name: str
     command: List[str]
+    env: Optional[Dict[str, str]] = None
+    model_config = {"defer_build": True}
+
+
+class ConnectRemoteServerRequest(BaseModel):
+    server_name: str
+    url: str
+    headers: Optional[Dict[str, str]] = None
+    model_config = {"defer_build": True}
+
+
+class GitHubDetectRequest(BaseModel):
+    repo_url: str
+    model_config = {"defer_build": True}
+
+
+class GitHubInstallRequest(BaseModel):
+    repo_url: str
+    server_name: str
+    command: List[str]
+    build_steps: Optional[List[List[str]]] = None
     env: Optional[Dict[str, str]] = None
     model_config = {"defer_build": True}
 
@@ -245,6 +276,136 @@ def connect_custom(req: ConnectCustomServerRequest, background_tasks: Background
     HTTP response can't do that. See MCPServersPanel.tsx for the listener.
     """
     background_tasks.add_task(_connect_custom_task, req.server_name, req.command, req.env)
+    return {"status": "connecting", "server_name": req.server_name}
+
+
+async def _connect_remote_task(server_name: str, url: str, headers: Optional[Dict[str, str]]) -> None:
+    """Background task behind POST /remote/connect — no runtime download step
+    (nothing to spawn locally), just the MCP handshake over HTTP. Same
+    mcp_connect_progress/_complete/_failed broadcasts as the stdio paths so
+    the frontend's existing progress UI needs no changes to show this too."""
+    async def progress(**kwargs):
+        await _broadcast_connect_progress(server_name, **kwargs)
+
+    try:
+        await progress(stage="connect", status="running", message=f"Connecting to '{server_name}' at {url}…")
+
+        config_json = {"type": "remote", "server_name": server_name, "url": url, "headers": headers}
+
+        def _do_connect():
+            with SessionLocal() as db:
+                return mcp_registry.connect_remote_server(
+                    server_name=server_name, url=url, headers=headers, db=db, config_json=config_json,
+                )
+
+        tools = await asyncio.to_thread(_do_connect)
+
+        await manager.broadcast_json({
+            "type": "mcp_connect_complete", "server_name": server_name,
+            "tools_count": len(tools), "tools": tools,
+        })
+    except Exception as e:
+        logger.error(f"Error connecting remote MCP server '{server_name}': {e}")
+        await manager.broadcast_json({"type": "mcp_connect_failed", "server_name": server_name, "message": str(e)})
+
+
+@custom_mcp_router.post("/remote/connect")
+def connect_remote(req: ConnectRemoteServerRequest, background_tasks: BackgroundTasks):
+    """
+    Connect a hosted MCP server by URL over the Streamable HTTP transport —
+    no subprocess, no OAuth exchange. `headers` is whatever static values
+    (an API key, a bearer token) the user pasted in themselves; if the
+    server actually requires an OAuth login this will simply fail to
+    authenticate, which is expected — Aegis doesn't run that flow.
+    """
+    background_tasks.add_task(_connect_remote_task, req.server_name, req.url, req.headers)
+    return {"status": "connecting", "server_name": req.server_name}
+
+
+@custom_mcp_router.get("/registry/search")
+def search_mcp_registry(q: str, limit: int = 20):
+    """
+    Live-searches the official public MCP Registry (registry.modelcontextprotocol.io)
+    by name/description. Read-only, unauthenticated — nothing is installed
+    just from a search. See registry_client.py for the response shape.
+    """
+    try:
+        return {"results": mcp_registry_client.search(q, limit=limit)}
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@custom_mcp_router.post("/github/detect")
+async def detect_github_server(req: GitHubDetectRequest):
+    """
+    Clones (or updates an existing clone of) a GitHub repo and inspects it
+    for a runnable MCP server — a package.json with a bin/main entry, or a
+    Python project script. Returns a best-guess command + any build steps
+    needed for the user to review before POSTing /github/install; when
+    nothing recognizable is found, `detected` is false and the user can
+    still type the run command in by hand.
+    """
+    try:
+        repo_dir = await github_installer.clone_or_update(req.repo_url)
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    config = github_installer.detect_run_config(repo_dir)
+    return {"repo_dir": str(repo_dir), **config}
+
+
+async def _install_github_task(
+    repo_url: str, server_name: str, command: List[str],
+    build_steps: List[List[str]], env: Optional[Dict[str, str]],
+) -> None:
+    """Background task behind POST /github/install: (re-)clone, run any build
+    steps, then connect the resulting local command as a normal stdio MCP
+    server — same progress broadcasts as every other connect path."""
+    async def progress(**kwargs):
+        await _broadcast_connect_progress(server_name, **kwargs)
+
+    try:
+        repo_dir = await github_installer.clone_or_update(repo_url, progress)
+
+        if build_steps:
+            await github_installer.build(repo_dir, build_steps, progress)
+
+        await progress(stage="connect", status="running", message=f"Starting '{server_name}' and discovering its tools…")
+
+        config_json = {
+            "type": "github", "server_name": server_name, "repo_url": repo_url,
+            "command": command, "env": env,
+        }
+
+        def _do_connect():
+            with SessionLocal() as db:
+                return mcp_registry.connect_server(
+                    server_name=server_name, command=command, env=env, db=db, config_json=config_json,
+                )
+
+        tools = await asyncio.to_thread(_do_connect)
+
+        await manager.broadcast_json({
+            "type": "mcp_connect_complete", "server_name": server_name,
+            "tools_count": len(tools), "tools": tools,
+        })
+    except Exception as e:
+        logger.error(f"Error installing GitHub MCP server '{server_name}' from {repo_url}: {e}")
+        await manager.broadcast_json({"type": "mcp_connect_failed", "server_name": server_name, "message": str(e)})
+
+
+@custom_mcp_router.post("/github/install")
+def install_from_github(req: GitHubInstallRequest, background_tasks: BackgroundTasks):
+    """
+    Installs and connects an MCP server from a GitHub repo, using the
+    command (and optional build steps) the user reviewed after /github/detect
+    — either the auto-detected guess or one they edited/typed themselves.
+    Runs in the background (clone/build can take real time) reporting
+    progress over the same mcp_connect_progress broadcasts as other connects.
+    """
+    background_tasks.add_task(
+        _install_github_task, req.repo_url, req.server_name, req.command, req.build_steps or [], req.env,
+    )
     return {"status": "connecting", "server_name": req.server_name}
 
 

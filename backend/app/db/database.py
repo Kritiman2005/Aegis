@@ -105,6 +105,15 @@ def init_db():
             conn.execute(text("ALTER TABLE installed_databases ADD COLUMN is_builtin BOOLEAN DEFAULT 0"))
             conn.commit()
 
+        # Marketplace embedding models installed before custom (non-fastembed-
+        # catalog) Hugging Face models were supported predate this column —
+        # every existing row is a real fastembed catalog entry, so that's the
+        # correct default rather than leaving it NULL.
+        existing_embedding_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(embedding_models)"))}
+        if "backend" not in existing_embedding_cols:
+            conn.execute(text("ALTER TABLE embedding_models ADD COLUMN backend TEXT DEFAULT 'fastembed'"))
+            conn.commit()
+
 
     # Setup FTS5 for MCP Tools
     from sqlalchemy import text

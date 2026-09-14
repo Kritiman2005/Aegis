@@ -12,10 +12,9 @@ before pyinstaller), not on each user's machine. So every packaged build
 already has it; there's no marketplace install step for this feature.
 
 WHISPER_MODELS_DIR lives under app/ (not backend/'s top level) specifically
-so PyInstaller's Analysis picks it up the same way it already does for
-app/marketplace/skills — a plain __file__-relative path that resolves
-correctly both in dev (venv) and inside the frozen onedir bundle. See
-main.spec's `datas` for the matching bundle-time glob.
+so PyInstaller's Analysis picks it up via a plain __file__-relative path
+that resolves correctly both in dev (venv) and inside the frozen onedir
+bundle. See main.spec's `datas` for the matching bundle-time glob.
 
 CPU-only by design, not "auto" device selection: this needs to behave
 identically and safely on every machine this ships to, including ones with

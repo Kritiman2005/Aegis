@@ -34,14 +34,6 @@ export default function ContextMemoryHub() {
     max_rag_chunks: 5,
   });
 
-  // Snapshot of the last fetched/saved config — hasChanges compares the
-  // live, edited `config` against this rather than a fixed initial value,
-  // so the Save button correctly disables itself again right after a
-  // successful save.
-  const [savedConfig, setSavedConfig] = useState<UnifiedConfig>(config);
-  const [isSaving, setIsSaving] = useState(false);
-  const hasChanges = JSON.stringify(config) !== JSON.stringify(savedConfig);
-
   const [downloadedModels, setDownloadedModels] = useState<any[]>([]);
   const [unloading, setUnloading] = useState(false);
   const [loadingModelId, setLoadingModelId] = useState<number | null>(null);
@@ -75,57 +67,20 @@ export default function ContextMemoryHub() {
     }
   };
 
+  // Read-only here now — Max Response Length feeds the RAM/latency estimate
+  // below, but editing it (along with the rest of the Memory & Context
+  // settings) moved to the reply-generation "llm" node's own config panel
+  // (WorkflowsView.tsx's MemorySettingsPanel), which posts to this same
+  // /api/context-config endpoint.
   const fetchConfig = async () => {
     try {
       const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/context-config`);
       if (res.ok) {
         const data = await res.json();
-        // Chat's saved values are the shared starting point (it's the one
-        // with max_rag_chunks); the Agent side is unified to match on save.
-        if (data.chat) {
-          setConfig(c => {
-            const next = { ...c, ...data.chat };
-            setSavedConfig(next);
-            return next;
-          });
-        }
+        if (data.chat) setConfig(c => ({ ...c, ...data.chat }));
       }
     } catch (e) {
       console.error(e);
-    }
-  };
-
-  const handleConfigChange = (field: keyof UnifiedConfig, value: number) => {
-    setConfig(c => ({ ...c, [field]: value }));
-  };
-
-  const saveConfig = async () => {
-    setIsSaving(true);
-    try {
-      const shared = {
-        max_history_messages: config.max_history_messages,
-        max_msg_chars: config.max_msg_chars,
-        max_output_tokens: config.max_output_tokens,
-        max_result_snippet: config.max_result_snippet,
-      };
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/context-config`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat: { ...shared, max_rag_chunks: config.max_rag_chunks },
-          agent: shared,
-        }),
-      });
-      if (res.ok) {
-        setSavedConfig(config);
-        toast.success('Settings saved.');
-      } else {
-        toast.error('Failed to save settings.');
-      }
-    } catch (e) {
-      toast.error('Failed to save settings.');
-    } finally {
-      setIsSaving(false);
     }
   };
 
@@ -268,112 +223,6 @@ export default function ContextMemoryHub() {
             <div className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm bg-aegis-text-muted" /><span className="text-aegis-text-secondary">Other {otherAppsGb.toFixed(1)}GB</span></div>
             <div className="flex items-center gap-1.5"><span className={`w-2 h-2 rounded-sm ${isLowMemory ? 'bg-aegis-error' : 'bg-aegis-primary'}`} /><span className="text-aegis-text-secondary">Model {modelEstimatedGb.toFixed(1)}GB</span></div>
             <div className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm bg-blue-400" /><span className="text-aegis-text-secondary">Free {availableGb.toFixed(1)}GB</span></div>
-          </div>
-        </div>
-
-        {/* Memory & Context Settings */}
-        <div className="bg-aegis-raised rounded-xl border border-aegis-border p-4 flex-1 min-h-0 flex flex-col overflow-hidden">
-          <div className="flex items-center justify-between mb-4 flex-shrink-0">
-            <div>
-              <h2 className="text-sm font-bold text-aegis-text-primary">Memory & Context Settings</h2>
-              <p className="text-[11px] text-aegis-text-muted">Higher values improve recall but increase RAM and latency. Applies to both Chat and the Agent — same underlying LLM.</p>
-            </div>
-          </div>
-
-          {/* Sliders — 2-column grid keeps all 4 controls visible without scrolling */}
-          <div className="grid grid-cols-2 gap-x-6 gap-y-4">
-            <div>
-              <div className="flex justify-between items-end mb-1.5">
-                <span className="text-xs font-bold text-aegis-text-primary">Max Response Length</span>
-                <span className="text-xs font-bold text-aegis-primary-light">{config.max_output_tokens.toLocaleString()}</span>
-              </div>
-              <input
-                type="range" min={2048} max={hardware?.max_context || 4096} step={512}
-                value={config.max_output_tokens}
-                onChange={(e) => handleConfigChange('max_output_tokens', parseInt(e.target.value))}
-                className="w-full h-1.5 bg-aegis-overlay rounded-lg appearance-none cursor-pointer accent-aegis-primary focus:outline-none"
-              />
-              <div className="flex justify-between text-[10px] font-medium text-aegis-text-muted mt-1">
-                <span>2,048</span>
-                <span className="text-aegis-primary-light font-bold">Model max: {(hardware?.max_context || 4096).toLocaleString()}</span>
-              </div>
-            </div>
-
-            <div>
-              <div className="flex justify-between items-end mb-1.5">
-                <span className="text-xs font-bold text-aegis-text-primary">Max History Messages</span>
-                <span className="text-xs font-bold text-aegis-primary-light">{config.max_history_messages}</span>
-              </div>
-              <input
-                type="range" min={1} max={20} step={1}
-                value={config.max_history_messages}
-                onChange={(e) => handleConfigChange('max_history_messages', parseInt(e.target.value))}
-                className="w-full h-1.5 bg-aegis-overlay rounded-lg appearance-none cursor-pointer accent-aegis-primary focus:outline-none"
-              />
-              <div className="flex justify-between text-[10px] font-medium text-aegis-text-muted mt-1">
-                <span>1</span>
-                <span>20</span>
-              </div>
-            </div>
-
-            <div>
-              <div className="flex justify-between items-end mb-1.5">
-                <span className="text-xs font-bold text-aegis-text-primary">Max Characters Per Message</span>
-                <span className="text-xs font-bold text-aegis-primary-light">{config.max_msg_chars.toLocaleString()}</span>
-              </div>
-              <input
-                type="range" min={500} max={10000} step={500}
-                value={config.max_msg_chars}
-                onChange={(e) => handleConfigChange('max_msg_chars', parseInt(e.target.value))}
-                className="w-full h-1.5 bg-aegis-overlay rounded-lg appearance-none cursor-pointer accent-aegis-primary focus:outline-none"
-              />
-              <div className="flex justify-between text-[10px] font-medium text-aegis-text-muted mt-1">
-                <span>500</span>
-                <span>10.0k</span>
-              </div>
-            </div>
-
-            <div>
-              <div className="flex justify-between items-end mb-1.5">
-                <span className="text-xs font-bold text-aegis-text-primary">Tool Result Snippet Size</span>
-                <span className="text-xs font-bold text-aegis-primary-light">{config.max_result_snippet.toLocaleString()}</span>
-              </div>
-              <input
-                type="range" min={500} max={10000} step={500}
-                value={config.max_result_snippet}
-                onChange={(e) => handleConfigChange('max_result_snippet', parseInt(e.target.value))}
-                className="w-full h-1.5 bg-aegis-overlay rounded-lg appearance-none cursor-pointer accent-aegis-primary focus:outline-none"
-              />
-              <div className="flex justify-between text-[10px] font-medium text-aegis-text-muted mt-1">
-                <span>500</span>
-                <span>10.0k</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="flex-1 flex items-center">
-            <div className="w-full bg-aegis-primary/10 p-3 rounded-lg border border-aegis-primary/20 flex items-center gap-2">
-              <AlertTriangle className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />
-              <p className="text-xs text-aegis-text-secondary">
-                <strong className="font-semibold text-aegis-text-primary">Max Response Length</strong> has the largest RAM impact — reflected live in the breakdown above.
-                {isLowMemory && ' Available RAM is currently below what the model needs, so responses may be slow.'}
-              </p>
-            </div>
-          </div>
-
-          {/* Save Button */}
-          <div className="pt-3 mt-3 border-t border-aegis-border flex justify-end flex-shrink-0">
-            <button
-              onClick={saveConfig}
-              disabled={!hasChanges || isSaving}
-              className={`px-5 py-2 rounded-lg text-xs font-semibold transition-all ${
-                hasChanges
-                  ? 'bg-aegis-primary text-white hover:bg-aegis-primary-dark shadow-sm'
-                  : 'bg-aegis-overlay text-aegis-text-muted cursor-not-allowed'
-              }`}
-            >
-              {isSaving ? 'Saving...' : 'Save Settings'}
-            </button>
           </div>
         </div>
 

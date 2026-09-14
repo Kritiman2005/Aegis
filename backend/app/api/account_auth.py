@@ -35,7 +35,7 @@ from app.auth.supabase_client import (
 # SUPABASE_URL in supabase_client.py: every install (dev or packaged) needs
 # to reach the same fixed service, and .env isn't bundled into a packaged
 # build.
-WEBAPP_URL = "https://aegis-webapp-theta.vercel.app"
+WEBAPP_URL = "https://aegisaistudio.online"
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/account", tags=["account"])

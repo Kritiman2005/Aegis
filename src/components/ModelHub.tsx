@@ -879,7 +879,7 @@ export default function ModelHub() {
           <input
             value={searchInput}
             onChange={e => setSearchInput(e.target.value)}
-            placeholder="Search models..."
+            placeholder="Search Hugging Face for any GGUF model…"
             className="w-full bg-aegis-raised border border-aegis-border rounded-2xl pl-11 pr-4 py-3 text-sm text-aegis-text-primary placeholder:text-aegis-text-muted focus:outline-none focus:border-aegis-primary/50 transition-colors"
           />
         </div>

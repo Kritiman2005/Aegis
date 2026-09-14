@@ -80,7 +80,7 @@ def delete_database(database_id: int, db: Session = Depends(get_db)):
     if not row:
         raise HTTPException(status_code=404, detail="Database not found.")
     if row.is_builtin:
-        raise HTTPException(status_code=400, detail="This is Aegis's own built-in document store — it can't be deleted.")
+        raise HTTPException(status_code=400, detail=f"'{row.name}' is a built-in database — it can't be deleted.")
 
     path = Path(row.storage_path)
     try:

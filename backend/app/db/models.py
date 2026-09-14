@@ -192,6 +192,59 @@ class Workflow(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class WorkflowRun(Base):
+    """
+    A durable record of one execution of a Workflow — written by
+    app.core.workflows.engine (run_workflow/run_chat_workflow/
+    run_ingestion_workflow) so a run's outcome survives past the WebSocket
+    broadcast that reported it live. Before this existed, a run's outputs
+    only ever existed for the moment the workflow_run_complete/_failed
+    message was on the wire — closing the canvas (or just not watching)
+    lost them permanently, with nothing to debug a failure against.
+
+    id is the same short run_id the engine already generates for its
+    WebSocket messages (run_workflow's uuid4 hex, or a fresh one minted for
+    a chat/ingestion run) — reusing it rather than a separate autoincrement
+    key means a client that saw a live progress message can look this same
+    run up afterwards with the id it already has.
+
+    node_outputs_json is written once, at the end (success or failure) —
+    intermediate per-node progress is still the WebSocket's job, this is
+    purely the retrospective record. Values are sanitized first (see
+    engine._summarize_output_for_history) so a run touching an embedding
+    node doesn't write raw vectors into this table.
+    """
+    __tablename__ = "workflow_runs"
+
+    id = Column(String, primary_key=True)
+    workflow_id = Column(Integer, ForeignKey("workflows.id"), nullable=False, index=True)
+    trigger = Column(String, nullable=False)  # "manual" | "chat" | "ingestion"
+    status = Column(String, nullable=False, default="running")  # "running" | "completed" | "failed"
+    failed_node_id = Column(String, nullable=True)
+    error_message = Column(Text, nullable=True)
+    node_outputs_json = Column(Text, nullable=True)
+    started_at = Column(DateTime, default=datetime.utcnow)
+    finished_at = Column(DateTime, nullable=True)
+
+
+class WorkflowVersion(Base):
+    """
+    A snapshot of a Workflow's graph_json taken right before it gets
+    overwritten (see app.api.workflows.update_workflow) — lets a bad edit
+    be undone without having to rebuild the graph by hand. Only the last
+    WORKFLOW_VERSION_LIMIT (see app.api.workflows) rows per workflow_id are
+    kept; older ones are pruned on insert so this can't grow unbounded on a
+    workflow that's saved constantly while being edited.
+    """
+    __tablename__ = "workflow_versions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workflow_id = Column(Integer, ForeignKey("workflows.id"), nullable=False, index=True)
+    name = Column(String, nullable=False)
+    graph_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class InstalledDatabase(Base):
     """
     A database or vector store the user installed from the Marketplace's
@@ -225,25 +278,53 @@ class InstalledDatabase(Base):
 class EmbeddingModelRegistry(Base):
     """
     An embedding model downloaded from the Marketplace's Embedding Models
-    category (app.api.marketplace_embeddings) — one of fastembed's own
-    supported dense text-embedding models (app.core.embeddings.registry).
-    Each gets its own cache_dir (AEGIS_DATA_DIR/embedding_models/<uuid>)
-    rather than sharing fastembed's default cache, so deleting one is a
-    plain rmtree with no HuggingFace cache-layout guessing. A workflow
-    "vector" node picks one by model_id (data.embeddingModel) — see
-    app.core.embeddings.manager.get_embedder.
+    category (app.api.marketplace_embeddings) — either one of fastembed's
+    own supported dense text-embedding models (app.core.embeddings.registry,
+    backend="fastembed") or an arbitrary Hugging Face repo the user typed in
+    themselves, loaded via sentence-transformers instead since fastembed only
+    runs models from its own fixed, ONNX-converted list (backend=
+    "sentence_transformers"). Each gets its own cache_dir
+    (AEGIS_DATA_DIR/embedding_models/<uuid>) rather than sharing either
+    library's default cache, so deleting one is a plain rmtree with no
+    HuggingFace cache-layout guessing. A workflow "vector" node picks one by
+    model_id (data.embeddingModel) — see app.core.embeddings.manager.get_embedder,
+    which branches on `backend` to know which library to load it with.
     """
     __tablename__ = "embedding_models"
 
     id = Column(Integer, primary_key=True, index=True)
-    model_id = Column(String, unique=True, nullable=False)   # fastembed catalog id, e.g. "BAAI/bge-base-en-v1.5"
+    model_id = Column(String, unique=True, nullable=False)   # fastembed catalog id, or a custom HF repo id
     display_name = Column(String, nullable=False)
-    dim = Column(Integer, nullable=False)
+    dim = Column(Integer, nullable=False)   # unknown for a custom model until its download finishes; 0 until then
+    size_gb = Column(Float, nullable=True)
+    cache_dir = Column(String, nullable=False)
+    backend = Column(String, default="fastembed")  # 'fastembed' | 'sentence_transformers'
+    status = Column(String, default="downloading")  # 'downloading' | 'downloaded' | 'failed'
+    error_message = Column(Text, nullable=True)
+    is_active = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class RerankerModelRegistry(Base):
+    """
+    A cross-encoder reranker downloaded from the Marketplace's Rerankers
+    category (app.api.marketplace_rerankers) — one of app.core.rerankers'
+    curated CATALOG entries. Each gets its own cache_dir
+    (AEGIS_DATA_DIR/reranker_models/<uuid>) rather than sharing
+    sentence-transformers' default cache, so deleting one is a plain
+    rmtree with no HuggingFace cache-layout guessing. A workflow
+    "reranker" node picks one by model_id (data.rerankerModel) — see
+    app.core.rerankers.get_cross_encoder.
+    """
+    __tablename__ = "reranker_models"
+
+    id = Column(Integer, primary_key=True, index=True)
+    model_id = Column(String, unique=True, nullable=False)   # e.g. "BAAI/bge-reranker-base"
+    display_name = Column(String, nullable=False)
     size_gb = Column(Float, nullable=True)
     cache_dir = Column(String, nullable=False)
     status = Column(String, default="downloading")  # 'downloading' | 'downloaded' | 'failed'
     error_message = Column(Text, nullable=True)
-    is_active = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -315,9 +396,9 @@ class TokenUsage(Base):
 
 class ConversationDisabledCapability(Base):
     """
-    Per-conversation OFF-toggles for installed tools/skills — the '+' menu's
-    Tools/Skills switches (Claude Desktop-style: installed once globally via
-    the Marketplace, then turned on/off per chat).
+    Per-conversation OFF-toggles for installed tools — the '+' menu's Tools
+    switches (Claude Desktop-style: installed once globally via the
+    Marketplace, then turned on/off per chat).
 
     Absence of a row means active (the default once installed) — only
     explicit "turned it off in this chat" state gets a row, so a newly
@@ -328,9 +409,7 @@ class ConversationDisabledCapability(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     conversation_id = Column(String, index=True, nullable=False)
-    capability_type = Column(String, nullable=False)  # 'tool' | 'skill'
-    capability_id = Column(String, nullable=False)
-    capability_type = Column(String, nullable=False)  # 'tool' | 'skill'
+    capability_type = Column(String, nullable=False)  # 'tool'
     capability_id = Column(String, nullable=False)
 
 

@@ -19,13 +19,18 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
-from app.db.models import Workflow
+from app.db.models import Workflow, WorkflowRun, WorkflowVersion
 from app.core.workflows.engine import run_workflow, _reachable_subgraph, _upstream_node_ids, _downstream_node_ids
 from app.core.agents.chat import ChatAgent
 from app.mcp.registry import mcp_registry
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/workflows", tags=["workflows"])
+
+# Kept per workflow_id in workflow_versions — old ones are pruned on every
+# insert so editing a workflow constantly (autosave-style) can't grow this
+# table without bound.
+WORKFLOW_VERSION_LIMIT = 30
 
 
 class WorkflowPayload(BaseModel):
@@ -50,6 +55,28 @@ def list_available_tools():
 
     local_tools = [dict(t, server=None) for t in ChatAgent.list_local_tools_for_palette()]
     return {"tools": mcp_tools + local_tools}
+
+
+@router.get("/chunking-strategies")
+def list_chunking_strategies():
+    """Every chunking strategy a Chunk node can pick (app.core.chunking_engines) —
+    built-in algorithms shipped with the app, not a Marketplace-installed
+    capability, so this is its own small endpoint rather than going
+    through the Marketplace tools listing the way per-format extraction
+    engines do."""
+    from app.core import chunking_engines
+    return {"strategies": chunking_engines.list_strategies()}
+
+
+@router.get("/extraction-mcp-tools")
+def list_extraction_mcp_tools():
+    """Every connected MCP tool an Extract node can pick as a custom
+    extractor (app.core.extraction_engines.list_mcp_candidates) — how a
+    user integrates a document-extraction tool Aegis doesn't bundle itself:
+    connect it as an MCP server (Connectors — the catalog, a GitHub repo,
+    the registry, or a raw pasted config all work) and it shows up here."""
+    from app.core import extraction_engines
+    return {"tools": extraction_engines.list_mcp_candidates()}
 
 
 @router.get("")
@@ -80,11 +107,34 @@ def update_workflow(workflow_id: int, payload: WorkflowPayload, db: Session = De
     w = db.query(Workflow).filter(Workflow.id == workflow_id).first()
     if not w:
         raise HTTPException(status_code=404, detail="Workflow not found.")
+
+    new_graph_json = json.dumps(payload.graph)
+    if new_graph_json != w.graph_json:
+        # Snapshot the OUTGOING graph, not the incoming one — a version
+        # entry means "what this workflow looked like before this save",
+        # so restoring it undoes the save that's about to happen. A no-op
+        # save (canvas re-serialized to the same JSON) skips this — it
+        # would just be a duplicate entry with nothing to restore to.
+        _snapshot_version(db, workflow_id, w.name, w.graph_json)
+
     w.name = payload.name
-    w.graph_json = json.dumps(payload.graph)
+    w.graph_json = new_graph_json
     db.commit()
     db.refresh(w)
     return _serialize(w)
+
+
+def _snapshot_version(db: Session, workflow_id: int, name: str, graph_json: str) -> None:
+    db.add(WorkflowVersion(workflow_id=workflow_id, name=name, graph_json=graph_json))
+    db.flush()
+    stale_ids = [
+        v.id for v in db.query(WorkflowVersion.id)
+        .filter(WorkflowVersion.workflow_id == workflow_id)
+        .order_by(WorkflowVersion.created_at.desc())
+        .offset(WORKFLOW_VERSION_LIMIT)
+    ]
+    if stale_ids:
+        db.query(WorkflowVersion).filter(WorkflowVersion.id.in_(stale_ids)).delete(synchronize_session=False)
 
 
 @router.delete("/{workflow_id}")
@@ -92,6 +142,19 @@ def delete_workflow(workflow_id: int, db: Session = Depends(get_db)):
     w = db.query(Workflow).filter(Workflow.id == workflow_id).first()
     if not w:
         raise HTTPException(status_code=404, detail="Workflow not found.")
+    if w.seed_key:
+        # Any seeded row (currently just the one default pipeline) stays
+        # undeletable — it's what a fresh install ships with and what
+        # seed.py's own self-healing (SEED_VERSION bumps) expects to find
+        # and update in place, not recreate from scratch after a user
+        # deletes it by mistake.
+        raise HTTPException(status_code=400, detail=f"'{w.name}' is a default workflow and can't be deleted.")
+    # No ORM relationship/cascade wires these to Workflow — clean them up by
+    # hand so deleting a workflow doesn't leave orphaned run/version rows
+    # (harmless to SQLite, since it isn't enforcing the FK either way, but
+    # pointless dead weight in these tables otherwise).
+    db.query(WorkflowRun).filter(WorkflowRun.workflow_id == workflow_id).delete(synchronize_session=False)
+    db.query(WorkflowVersion).filter(WorkflowVersion.workflow_id == workflow_id).delete(synchronize_session=False)
     db.delete(w)
     db.commit()
     return {"message": f"Deleted workflow {workflow_id}."}
@@ -114,6 +177,89 @@ def run(workflow_id: int, background_tasks: BackgroundTasks, db: Session = Depen
     run_id = uuid.uuid4().hex[:8]
     background_tasks.add_task(run_workflow, workflow_id, run_id, graph)
     return {"status": "running", "run_id": run_id}
+
+
+@router.get("/{workflow_id}/runs")
+def list_runs(workflow_id: int, db: Session = Depends(get_db)):
+    """Recent run history — status/timing only, no per-node outputs (those
+    can be large; fetch a specific run via GET .../runs/{run_id} for that).
+    Written by app.core.workflows.engine's three run entrypoints so a run's
+    outcome survives past the WebSocket messages that reported it live."""
+    rows = (
+        db.query(WorkflowRun)
+        .filter(WorkflowRun.workflow_id == workflow_id)
+        .order_by(WorkflowRun.started_at.desc())
+        .limit(50)
+        .all()
+    )
+    return {"runs": [_serialize_run(r, include_outputs=False) for r in rows]}
+
+
+@router.get("/{workflow_id}/runs/{run_id}")
+def get_run(workflow_id: int, run_id: str, db: Session = Depends(get_db)):
+    r = db.query(WorkflowRun).filter(WorkflowRun.workflow_id == workflow_id, WorkflowRun.id == run_id).first()
+    if not r:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    return _serialize_run(r, include_outputs=True)
+
+
+def _serialize_run(r: WorkflowRun, include_outputs: bool) -> Dict:
+    out = {
+        "id": r.id,
+        "workflow_id": r.workflow_id,
+        "trigger": r.trigger,
+        "status": r.status,
+        "failed_node_id": r.failed_node_id,
+        "error_message": r.error_message,
+        "started_at": r.started_at.isoformat() if r.started_at else None,
+        "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+    }
+    if include_outputs:
+        out["node_outputs"] = json.loads(r.node_outputs_json) if r.node_outputs_json else {}
+    return out
+
+
+@router.get("/{workflow_id}/versions")
+def list_versions(workflow_id: int, db: Session = Depends(get_db)):
+    """Snapshots taken automatically on every /PUT save that actually
+    changed the graph (see update_workflow's _snapshot_version call) —
+    graph_json is omitted here (can be large); fetch a specific version via
+    GET .../versions/{version_id} for that, or restore it directly."""
+    rows = (
+        db.query(WorkflowVersion)
+        .filter(WorkflowVersion.workflow_id == workflow_id)
+        .order_by(WorkflowVersion.created_at.desc())
+        .all()
+    )
+    return {"versions": [{"id": v.id, "name": v.name, "created_at": v.created_at.isoformat() if v.created_at else None} for v in rows]}
+
+
+@router.get("/{workflow_id}/versions/{version_id}")
+def get_version(workflow_id: int, version_id: int, db: Session = Depends(get_db)):
+    v = db.query(WorkflowVersion).filter(WorkflowVersion.workflow_id == workflow_id, WorkflowVersion.id == version_id).first()
+    if not v:
+        raise HTTPException(status_code=404, detail="Version not found.")
+    return {"id": v.id, "name": v.name, "graph": json.loads(v.graph_json), "created_at": v.created_at.isoformat() if v.created_at else None}
+
+
+@router.post("/{workflow_id}/versions/{version_id}/restore")
+def restore_version(workflow_id: int, version_id: int, db: Session = Depends(get_db)):
+    """Restores a workflow's graph to an earlier snapshot — itself
+    snapshotted first (the CURRENT graph, right before being overwritten),
+    same as any other save, so restoring is undoable too."""
+    w = db.query(Workflow).filter(Workflow.id == workflow_id).first()
+    if not w:
+        raise HTTPException(status_code=404, detail="Workflow not found.")
+    v = db.query(WorkflowVersion).filter(WorkflowVersion.workflow_id == workflow_id, WorkflowVersion.id == version_id).first()
+    if not v:
+        raise HTTPException(status_code=404, detail="Version not found.")
+
+    if v.graph_json != w.graph_json:
+        _snapshot_version(db, workflow_id, w.name, w.graph_json)
+    w.graph_json = v.graph_json
+    db.commit()
+    db.refresh(w)
+    return _serialize(w)
 
 
 def _validate_chat_handler_graph(graph: Dict) -> None:
@@ -257,6 +403,11 @@ def _serialize(w: Workflow) -> Dict:
         "graph": json.loads(w.graph_json),
         "is_chat_handler": bool(w.is_chat_handler),
         "is_ingestion_handler": bool(w.is_ingestion_handler),
+        # Non-null only for a seeded row (currently just the one default
+        # pipeline — see app.core.workflows.seed.SEED_WORKFLOW_KEY). Exposed
+        # so the frontend can tell a seeded workflow apart from a
+        # user-created one — e.g. to not offer to delete it.
+        "seed_key": w.seed_key,
         "created_at": w.created_at.isoformat() if w.created_at else None,
         "updated_at": w.updated_at.isoformat() if w.updated_at else None,
     }

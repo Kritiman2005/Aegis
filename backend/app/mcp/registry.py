@@ -13,18 +13,25 @@ from typing import Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from app.mcp.stdio_client import StdioMCPClient
+from app.mcp.http_client import StreamableHTTPMCPClient
 
 logger = logging.getLogger(__name__)
+
+# Either client type exposes the identical start/stop/is_running/initialize/
+# list_tools/call_tool/cached_tools surface — the registry never branches on
+# which one it's holding.
+MCPClient = "StdioMCPClient | StreamableHTTPMCPClient"
 
 
 class MCPServerRegistry:
     """
     Multi-server MCP registry.
-    Manages active StdioMCPClient instances and routes tool calls to the correct server.
+    Manages active MCP client instances (local stdio subprocesses or remote
+    streamable-HTTP connections) and routes tool calls to the correct server.
     """
 
     def __init__(self):
-        self._clients: Dict[str, StdioMCPClient] = {}
+        self._clients: Dict[str, object] = {}
         # tool_name -> server_name mapping
         self._tool_to_server: Dict[str, str] = {}
         # Per-server metadata (e.g. authenticated username, org, etc.)
@@ -43,6 +50,50 @@ class MCPServerRegistry:
         """Returns all server metadata, keyed by server name."""
         return dict(self._server_metadata)
 
+    def _finish_connect(
+        self,
+        server_name: str,
+        client,
+        db: Optional[Session],
+        server_type: str,
+        config_json: Optional[dict],
+    ) -> List[dict]:
+        """Shared tail of connect_server/connect_remote_server: start the
+        already-constructed client, run the handshake, index its tools, and
+        sync to SQLite. Both callers just differ in which client class they
+        hand in (StdioMCPClient vs StreamableHTTPMCPClient)."""
+        if server_name in self._clients:
+            self.disconnect_server(server_name, db=db)
+
+        try:
+            client.start()
+            client.initialize()
+            tools = client.list_tools()
+        except Exception as e:
+            logger.error(f"Failed to connect MCP server '{server_name}': {e}")
+            client.stop()
+            raise RuntimeError(f"Could not connect MCP server '{server_name}': {e}")
+
+        self._clients[server_name] = client
+
+        for t in tools:
+            tool_name = t.get("name")
+            if tool_name:
+                self._tool_to_server[tool_name] = server_name
+
+        if db:
+            from app.db.crud import sync_mcp_server_and_tools
+            sync_mcp_server_and_tools(
+                db=db,
+                server_name=server_name,
+                server_type=server_type,
+                display_name=server_name.replace("_", " ").title(),
+                tools=tools,
+                config_json=config_json
+            )
+
+        return tools
+
     def connect_server(
         self,
         server_name: str,
@@ -56,43 +107,27 @@ class MCPServerRegistry:
         Spawns an MCP server subprocess, performs initialization, fetches available tools,
         updates the internal routing index, and syncs tools into SQLite.
         """
-        # If server is already running, stop it first to refresh
-        if server_name in self._clients:
-            self.disconnect_server(server_name, db=db)
-
         logger.info(f"Connecting MCP server '{server_name}' via command: {' '.join(command)}")
         client = StdioMCPClient(command=command, env=env)
-        
-        try:
-            client.start()
-            client.initialize()
-            tools = client.list_tools()
-        except Exception as e:
-            logger.error(f"Failed to connect MCP server '{server_name}': {e}")
-            client.stop()
-            raise RuntimeError(f"Could not connect MCP server '{server_name}': {e}")
+        return self._finish_connect(server_name, client, db, server_type, config_json)
 
-        self._clients[server_name] = client
-
-        # Update index
-        for t in tools:
-            tool_name = t.get("name")
-            if tool_name:
-                self._tool_to_server[tool_name] = server_name
-
-        # Sync to DB if session provided
-        if db:
-            from app.db.crud import sync_mcp_server_and_tools
-            sync_mcp_server_and_tools(
-                db=db,
-                server_name=server_name,
-                server_type=server_type,
-                display_name=server_name.replace("_", " ").title(),
-                tools=tools,
-                config_json=config_json
-            )
-
-        return tools
+    def connect_remote_server(
+        self,
+        server_name: str,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        db: Optional[Session] = None,
+        config_json: Optional[dict] = None,
+    ) -> List[dict]:
+        """
+        Connects to a hosted MCP server over the Streamable HTTP transport —
+        no subprocess, no OAuth. `headers` is whatever static values the user
+        pasted in themselves (an API key, a bearer token they generated on
+        the server's own site); Aegis never runs an OAuth exchange.
+        """
+        logger.info(f"Connecting remote MCP server '{server_name}' at {url}")
+        client = StreamableHTTPMCPClient(url=url, headers=headers)
+        return self._finish_connect(server_name, client, db, "remote_mcp", config_json)
 
     def connect_google_service(self, service_name: str, credentials_json_str: str, db: Optional[Session] = None) -> List[dict]:
         """
@@ -194,10 +229,6 @@ class MCPServerRegistry:
         """Which connected server (== its catalog key) provides this tool, if any."""
         return self._tool_to_server.get(tool_name)
 
-    def get_server_for_tool(self, tool_name: str) -> Optional[str]:
-        """Which connected server (== its catalog key) provides this tool, if any."""
-        return self._tool_to_server.get(tool_name)
-
     def call_tool(self, tool_name: str, arguments: dict) -> str:
         """Routes a tool call to the server providing it."""
         server_name = self._tool_to_server.get(tool_name)
@@ -250,15 +281,27 @@ def reconnect_from_saved_config(db: Session, server: "MCPServer") -> List[dict]:
             db=db,
             config_json=config,
         )
-    elif config_type in ("oauth", "custom"):
+    elif config_type in ("oauth", "custom", "github"):
         # OAuth servers (GitHub, Slack, Notion, ...) store their resolved
         # command + access token (in env) at connect time — same shape as
-        # a custom server from here on, just re-launched verbatim.
+        # a custom server from here on, just re-launched verbatim. A "github"
+        # server (cloned+built once at install time — see github_installer.py)
+        # stores its resolved local command the same way; the built files
+        # are still on disk, so reconnecting just re-runs that command with
+        # no re-clone/re-build needed.
         server_name = config.get("service_name") or config.get("server_name")
         return mcp_registry.connect_server(
             server_name=server_name,
             command=config["command"],
             env=config.get("env"),
+            db=db,
+            config_json=config,
+        )
+    elif config_type == "remote":
+        return mcp_registry.connect_remote_server(
+            server_name=config["server_name"],
+            url=config["url"],
+            headers=config.get("headers"),
             db=db,
             config_json=config,
         )

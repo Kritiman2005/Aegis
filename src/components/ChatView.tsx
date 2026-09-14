@@ -12,8 +12,6 @@ import {
   Bookmark,
   Loader2,
   Plus,
-  Store,
-  Sparkles,
   FileText,
   XCircle,
   ChevronDown,
@@ -259,7 +257,7 @@ export default function ChatView({
   const [isUploading, setIsUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // "+" attach menu: Upload Document / Tools / Skills
+  // "+" attach menu: Upload Document / Tools
   const [previewAttachment, setPreviewAttachment] = useState<Attachment | null>(null);
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
   // Collapsed by default — the "+" menu shows one "Export" row that expands
@@ -274,8 +272,6 @@ export default function ChatView({
   const [scrapeBarOpen, setScrapeBarOpen] = useState(false);
   const [scrapeUrl, setScrapeUrl] = useState('');
   const [isScraping, setIsScraping] = useState(false);
-  const skillFileInputRef = useRef<HTMLInputElement>(null);
-  const [isUploadingSkill, setIsUploadingSkill] = useState(false);
 
   // "+" > Export: picks the format up front instead of relying on the
   // agent to guess export intent from free text. Chat Mode only — Agent
@@ -283,10 +279,9 @@ export default function ChatView({
   // docstring) and just nudges back to Chat Mode.
   const [pendingExportFormat, setPendingExportFormat] = useState<'pdf' | 'docx' | 'xlsx' | null>(null);
 
-  // Installed Tools/Skills for THIS conversation, with their per-chat
-  // on/off state — the "+" menu's Claude-Desktop-style toggle list.
+  // Installed Tools for THIS conversation, with their per-chat on/off
+  // state — the "+" menu's Claude-Desktop-style toggle list.
   const [capTools, setCapTools] = useState<{ id: string; name: string; active: boolean }[]>([]);
-  const [capSkills, setCapSkills] = useState<{ id: string; name: string; description: string; active: boolean }[]>([]);
 
   const fetchCapabilities = () => {
     if (!sessionId) return;
@@ -294,7 +289,6 @@ export default function ChatView({
       .then(res => res.json())
       .then(data => {
         setCapTools(Array.isArray(data.tools) ? data.tools : []);
-        setCapSkills(Array.isArray(data.skills) ? data.skills : []);
       })
       .catch(() => {});
   };
@@ -305,10 +299,9 @@ export default function ChatView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [attachMenuOpen, sessionId]);
 
-  const toggleCapability = async (type: 'tool' | 'skill', id: string, active: boolean) => {
+  const toggleCapability = async (type: 'tool', id: string, active: boolean) => {
     if (!sessionId) return;
-    if (type === 'tool') setCapTools(prev => prev.map(t => (t.id === id ? { ...t, active } : t)));
-    else setCapSkills(prev => prev.map(s => (s.id === id ? { ...s, active } : s)));
+    setCapTools(prev => prev.map(t => (t.id === id ? { ...t, active } : t)));
     try {
       await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/conversations/${sessionId}/capabilities/${type}/${id}`, {
         method: 'POST',
@@ -326,31 +319,6 @@ export default function ChatView({
     setAttachMenuOpen(false);
     if (toolId === 'playwright_scraper') {
       setScrapeBarOpen(true);
-    }
-  };
-
-  const handleSkillFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setIsUploadingSkill(true);
-    const formData = new FormData();
-    formData.append('file', file);
-    try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/skills/upload`, {
-        method: 'POST',
-        body: formData,
-      });
-      if (res.ok) {
-        fetchCapabilities();
-      } else {
-        const err = await res.json().catch(() => ({}));
-        onSendMessage(`[System] Couldn't add that skill: ${err.detail || 'invalid file'}`, 'toast');
-      }
-    } catch {
-      onSendMessage('[System] Failed to upload the skill file.', 'toast');
-    } finally {
-      setIsUploadingSkill(false);
-      if (skillFileInputRef.current) skillFileInputRef.current.value = '';
     }
   };
 
@@ -831,7 +799,7 @@ export default function ChatView({
 
           {/* Input Bar Bottom Toolbar */}
           <div className="absolute bottom-2.5 left-3 right-3 flex items-center justify-between pointer-events-none">
-            {/* "+" attach menu: Upload Document, then Tools/Skills lists with per-chat toggles */}
+            {/* "+" attach menu: Upload Document, Export, and per-chat tool toggles */}
             <div className="relative pointer-events-auto">
               <input
                 type="file"
@@ -889,42 +857,6 @@ export default function ChatView({
                       ))}
                     </div>
 
-                    {/* Skills — pure guidance the chat agent
-                        draws on automatically when relevant, only while on. */}
-                    <div className="mt-1 pt-1.5 border-t border-aegis-border px-3.5 pb-1 text-[11px] font-semibold text-aegis-text-muted uppercase tracking-wide">
-                      Skills
-                    </div>
-                    {capSkills.map(skill => (
-                      <div key={skill.id} className="w-full flex items-center gap-2.5 px-3.5 py-2 text-[13px] text-aegis-text-primary" title={skill.description}>
-                        <Sparkles className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
-                        <span className="flex-1 truncate">{skill.name}</span>
-                        <ToggleSwitch checked={skill.active} onChange={(v) => toggleCapability('skill', skill.id, v)} />
-                      </div>
-                    ))}
-                    <input
-                      type="file"
-                      ref={skillFileInputRef}
-                      onChange={handleSkillFileChange}
-                      className="hidden"
-                      accept=".md"
-                    />
-                    <button
-                      onClick={() => skillFileInputRef.current?.click()}
-                      disabled={isUploadingSkill}
-                      className="w-full flex items-center gap-2.5 px-3.5 py-2 text-[13px] text-aegis-text-muted hover:bg-aegis-overlay hover:text-aegis-text-primary transition-colors disabled:opacity-50"
-                    >
-                      {isUploadingSkill ? <Loader2 className="w-4 h-4 flex-shrink-0 animate-spin" /> : <Paperclip className="w-4 h-4 flex-shrink-0" />}
-                      <span className="whitespace-nowrap">Upload Custom Skill (.md)</span>
-                    </button>
-                    {capSkills.length === 0 && (
-                      <button
-                        onClick={() => { setAttachMenuOpen(false); onOpenMarketplace?.(); }}
-                        className="w-full flex items-center gap-2.5 px-3.5 py-2 text-[13px] text-aegis-text-muted hover:bg-aegis-overlay hover:text-aegis-text-primary transition-colors"
-                      >
-                        <Store className="w-4 h-4 flex-shrink-0" />
-                        <span className="whitespace-nowrap">Add skills from Marketplace</span>
-                      </button>
-                    )}
                   </div>
                 </>
               )}

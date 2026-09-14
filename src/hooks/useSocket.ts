@@ -412,8 +412,8 @@ export function useSocket() {
         });
         // Turn the animated response indicator on immediately, not only once
         // the first 'token' event arrives — that event only fires after the
-        // backend's whole pre-generation phase (RAG search, skills, status
-        // updates) completes, which can take a real, visible amount of time.
+        // backend's whole pre-generation phase (RAG search, status updates)
+        // completes, which can take a real, visible amount of time.
         // Without this, that entire wait shows nothing at all if a status
         // update is slow, dropped, or the connection hiccups — exactly the
         // blank-screen gap this was reported against. Claude's own "thinking"

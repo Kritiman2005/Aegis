@@ -77,20 +77,12 @@ datas = (
         ('app/core/scraper_driver.js', 'app/core'),
         ('app/core/browser_driver.js', 'app/core'),
     ] +
-    # Bundled marketplace skills (plain .md files, not Python modules) — see
-    # app/core/marketplace.py. Enumerated explicitly (glob, not a bare
-    # directory path) since PyInstaller's datas directory-vs-file handling
-    # has been a repeated source of surprises in this same file already.
-    [
-        (str(p), str(Path('app/marketplace/skills') / p.relative_to('app/marketplace/skills').parent))
-        for p in Path('app/marketplace/skills').rglob('*.md')
-    ] +
     # Bundled Whisper model (see app/core/transcription.py) — downloaded by
     # scripts/download_whisper_model.py, which `npm run build:python` runs
     # right before this spec, so the directory is guaranteed to exist by
-    # the time Analysis runs. Enumerated file-by-file for the same reason
-    # as marketplace skills above: PyInstaller's datas handling of a bare
-    # directory path (vs. individual files) has bitten this project before.
+    # the time Analysis runs. Enumerated file-by-file (glob, not a bare
+    # directory path) since PyInstaller's datas directory-vs-file handling
+    # has been a repeated source of surprises in this same file already.
     # Errors loudly instead of silently shipping a voice-less build if the
     # predownload step didn't run.
     #

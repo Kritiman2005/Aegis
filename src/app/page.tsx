@@ -294,7 +294,7 @@ export default function Home() {
           <AnalyticsView />
         )}
         {activeTab === 'marketplace' && (
-          <MarketplaceView />
+          <MarketplaceView onOpenConnectors={() => setActiveTab('mcp_servers')} />
         )}
       </div>
     </div>

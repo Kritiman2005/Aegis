@@ -20,6 +20,7 @@ const ALLOWED_SEND_CHANNELS = [
   'app:close',
   'app:toggle-devtools',
   'backend:restart',
+  'app:erase-all-data',
 ] as const;
 
 /** Channels the renderer is allowed to RECEIVE from main */

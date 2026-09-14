@@ -11,7 +11,7 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
 // SUPABASE_URL in the backend's supabase_client.py: every install (dev or
 // packaged) needs to reach the same website, and .env isn't bundled into a
 // packaged build.
-const WEBAPP_BASE = 'https://aegis-webapp-theta.vercel.app';
+const WEBAPP_BASE = 'https://aegisaistudio.online';
 
 interface AuthScreenProps {
   onAuthenticated: () => void;

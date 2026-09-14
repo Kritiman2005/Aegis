@@ -19,6 +19,7 @@ import {
   X,
 } from 'lucide-react';
 import { AegisMark } from './AegisLogo';
+import toast from 'react-hot-toast';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
 
@@ -70,8 +71,13 @@ interface SidebarProps {
 
 const NAV_ITEMS = [
   { id: 'workflows'    as TabType, label: 'Workflows', icon: Workflow },
-  { id: 'connectors'   as TabType, label: 'Connectors', icon: Link2 },
-  { id: 'mcp_servers'  as TabType, label: 'MCP Servers', icon: Plug },
+  // 'connectors' is the hidden OAuth-broker feature (ConnectorsView.tsx) —
+  // stays disabled behind connectorsEnabled until a hosted broker exists.
+  // The user-facing "Connectors" name belongs to the MCP feature below
+  // (renamed from "MCP Servers"); this one keeps a distinct label so the
+  // two don't collide if the flag is ever flipped on.
+  { id: 'connectors'   as TabType, label: 'OAuth Connectors', icon: Link2 },
+  { id: 'mcp_servers'  as TabType, label: 'Connectors', icon: Plug },
   { id: 'marketplace' as TabType, label: 'Marketplace', icon: Store },
   { id: 'llms'        as TabType, label: 'LLMs',        icon: Cpu },
   { id: 'context'     as TabType, label: 'Context & Memory', icon: Database },
@@ -118,6 +124,12 @@ export default function Sidebar({
 
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
+  // "Erase all my data" is a plain in-card "click again to confirm" toggle,
+  // not a native confirm() — that blocks the whole renderer until dismissed
+  // (confirmed the hard way building the workflow-delete feature), and this
+  // action is far more consequential than that one (wipes every chat,
+  // downloaded model, and workflow, not just one graph).
+  const [eraseArmed, setEraseArmed] = useState(false);
   const accountMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -125,6 +137,7 @@ export default function Sidebar({
     const handleClickOutside = (e: MouseEvent) => {
       if (accountMenuRef.current && !accountMenuRef.current.contains(e.target as Node)) {
         setAccountMenuOpen(false);
+        setEraseArmed(false);
       }
     };
     document.addEventListener('mousedown', handleClickOutside);
@@ -139,6 +152,26 @@ export default function Sidebar({
       setLoggingOut(false);
       setAccountMenuOpen(false);
     }
+  };
+
+  // Only meaningful inside the packaged Electron app (window.aegis comes
+  // from electron/preload.ts's contextBridge) — running the Next.js dev
+  // server in a plain browser tab has no main process to ask, so the
+  // button below only renders when this is actually available.
+  const aegisBridge = typeof window !== 'undefined' ? window.aegis : undefined;
+
+  const handleEraseAllData = () => {
+    if (!eraseArmed) {
+      setEraseArmed(true);
+      return;
+    }
+    if (!aegisBridge) {
+      toast.error('This only works in the installed desktop app.');
+      return;
+    }
+    aegisBridge.send('app:erase-all-data');
+    // The main process kills the sidecar, wipes userData, and relaunches
+    // the app itself — nothing left to do here, the window is about to close.
   };
 
   return (
@@ -298,6 +331,17 @@ export default function Sidebar({
             >
               {loggingOut ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <LogOut className="w-3.5 h-3.5" />}
               Log out
+            </button>
+            <div className="h-px bg-aegis-sidebar-border mx-1" />
+            <button
+              onClick={handleEraseAllData}
+              title="Deletes every chat, workflow, downloaded model, and connector — everything under Aegis's data folder."
+              className={`w-full flex items-center gap-2.5 px-3 py-2 text-[12px] font-medium transition-colors ${
+                eraseArmed ? 'text-white bg-red-600 hover:bg-red-700' : 'text-red-400 hover:bg-aegis-sidebar-border hover:text-red-300'
+              }`}
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              {eraseArmed ? 'Click again to erase everything' : 'Erase all my data'}
             </button>
           </div>
         )}

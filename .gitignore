@@ -39,6 +39,9 @@ dist-info/
 *.sqlite3
 qdrant_db/
 backend/qdrant_db/
+# Runtime marker — set once app.core.rag.processor.migrate_documents_to_current_embedding
+# has run for this local install, not part of the app itself.
+backend/.embedding_v2_migrated
 # Whisper model — downloaded by scripts/download_whisper_model.py at build
 # time (see app/core/transcription.py), not committed.
 backend/app/whisper_bundled/
@@ -51,6 +54,9 @@ browsers/
 # command (npx/uvx) isn't already installed — same AEGIS_DATA_DIR-or-repo-
 # root fallback as browsers/ above (see app/mcp/runtime_manager.py).
 backend/runtimes/
+# Repos cloned by the GitHub-install connector flow — same AEGIS_DATA_DIR-or-
+# repo-root fallback (see app/mcp/github_installer.py).
+backend/connector_repos/
 # Whisper model — downloaded by scripts/download_whisper_model.py at build
 # time (see app/core/transcription.py), not committed.
 backend/app/whisper_bundled/

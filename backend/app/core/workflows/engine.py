@@ -7,7 +7,7 @@ what Agent Mode's LLM-driven planning was replaced with: the user decides
 which tool runs at each step by placing a node for it, so there is no
 "guess the right tool from a menu" decision for a local model to get wrong.
 
-Eight node kinds (node.data.kind):
+Nine node kinds (node.data.kind):
   - "mcp" / "tool": a direct tool call — MCP-connected or local. Arguments
     come from data.staticInputs (fixed values, deterministic) unless
     data.isAi is set, in which case ExecutorAgent.generate_arguments fills
@@ -31,16 +31,16 @@ Eight node kinds (node.data.kind):
     propagation pass) — this is how "should we even search" or "does this
     look export-related" becomes a visible, reconfigurable node instead of
     logic hardcoded inside some other node.
-  - "database": runs a SQL query against data.databaseId, an
-    app.db.models.InstalledDatabase row installed from the Marketplace's
-    Databases category — any relational engine in app.core.dbengines'
-    catalog (sqlite, duckdb, ...), not just SQLite.
-  - "aegis_database": browses/edits (data.operation: list/insert/update/
-    delete) Aegis's OWN SQLite database — a curated, credential-free
-    allowlist of tables plus any table the user created themselves
-    through this node's canvas browser (see app.core.aegis_db_browser for
-    the full safety model). A different database entirely from the
-    "database" node above.
+  - "database": targets data.databaseId, an app.db.models.InstalledDatabase
+    row — either one installed from the Marketplace's Databases category
+    (a SQL query, any relational engine in app.core.dbengines' catalog:
+    sqlite, duckdb, ...) or Aegis's OWN SQLite database
+    (seed.BUILTIN_AEGIS_DB_ENGINE_ID, auto-registered as a normal-looking
+    row so it's just another dropdown choice, not a separate hardcoded
+    node kind): data.operation (list/insert/update/delete) against a
+    curated, credential-free allowlist of tables plus any table the user
+    created themselves through this node's canvas browser — see
+    app.core.aegis_db_browser for the full safety model.
   - "embedding": embeds upstream text with data.embeddingModel — a model
     downloaded from the Marketplace's Embedding Models category
     (app.core.embeddings), or the app's own bundled dense model if unset.
@@ -52,11 +52,21 @@ Eight node kinds (node.data.kind):
     (it no longer embeds text itself); "search" still embeds its own
     query text internally with data.embeddingModel — a deliberate
     asymmetry, see _run_vector_node's docstring for why.
+  - "reranker": re-scores an upstream "vector" search's list of matches
+    against a query with a cross-encoder (data.rerankerModel — a model
+    downloaded from the Marketplace's Rerankers category, or the app's own
+    bundled default if unset) and returns the top data.topK, reordered by
+    relevance rather than raw embedding/BM25 similarity — see
+    _run_reranker_node. Deliberately its own node, not a checkbox on
+    "vector", so a workflow can search wide and rerank down explicitly.
   - "extract": pulls plain text out of a document file (data.staticInputs
     filePath / an upstream-wired path) — the same extractor the app's own
     document upload pipeline uses (app.core.rag.processor.extract_text).
   - "chunk": splits upstream text into overlapping chunks
-    (data.chunkSize/overlap), reusing app.core.rag.processor.chunk_text.
+    (data.chunkSize/overlap). data.strategy picks which chunking strategy
+    from app.core.chunking_engines' registry (recursive/paragraph/
+    sentence/fixed) — unset uses the same recursive strategy the app's own
+    document RAG pipeline uses (app.core.rag.processor.chunk_text).
   - "loop": runs its single direct downstream node once per item in an
     upstream array, collecting the results — see _run_loop_node for the
     (deliberately scoped-down) semantics.
@@ -101,15 +111,15 @@ itself holds none:
     graph's true terminal isn't "chat_reply" itself; see
     run_chat_workflow's docstring.
 
-A workflow's memory/entity context, matched-skill guidance, and the
-bundled hybrid document store's real hybrid search are all still
-available — the first two as config on the reply-generating "llm" node
-(see its includeSkillGuidance/memory-settings panel), the last via the
-generic "embedding" + "vector" nodes pointed at the bundled aegis_hybrid
-store (see _run_vector_node) — there's no dedicated node kind for any of
-them anymore; a plain "llm" node handles any other judgment call a workflow
-needs (e.g. "does this turn need document search" or "should this reply
-export to a file"), same as any other reasoning step.
+A workflow's memory/entity context and the bundled hybrid document store's
+real hybrid search are all still available — the first as config on the
+reply-generating "llm" node (see its memory-settings panel), the second via
+the generic "embedding" + "vector" (+ optional "reranker") nodes pointed at
+the bundled aegis_hybrid store (see _run_vector_node/_run_reranker_node) —
+there's no dedicated node kind for either anymore; a plain "llm" node
+handles any other judgment call a workflow needs (e.g. "does this turn need
+document search" or "should this reply export to a file"), same as any
+other reasoning step.
 
 Every step broadcasts progress over the same WebSocket connection manager
 used elsewhere in this app (MCP-connect progress, model-download progress)
@@ -124,6 +134,7 @@ per-connection progress instead of a broadcast).
 import json
 import logging
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -473,77 +484,93 @@ def _lookup_installed_database(database_id) -> Dict[str, Any]:
         return {"engine_id": row.engine_id, "storage_path": row.storage_path, "category": row.category, "name": row.name}
 
 
-async def _run_database_node(node: Dict, edges: List[Dict], node_outputs: Dict[str, Any]) -> List[Dict]:
-    """Runs a query against an installed relational database — any engine
-    in app.core.dbengines' catalog (sqlite, duckdb, ...), dispatched
-    generically through the engine's own adapter rather than hardcoding
-    SQLite. Query parameters come from the same staticInputs+edge-mapping
-    every tool node already uses, bound as each engine's own named-
-    placeholder style (":name" for SQLite, "$name" for DuckDB — see the
-    engine's placeholder_syntax in GET /api/marketplace/databases/catalog)."""
+async def _run_database_node(node: Dict, edges: List[Dict], node_outputs: Dict[str, Any]) -> Any:
+    """Runs against an installed relational database — one node covers
+    both a Marketplace-installed database of the user's own choosing (any
+    engine in app.core.dbengines' catalog: sqlite, duckdb, ... — a raw SQL
+    query, params bound as that engine's own named-placeholder style, see
+    GET /api/marketplace/databases/catalog's placeholder_syntax) AND the
+    app's own bundled SQLite database (seed.BUILTIN_AEGIS_DB_ENGINE_ID —
+    browsed/edited through app.core.aegis_db_browser's safety model: its
+    system tables are always visible via "list" but never writable —
+    insert/update/delete/a write through "query" only ever work on a
+    table the user created themselves, the same allowlist/permission
+    split the canvas browser enforces), selected the same way any other
+    installed database is: from data.databaseId, not a separate hardcoded
+    node kind. data.operation (list/insert/update/delete/create_table/
+    query) and data.table only apply to the SQLite case (table unused for
+    "query"); data.query only applies otherwise UNLESS operation=="query",
+    which reuses that same field — the raw-SQL escape hatch works
+    identically whichever database is selected. insert/update values, and
+    a query's own named parameters, come from the same staticInputs+edge-
+    mapping every tool node already uses; update/delete additionally need
+    a primary-key value, resolved the same way under the key "__pk".
+    create_table takes data.table as the NEW table's name and
+    data.newTableColumns (a list of {name, type, nullable}) as its
+    columns — see aegis_db_browser.create_table. query runs data.query
+    directly — see aegis_db_browser.run_query for what it allows (any
+    SELECT, any statement against a table the user created, or a fresh
+    CREATE TABLE, which becomes immediately usable afterward)."""
+    from app.core.workflows.seed import BUILTIN_AEGIS_DB_ENGINE_ID
+
     data = node.get("data", {})
+    label = data.get("label") or node["id"]
     database_id = data.get("databaseId")
-    query = data.get("query")
     if not database_id:
-        raise WorkflowError(f"Node '{data.get('label') or node['id']}' has no database selected — pick one installed from the Marketplace.")
-    if not query:
-        raise WorkflowError(f"Node '{data.get('label') or node['id']}' has no query configured.")
+        raise WorkflowError(f"Node '{label}' has no database selected — pick one installed from the Marketplace.")
 
     info = _lookup_installed_database(database_id)
     if info["category"] != "relational":
         raise WorkflowError(f"'{info['name']}' is a vector store, not a relational database — use a vector node instead.")
 
+    if info["engine_id"] == BUILTIN_AEGIS_DB_ENGINE_ID:
+        from app.core import aegis_db_browser as browser
+        from app.db.database import SessionLocal
+
+        operation = data.get("operation", "list")
+        args = _resolve_named_arguments(node, edges, node_outputs)
+
+        db = SessionLocal()
+        try:
+            if operation == "query":
+                query = data.get("query")
+                if not query:
+                    raise WorkflowError(f"Node '{label}' has no query configured.")
+                return browser.run_query(db, query, args)
+
+            table = data.get("table")
+            if not table:
+                raise WorkflowError(f"Node '{label}' has no table {'name' if operation == 'create_table' else 'selected'}.")
+
+            if operation == "list":
+                limit = int(data.get("limit") or 50)
+                return browser.get_rows(db, table, limit, 0)
+            elif operation == "insert":
+                return browser.insert_row(db, table, args)
+            elif operation in ("update", "delete"):
+                pk_value = args.pop("__pk", None)
+                if pk_value is None:
+                    raise WorkflowError(f"Node '{label}' needs a primary key value — set a \"__pk\" fixed value or wire one in from upstream.")
+                if operation == "update":
+                    return browser.update_row(db, table, pk_value, args)
+                return browser.delete_row(db, table, pk_value)
+            elif operation == "create_table":
+                columns = data.get("newTableColumns") or []
+                if not columns:
+                    raise WorkflowError(f"Node '{label}' needs at least one column to create '{table}' with.")
+                return browser.create_table(db, table, columns)
+            else:
+                raise WorkflowError(f"Node '{label}' has an unknown operation '{operation}'.")
+        except browser.TableError as e:
+            raise WorkflowError(f"'{label}': {e}")
+        finally:
+            db.close()
+
+    query = data.get("query")
+    if not query:
+        raise WorkflowError(f"Node '{label}' has no query configured.")
     params = _resolve_named_arguments(node, edges, node_outputs)
     return await relational_engine.run_query(info["engine_id"], info["storage_path"], query, params)
-
-
-async def _run_aegis_database_node(node: Dict, edges: List[Dict], node_outputs: Dict[str, Any]) -> Any:
-    """
-    Runs a safe operation (data.operation: list/insert/update/delete)
-    against Aegis's OWN SQLite database — a curated, credential-free
-    allowlist of tables (chat history, workflows, installed databases,
-    ...) plus any table the user created themselves through this same
-    node's canvas browser. Deliberately not the generic "database" node
-    above (that's for a Marketplace-installed database of the user's own
-    choosing); every operation here goes through app.core.aegis_db_browser,
-    the single place the actual safety model (allowlist, name-collision
-    checks, parameterized queries — never raw string interpolation of a
-    value) lives. insert/update values come from the same staticInputs+
-    edge-mapping every tool node already uses; update/delete additionally
-    need a primary-key value, resolved the same way under the key "__pk".
-    """
-    from app.core import aegis_db_browser as browser
-    from app.db.database import SessionLocal
-
-    data = node.get("data", {})
-    label = data.get("label") or node["id"]
-    table = data.get("table")
-    operation = data.get("operation", "list")
-    if not table:
-        raise WorkflowError(f"Node '{label}' has no table selected.")
-
-    args = _resolve_named_arguments(node, edges, node_outputs)
-
-    db = SessionLocal()
-    try:
-        if operation == "list":
-            limit = int(data.get("limit") or 50)
-            return browser.get_rows(db, table, limit, 0)
-        elif operation == "insert":
-            return browser.insert_row(db, table, args)
-        elif operation in ("update", "delete"):
-            pk_value = args.pop("__pk", None)
-            if pk_value is None:
-                raise WorkflowError(f"Node '{label}' needs a primary key value — set a \"__pk\" fixed value or wire one in from upstream.")
-            if operation == "update":
-                return browser.update_row(db, table, pk_value, args)
-            return browser.delete_row(db, table, pk_value)
-        else:
-            raise WorkflowError(f"Node '{label}' has an unknown operation '{operation}'.")
-    except browser.TableError as e:
-        raise WorkflowError(f"'{label}': {e}")
-    finally:
-        db.close()
 
 
 async def _run_embedding_node(
@@ -606,14 +633,12 @@ async def _run_vector_node(
 ) -> Any:
     """
     Upserts or searches (data.operation) an installed vector store — pure
-    storage/search now, no embedding of its own for "upsert" (that's the
-    "embedding" node's job; wire one in upstream — its {"texts", "vectors"}
-    output is what this reads). "search" is the one deliberate asymmetry:
-    it still embeds its own query text internally with data.embeddingModel
-    (same model resolution as the embedding node) rather than requiring a
-    separate node just to embed one query string — most workflows would
-    rather type the query directly on this node than thread it through an
-    extra step.
+    storage/search, no embedding of its own: both "upsert" and "search"
+    against a Marketplace-installed store need an "embedding" node wired in
+    upstream (its {"texts", "vectors"} output for upsert; its "vectors" for
+    search's query vector) — a plain dense-search store never resolves
+    data.embeddingModel itself, so there's exactly one place a workflow
+    configures which embedding model it's using, not two.
 
     One engine_id is special: seed.BUILTIN_VECTOR_ENGINE_ID
     ("aegis_hybrid") is Aegis's own bundled document store — the real
@@ -633,7 +658,6 @@ async def _run_vector_node(
     document_id (see _find_ancestor_loop_item); outside of that, it
     raises rather than storing under the wrong document.
     """
-    from app.core.embeddings.manager import get_embedder
     from app.core.workflows.seed import BUILTIN_VECTOR_ENGINE_ID
 
     data = node.get("data", {})
@@ -699,7 +723,14 @@ async def _run_vector_node(
         # (wired upstream, gating this whole branch — see
         # _run_logic_node and the dispatch loops' gate-propagation pass),
         # not a special case in here.
-        query_text = data.get("instruction") or None
+        # An incoming edge explicitly mapped to inputField "query" (see
+        # WorkflowsView.tsx's EdgeConfigPanel) wins over every implicit
+        # fallback below — e.g. wiring a specific field of a multi-field
+        # upstream dict in as the query, rather than this node's own
+        # "upstream.get('query')" guess.
+        query_text = _resolve_named_arguments(node, edges, node_outputs).get("query") or None
+        if not query_text:
+            query_text = data.get("instruction") or None
         if not query_text and isinstance(upstream, dict):
             query_text = upstream.get("query") or None
         if not query_text and isinstance(upstream, str):
@@ -719,26 +750,88 @@ async def _run_vector_node(
             # AND a sparse vector, which a generic Embedding node's single
             # dense-only output can't provide (same reason upsert against
             # this store ignores an upstream Embedding node's vectors too).
+            # data.searchMode is a real choice exposed on this node's config
+            # (only meaningful for this store — the only one with a sparse
+            # index at all) — see app.core.rag.processor.hybrid_search's
+            # mode param. Reranking is never done here — it's always
+            # rerank=False, trusting the store's own fusion/similarity
+            # order; wire a "reranker" node downstream (see
+            # _run_reranker_node) to re-score these candidates with a
+            # cross-encoder instead.
             from app.core.rag.processor import hybrid_search
-            return await anyio.to_thread.run_sync(lambda: hybrid_search(query=query_text, conversation_id=conversation_id, top_k=top_k))
+            search_mode = data.get("searchMode") or "hybrid"
+            return await anyio.to_thread.run_sync(
+                lambda: hybrid_search(query=query_text, conversation_id=conversation_id, top_k=top_k, mode=search_mode, rerank=False)
+            )
 
-        # An upstream "Embedding" node's own vector is used directly when
-        # present — real, not decorative, unlike the aegis_hybrid case
-        # above: a Marketplace-installed store's plain dense search can use
-        # exactly the vector that node already computed, so wiring one in
-        # (e.g. "Decide" -> "Embedding" -> "Vector") saves a redundant
-        # second embedding call rather than just documenting intent.
+        # A Marketplace-installed store's plain dense search always uses an
+        # upstream "Embedding" node's own vector — never re-embeds here —
+        # so a workflow configures its embedding model in exactly one
+        # place (e.g. "Decide" -> "Embedding" -> "Vector").
         query_vector = upstream["vectors"][0] if isinstance(upstream, dict) and upstream.get("vectors") else None
         if query_vector is None:
-            try:
-                model = await anyio.to_thread.run_sync(get_embedder, data.get("embeddingModel"))
-            except ValueError as e:
-                raise WorkflowError(f"Node '{label}': {e}")
-            query_vector = await anyio.to_thread.run_sync(lambda: list(model.embed([query_text]))[0].tolist())
+            raise WorkflowError(f"Node '{label}' needs an Embedding node wired in upstream — it has no vector to search with.")
         return await vector_engine.search(info["engine_id"], info["storage_path"], query_vector, top_k)
 
     else:
         raise WorkflowError(f"Node '{label}' has an unknown vector operation '{operation}'.")
+
+
+async def _run_reranker_node(
+    node: Dict, edges: List[Dict], node_outputs: Dict[str, Any],
+    chat_ctx: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Re-scores an upstream "vector" search's candidate list against a query
+    using a cross-encoder, returning the top data.topK reordered by actual
+    relevance rather than raw embedding/BM25 similarity. Deliberately its
+    own node, not a checkbox on "vector" — a workflow can search wide (a
+    generous vector node topK) and rerank down to a smaller final count
+    explicitly, the same two-step shape a real retrieval pipeline has.
+
+    The candidate list comes from an incoming edge explicitly mapped to
+    inputField "results" (see NodeInputColumn in WorkflowsView.tsx), else
+    the nearest upstream node whose output is a list — normally the
+    "vector" node feeding this one directly. The query text follows the
+    same resolution order a "vector" search node's own query text does:
+    a mapped "query" field, then data.instruction, then the live chat
+    message.
+
+    data.rerankerModel: a cross-encoder downloaded from the Marketplace's
+    Rerankers category (app.core.rerankers), or the app's own bundled
+    default (app.core.rag.processor.get_reranker) when unset — same
+    resolution shape as a "vector"/"embedding" node's data.embeddingModel.
+    """
+    from app.core.rag.processor import rerank_chunks
+    from app.core.rerankers import get_cross_encoder
+
+    data = node.get("data", {})
+    label = data.get("label") or node["id"]
+
+    mapped = _resolve_named_arguments(node, edges, node_outputs)
+    results = mapped.get("results")
+    if not isinstance(results, list):
+        for src_id in _upstream_node_ids(node["id"], edges):
+            val = node_outputs.get(src_id)
+            if isinstance(val, list):
+                results = val
+                break
+    if not isinstance(results, list) or not results:
+        return results if isinstance(results, list) else []
+
+    query_text = mapped.get("query") or data.get("instruction") or None
+    if not query_text and chat_ctx:
+        query_text = chat_ctx.get("message")
+    if not query_text:
+        raise WorkflowError(f"Node '{label}' has no query text — set one or wire in upstream text.")
+
+    try:
+        reranker = await anyio.to_thread.run_sync(get_cross_encoder, data.get("rerankerModel") or None)
+    except ValueError as e:
+        raise WorkflowError(f"Node '{label}': {e}")
+
+    top_k = int(data.get("topK") or 5)
+    return await anyio.to_thread.run_sync(lambda: rerank_chunks(query_text, results, top_k=top_k, reranker=reranker))
 
 
 async def _run_extract_node(node: Dict, edges: List[Dict], node_outputs: Dict[str, Any]) -> str:
@@ -771,10 +864,13 @@ async def _run_extract_node(node: Dict, edges: List[Dict], node_outputs: Dict[st
 
 
 def _run_chunk_node(node: Dict, edges: List[Dict], node_outputs: Dict[str, Any]) -> List[str]:
-    """Splits upstream text into overlapping chunks, reusing the same
-    recursive paragraph/sentence-aware chunker the app's own document RAG
-    pipeline uses (app.core.rag.processor.chunk_text)."""
-    from app.core.rag.processor import chunk_text
+    """Splits upstream text into overlapping chunks. data.strategy picks
+    which one from app.core.chunking_engines' registry (recursive/
+    paragraph/sentence/fixed) — left unset, this is byte-identical to the
+    app's own document RAG pipeline (app.core.rag.processor.chunk_text),
+    same as every other strategy-registry node (Extract) defaults to the
+    real pipeline's own behavior when unconfigured."""
+    from app.core import chunking_engines
 
     data = node.get("data", {})
     upstream_ids = _upstream_node_ids(node["id"], edges)
@@ -784,7 +880,57 @@ def _run_chunk_node(node: Dict, edges: List[Dict], node_outputs: Dict[str, Any])
 
     chunk_size = int(data.get("chunkSize") or 300)
     overlap = int(data.get("overlap") or 50)
-    return chunk_text(text, chunk_size=chunk_size, overlap=overlap)
+    return chunking_engines.chunk(text, chunk_size=chunk_size, overlap=overlap, strategy_id=data.get("strategy"))
+
+
+_RETRYABLE_KINDS = {"mcp", "tool", "database", "vector", "embedding", "reranker"}
+_RETRY_DELAYS = (0.5, 1.5)  # gaps between attempts — 3 tries total
+
+
+async def _execute_node_with_retry(
+    node_id: str,
+    nodes: Dict[str, Dict],
+    edges: List[Dict],
+    node_outputs: Dict[str, Any],
+    chat_agent: ChatAgent,
+    executor: ExecutorAgent,
+    conversation_id: Optional[str] = None,
+    chat_ctx: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """
+    Thin wrapper around _execute_node that automatically retries node kinds
+    which talk to something outside this process — an MCP tool call, an
+    installed relational/vector database, or a downloaded embedding/
+    reranker model — since a transient network blip or a momentary rate
+    limit shouldn't fail an entire run when trying again a moment later
+    would have worked. Every OTHER kind ("llm", "logic", "extract",
+    "chunk", the trigger/reply kinds) is pure local compute where a second
+    attempt would just fail identically, so those go straight through with
+    no added latency.
+
+    Never retries a WorkflowError — that signals a structural/config
+    problem (no tool selected, invalid regex, missing database) that a
+    retry can't fix, exactly like it can't fix it the first time. Only a
+    plain Exception bubbling out of the underlying call (the actual
+    tool/DB/model call failing) is treated as possibly-transient.
+    """
+    kind = nodes[node_id].get("data", {}).get("kind", "tool")
+    if kind not in _RETRYABLE_KINDS:
+        return await _execute_node(node_id, nodes, edges, node_outputs, chat_agent, executor, conversation_id=conversation_id, chat_ctx=chat_ctx)
+
+    label = nodes[node_id].get("data", {}).get("label") or node_id
+    last_exc: Exception = None
+    for attempt, delay in enumerate((0.0,) + _RETRY_DELAYS):
+        if delay:
+            logger.warning(f"Node '{label}' failed ({last_exc}) — retrying in {delay}s (attempt {attempt + 1}/{len(_RETRY_DELAYS) + 1}).")
+            await anyio.sleep(delay)
+        try:
+            return await _execute_node(node_id, nodes, edges, node_outputs, chat_agent, executor, conversation_id=conversation_id, chat_ctx=chat_ctx)
+        except WorkflowError:
+            raise
+        except Exception as e:
+            last_exc = e
+    raise last_exc
 
 
 async def _execute_node(
@@ -841,8 +987,20 @@ async def _execute_node(
         # decide/classify-style node shouldn't need its own explicit model
         # pick just to work out of the box.
         upstream = {src: node_outputs.get(src) for src in _upstream_node_ids(node_id, edges)}
+        # An incoming edge explicitly mapped to inputField "instruction"
+        # (see WorkflowsView.tsx's EdgeConfigPanel) overrides this node's
+        # own static Prompt text — e.g. wiring a search result's "content"
+        # straight in as the instruction itself, not just contextual data.
+        # Every other resolved field (if any) is folded into the context
+        # dict too, under its own mapped name, alongside the normal
+        # per-source-id upstream — purely additive, so a graph that never
+        # sets any mapping behaves exactly as before.
+        mapped = _resolve_named_arguments(node, edges, node_outputs)
+        instruction = mapped.pop("instruction", None) or data.get("instruction", "")
+        if mapped:
+            upstream = {**upstream, **mapped}
         return await _run_ai_reasoning_node(
-            executor, data.get("instruction", ""), upstream, data.get("modelName") or None,
+            executor, instruction, upstream, data.get("modelName") or None,
             output_fields=data.get("outputFields"), temperature=data.get("temperature"), max_tokens=data.get("maxTokens"),
         )
 
@@ -852,11 +1010,11 @@ async def _execute_node(
     elif kind == "database":
         return await _run_database_node(node, edges, node_outputs)
 
-    elif kind == "aegis_database":
-        return await _run_aegis_database_node(node, edges, node_outputs)
-
     elif kind == "vector":
         return await _run_vector_node(node, edges, node_outputs, conversation_id=conversation_id, chat_ctx=chat_ctx)
+
+    elif kind == "reranker":
+        return await _run_reranker_node(node, edges, node_outputs, chat_ctx=chat_ctx)
 
     elif kind == "embedding":
         return await _run_embedding_node(node, edges, node_outputs, chat_ctx=chat_ctx)
@@ -1004,7 +1162,7 @@ async def _run_loop_node(
         try:
             last_result = None
             for step_id in chain:
-                last_result = await _execute_node(step_id, nodes, edges, node_outputs, chat_agent, executor, conversation_id=conversation_id, chat_ctx=chat_ctx)
+                last_result = await _execute_node_with_retry(step_id, nodes, edges, node_outputs, chat_agent, executor, conversation_id=conversation_id, chat_ctx=chat_ctx)
                 node_outputs[step_id] = last_result
             results.append(last_result)
             if marks_documents_ready and isinstance(item, dict) and item.get("document_id") is not None:
@@ -1103,46 +1261,6 @@ def _upstream_dict_with_key(node_id: str, edges: List[Dict], node_outputs: Dict[
         if isinstance(val, dict) and key in val:
             return val
     return None
-
-
-def _run_skills_context_node(
-    chat_agent: ChatAgent, chat_ctx: Dict[str, Any], force_skill_folders: Optional[List[str]] = None,
-) -> str:
-    """Wraps _handle_idle's skills block verbatim (chat.py's _handle_idle,
-    the "2. Skills" section): every installed+active skill's metadata
-    (always included) plus the full body of whichever skill(s) actually
-    match this message.
-
-    force_skill_folders — from the reply-generation "llm" node's own
-    data.skillIds (see _run_chat_generation_node) — names skills the user
-    explicitly picked on the node itself, e.g. always ensure "code-review" guidance is present for
-    this workflow. Those are folded into the triggered (full-body) block
-    unconditionally, on top of whatever match_skills finds for this
-    message, and bypass is_capability_active's per-conversation toggle —
-    an explicit node-level pick is a stronger signal than that chat-UI-only
-    default, the same way any other node config overrides a built-in
-    default elsewhere in this module."""
-    try:
-        from app.core.skills import load_skills, build_skills_metadata_block, match_skills, build_triggered_skills_block
-        from app.db.crud import is_capability_active
-        from app.db.database import SessionLocal
-
-        all_skills = load_skills()
-        forced = [s for s in all_skills if s.folder in (force_skill_folders or [])]
-        db = SessionLocal()
-        try:
-            active_skills = [s for s in all_skills if is_capability_active(db, chat_agent.connection_id, "skill", s.folder)]
-        finally:
-            db.close()
-        metadata_skills = list({s.folder: s for s in (*active_skills, *forced)}.values())
-        matched = match_skills(chat_ctx["message"], active_skills)
-        triggered_skills = list({s.folder: s for s in (*matched, *forced)}.values())
-        metadata = build_skills_metadata_block(metadata_skills)
-        triggered = build_triggered_skills_block(triggered_skills)
-        return "\n\n".join(p for p in (metadata, triggered) if p)
-    except Exception as e:
-        logger.warning(f"skills_context node failed: {e}")
-        return ""
 
 
 async def _run_export_document_node(
@@ -1248,11 +1366,6 @@ async def _run_chat_generation_node(
     Anything else (a tool result, plain text, a "logic" pass-through, ...)
     is folded in generically as text/JSON, so this still composes with a
     fully custom graph, not only the seeded one.
-
-    data.get("includeSkillGuidance", True) — when true (the default, and
-    what the seeded pipeline uses) this node runs the skills block itself
-    (_run_skills_context_node) rather than requiring a separate node —
-    skill guidance is config on this node, not its own step.
     """
     from app.prompts.chat import build_chat_prompt
 
@@ -1269,8 +1382,9 @@ async def _run_chat_generation_node(
             continue
         if src_kind == "chat_trigger":
             continue  # already available as chat_ctx — not duplicated into context
-        elif src_kind == "vector":
-            # A generic vector node's "search" output is a raw list of
+        elif src_kind in ("vector", "reranker"):
+            # A generic vector node's "search" output (or a "reranker"
+            # node's reordered subset of the same shape) is a raw list of
             # chunk dicts — format it the same way a document-excerpt
             # block reads, rather than a JSON dump, so a swapped-in
             # Marketplace store reads identically to the bundled one.
@@ -1300,11 +1414,6 @@ async def _run_chat_generation_node(
             export_fmt = val.get("format") if val.get("is_export") else None
         else:
             context_parts.append(val if isinstance(val, str) else json.dumps(val, indent=2, default=str))
-
-    if data.get("includeSkillGuidance", True) or data.get("skillIds"):
-        skills_block = _run_skills_context_node(chat_agent, chat_ctx, force_skill_folders=data.get("skillIds"))
-        if skills_block:
-            context_parts.append(skills_block)
 
     full_context = "\n\n".join(context_parts)
     if compound_parts:
@@ -1352,6 +1461,73 @@ async def _run_chat_generation_node(
     import asyncio
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(llm_executor, lambda: chat_agent._call_llm_text(messages, token_callback))
+
+
+_HISTORY_MAX_STR = 4000
+_HISTORY_MAX_LIST = 20
+
+
+def _summarize_output_for_history(value: Any, _depth: int = 0) -> Any:
+    """
+    Shrinks a node's raw output down to something safe to persist in
+    WorkflowRun.node_outputs_json — run history is meant for "what did each
+    step produce, roughly", not a second copy of every embedding vector or
+    a document's full extracted text. Recurses into dicts/lists (bounded to
+    3 levels — deep enough for the shapes these nodes actually return, e.g.
+    a vector search's list-of-dicts-with-nested-payload) with two special
+    cases: an "vectors" key (an embedding node's own output) collapses to a
+    one-line description instead of the raw floats, and an overlong
+    string/list is truncated with a "... N more" marker rather than
+    silently dropped, so it's still obvious something was there.
+    """
+    if _depth > 3:
+        return "…"
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if k == "vectors" and isinstance(v, list):
+                dim = len(v[0]) if v and isinstance(v[0], list) else 0
+                out[k] = f"<{len(v)} vector(s), dim {dim}>"
+            else:
+                out[k] = _summarize_output_for_history(v, _depth + 1)
+        return out
+    if isinstance(value, list):
+        head = [_summarize_output_for_history(v, _depth + 1) for v in value[:_HISTORY_MAX_LIST]]
+        if len(value) > _HISTORY_MAX_LIST:
+            head.append(f"... {len(value) - _HISTORY_MAX_LIST} more")
+        return head
+    if isinstance(value, str) and len(value) > _HISTORY_MAX_STR:
+        return value[:_HISTORY_MAX_STR] + f"... ({len(value) - _HISTORY_MAX_STR} more chars)"
+    return value
+
+
+def _record_run_start(run_id: str, workflow_id: int, trigger: str) -> None:
+    from app.db.database import SessionLocal
+    from app.db.models import WorkflowRun
+
+    with SessionLocal() as db:
+        db.add(WorkflowRun(id=run_id, workflow_id=workflow_id, trigger=trigger, status="running"))
+        db.commit()
+
+
+def _record_run_finish(
+    run_id: str, status: str, node_outputs: Dict[str, Any],
+    failed_node_id: Optional[str] = None, error_message: Optional[str] = None,
+) -> None:
+    from app.db.database import SessionLocal
+    from app.db.models import WorkflowRun
+
+    summarized = {nid: _summarize_output_for_history(out) for nid, out in node_outputs.items()}
+    with SessionLocal() as db:
+        row = db.query(WorkflowRun).filter(WorkflowRun.id == run_id).first()
+        if not row:
+            return  # run row was never created (shouldn't happen) — nothing to update
+        row.status = status
+        row.failed_node_id = failed_node_id
+        row.error_message = error_message
+        row.node_outputs_json = json.dumps(summarized, default=str)
+        row.finished_at = datetime.utcnow()
+        db.commit()
 
 
 async def run_chat_workflow(
@@ -1415,9 +1591,34 @@ async def run_chat_workflow(
             raise WorkflowError("The connected chat workflow no longer exists.")
         graph = json.loads(row.graph_json)
 
+    run_id = uuid.uuid4().hex[:8]
+    await anyio.to_thread.run_sync(_record_run_start, run_id, workflow_id, "chat")
+
+    node_outputs: Dict[str, Any] = {}
+    try:
+        return await _run_chat_workflow_body(
+            chat_agent, workflow_id, message, history, attachments, connection_id, token_callback, export_format, graph, run_id, node_outputs,
+        )
+    except Exception as e:
+        await anyio.to_thread.run_sync(_record_run_finish, run_id, "failed", node_outputs, None, str(e))
+        raise
+
+
+async def _run_chat_workflow_body(
+    chat_agent: ChatAgent,
+    workflow_id: int,
+    message: str,
+    history: List[Dict],
+    attachments: Optional[List[Dict]],
+    connection_id: str,
+    token_callback,
+    export_format: Optional[str],
+    graph: Dict,
+    run_id: str,
+    node_outputs: Dict[str, Any],
+) -> str:
     nodes = {n["id"]: n for n in graph.get("nodes", [])}
     edges = graph.get("edges", [])
-    node_outputs: Dict[str, Any] = {}
 
     trigger_ids = [nid for nid, n in nodes.items() if n.get("data", {}).get("kind") == "chat_trigger"]
     if len(trigger_ids) != 1:
@@ -1487,19 +1688,20 @@ async def run_chat_workflow(
         for step_id in _trace_loop_body_chain(nid, edges)
     }
 
-    # A "logic" node whose condition is false gates off its own downstream
-    # CHAIN — traced exactly like a loop's body (_trace_loop_body_chain
-    # already stops at the first join point: a step also fed by something
-    # else), so a node fed by BOTH a gated branch and an always-available
-    # one (e.g. the reply-generation "llm" node, fed by both a gated
-    # vector search AND an ungated classifier) is never itself gated —
-    # only the single-path steps that exist purely to serve that one
-    # gated branch are. Precomputed once per logic node (not derived from
-    # cascading "is my upstream gated" checks, which can't tell "every
-    # path in happens to be gated this turn" apart from "structurally
-    # exists only to serve this one gate").
+    # A "logic" node whose condition is false gates off every node that
+    # would have NO surviving input without it — computed as a fixed
+    # point (_downstream_gated_by), not a simple linear trace: a logic
+    # node's downstream can fan out (e.g. one classifier feeding both the
+    # reply generator AND an export node directly) and fan back in at a
+    # join fed by a DIFFERENT, ungated branch too (e.g. that same reply
+    # generator, also fed by an independent vector search) — such a join
+    # must never be gated just because ONE of its several inputs happens
+    # to be. Precomputed once per logic node (not derived from cascading
+    # "is my upstream gated" checks, which can't tell "every path in
+    # happens to be gated this turn" apart from "structurally exists only
+    # to serve this one gate").
     logic_gated_chains = {
-        nid: _trace_loop_body_chain(nid, edges)
+        nid: _downstream_gated_by(nid, edges)
         for nid, n in nodes.items()
         if n.get("data", {}).get("kind") == "logic"
     }
@@ -1531,7 +1733,7 @@ async def run_chat_workflow(
             elif kind == "export_document":
                 result = await _run_export_document_node(chat_agent, node, nodes, edges, node_outputs, chat_ctx, token_callback)
             else:
-                result = await _execute_node(
+                result = await _execute_node_with_retry(
                     node_id, nodes, edges, node_outputs, chat_agent, executor,
                     conversation_id=chat_agent.connection_id, chat_ctx=chat_ctx,
                 )
@@ -1543,7 +1745,9 @@ async def run_chat_workflow(
         if kind == "logic" and result is None:
             gated_closed.update(logic_gated_chains.get(node_id, []))
 
-    return node_outputs.get(terminal_id) or ""
+    reply_text = node_outputs.get(terminal_id) or ""
+    await anyio.to_thread.run_sync(_record_run_finish, run_id, "completed", node_outputs)
+    return reply_text
 
 
 async def run_ingestion_workflow(document_id: int, file_path: str, filename: str, file_type: str) -> None:
@@ -1585,9 +1789,23 @@ async def run_ingestion_workflow(document_id: int, file_path: str, filename: str
         graph = json.loads(row.graph_json)
         workflow_id = row.id
 
+    run_id = f"ingest_{document_id}"
+    await anyio.to_thread.run_sync(_record_run_start, run_id, workflow_id, "ingestion")
+    node_outputs: Dict[str, Any] = {}
+    try:
+        await _run_ingestion_workflow_body(document_id, file_path, filename, file_type, graph, workflow_id, node_outputs)
+    except Exception as e:
+        await anyio.to_thread.run_sync(_record_run_finish, run_id, "failed", node_outputs, None, str(e))
+        raise
+    await anyio.to_thread.run_sync(_record_run_finish, run_id, "completed", node_outputs)
+
+
+async def _run_ingestion_workflow_body(
+    document_id: int, file_path: str, filename: str, file_type: str,
+    graph: Dict, workflow_id: int, node_outputs: Dict[str, Any],
+) -> None:
     nodes = {n["id"]: n for n in graph.get("nodes", [])}
     edges = graph.get("edges", [])
-    node_outputs: Dict[str, Any] = {}
 
     trigger_ids = [nid for nid, n in nodes.items() if n.get("data", {}).get("kind") == "document_upload_trigger"]
     if len(trigger_ids) != 1:
@@ -1615,11 +1833,14 @@ async def run_ingestion_workflow(document_id: int, file_path: str, filename: str
         for step_id in _trace_loop_body_chain(nid, edges)
     }
 
-    # See run_chat_workflow's matching comment — chains, not cascading
-    # "any upstream gated" checks, so a multi-upstream join point is
-    # never itself mistaken for part of a gated branch.
+    # See run_chat_workflow's matching comment — a fixed-point computation
+    # (_downstream_gated_by), not cascading "any upstream gated" checks or
+    # a simple linear trace, so a multi-upstream join point downstream of
+    # one gated branch (and one ungated one) is never itself gated, and a
+    # branching downstream (e.g. one classifier feeding two next steps)
+    # doesn't crash the precomputation itself.
     logic_gated_chains = {
-        nid: _trace_loop_body_chain(nid, edges)
+        nid: _downstream_gated_by(nid, edges)
         for nid, n in nodes.items()
         if n.get("data", {}).get("kind") == "logic"
     }
@@ -1642,7 +1863,7 @@ async def run_ingestion_workflow(document_id: int, file_path: str, filename: str
             "node_id": node_id, "status": "running", "message": f"Running '{label}'…",
         })
         try:
-            result = await _execute_node(node_id, nodes, edges, node_outputs, chat_agent, executor)
+            result = await _execute_node_with_retry(node_id, nodes, edges, node_outputs, chat_agent, executor)
         except WorkflowError:
             raise
         except Exception as e:
@@ -1671,6 +1892,8 @@ async def run_workflow(workflow_id: int, run_id: str, graph: Dict) -> None:
     chat_agent = ChatAgent(f"workflow_run_{run_id}")
     executor = ExecutorAgent(chat_agent.llm_manager)  # share the already-resolved LLM manager instance
 
+    await anyio.to_thread.run_sync(_record_run_start, run_id, workflow_id, "manual")
+
     async def broadcast(node_id: Optional[str], status: str, message: str, output: Any = None) -> None:
         await manager.broadcast_json({
             "type": "workflow_node_progress",
@@ -1686,6 +1909,7 @@ async def run_workflow(workflow_id: int, run_id: str, graph: Dict) -> None:
         order = _topological_order(list(nodes.values()), edges)
     except WorkflowError as e:
         await manager.broadcast_json({"type": "workflow_run_failed", "workflow_id": workflow_id, "run_id": run_id, "message": str(e)})
+        await anyio.to_thread.run_sync(_record_run_finish, run_id, "failed", node_outputs, None, str(e))
         return
 
     # Loop bodies are executed inline by their owning loop node (once per
@@ -1700,11 +1924,13 @@ async def run_workflow(workflow_id: int, run_id: str, graph: Dict) -> None:
     }
 
     # See run_chat_workflow's matching comment on gate propagation — a
-    # precomputed chain per logic node, not cascading "any upstream
-    # gated" checks, so a multi-upstream join point downstream of one
-    # gated branch (and one ungated one) is never itself gated.
+    # fixed-point computation (_downstream_gated_by) per logic node, not
+    # cascading "any upstream gated" checks or a simple linear trace, so a
+    # multi-upstream join point downstream of one gated branch (and one
+    # ungated one) is never itself gated, and a branching downstream
+    # doesn't crash the precomputation itself.
     logic_gated_chains = {
-        nid: _trace_loop_body_chain(nid, edges)
+        nid: _downstream_gated_by(nid, edges)
         for nid, n in nodes.items()
         if n.get("data", {}).get("kind") == "logic"
     }
@@ -1724,10 +1950,26 @@ async def run_workflow(workflow_id: int, run_id: str, graph: Dict) -> None:
         kind = data.get("kind")
         label = data.get("label") or data.get("toolName") or node_id
 
+        # A trigger only ever has real input when its own live path injects
+        # it (run_chat_workflow / run_ingestion_workflow) — a manual Run
+        # has none to give it. Rather than let _execute_node's dispatch
+        # raise for it (aborting the ENTIRE run at node 1, before anything
+        # else on the canvas gets a chance — previously true of every
+        # workflow with a chat_trigger/document_upload_trigger node, which
+        # is most workflows with a real live purpose), treat it as an
+        # inert no-op here: whatever's actually wired downstream of it
+        # will fail on its own missing input if it genuinely needs live
+        # trigger data, same as any other node with missing config —
+        # everything NOT dependent on the trigger still gets to run.
+        if kind in ("chat_trigger", "document_upload_trigger"):
+            node_outputs[node_id] = None
+            await broadcast(node_id, "completed", f"'{label}' skipped — only runs live (connect it from the toolbar, or trigger it for real, to exercise this node).", output=None)
+            continue
+
         await broadcast(node_id, "running", f"Running '{label}'…")
 
         try:
-            result = await _execute_node(node_id, nodes, edges, node_outputs, chat_agent, executor)
+            result = await _execute_node_with_retry(node_id, nodes, edges, node_outputs, chat_agent, executor)
             node_outputs[node_id] = result
             if kind == "logic" and result is None:
                 gated_closed.update(logic_gated_chains.get(node_id, []))
@@ -1741,9 +1983,11 @@ async def run_workflow(workflow_id: int, run_id: str, graph: Dict) -> None:
                 "run_id": run_id,
                 "message": f"Node '{label}' failed: {e}",
             })
+            await anyio.to_thread.run_sync(_record_run_finish, run_id, "failed", node_outputs, node_id, str(e))
             return
 
     await manager.broadcast_json({"type": "workflow_run_complete", "workflow_id": workflow_id, "run_id": run_id, "outputs": node_outputs})
+    await anyio.to_thread.run_sync(_record_run_finish, run_id, "completed", node_outputs)
 
 
 def _find_tool_schema(tool_name: str) -> Optional[Dict]:

@@ -273,7 +273,7 @@ export default function ConnectorsView() {
         
         {/* Header */}
         <div className="mb-6">
-          <h1 className="text-2xl font-bold text-aegis-text-primary">Connectors</h1>
+          <h1 className="text-2xl font-bold text-aegis-text-primary">OAuth Connectors</h1>
           <p className="text-sm text-aegis-text-secondary mt-1">Connect your tools so Aegis can take action across your workspace.</p>
         </div>
 

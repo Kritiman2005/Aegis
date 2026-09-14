@@ -1,0 +1,162 @@
+"""
+Aegis — Marketplace Rerankers API (/api/marketplace/rerankers)
+
+Backs the Marketplace's Rerankers category: browse app.core.rerankers'
+curated CATALOG, download one (background task + progress broadcast, same
+pattern as Marketplace embedding-model downloads and database installs),
+list/delete what's installed. A workflow "reranker" node
+(app.core.workflows.engine._run_reranker_node) references a downloaded
+model by its id — app.core.rerankers.get_cross_encoder resolves that to a
+ready sentence_transformers.CrossEncoder instance.
+"""
+
+import logging
+import os
+import shutil
+import uuid
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from app.core.connection_manager import manager
+from app.core.rerankers import CATALOG, get_catalog_entry
+from app.core.hf_search import search_models
+from app.db.database import SessionLocal, get_db
+from app.db.models import RerankerModelRegistry
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/marketplace/rerankers", tags=["marketplace-rerankers"])
+
+_data_dir = os.environ.get("AEGIS_DATA_DIR")
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+RERANKERS_DIR = Path(_data_dir) / "reranker_models" if _data_dir else BASE_DIR / "reranker_models"
+RERANKERS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+class DownloadRerankerRequest(BaseModel):
+    model_id: str
+    # Only used when model_id isn't one of CATALOG's curated entries — lets
+    # a user pull in ANY sentence-transformers-compatible cross-encoder from
+    # Hugging Face, not just the hand-picked list (get_cross_encoder already
+    # loads by raw model_id with no catalog restriction; this endpoint was
+    # the only thing narrowing it).
+    display_name: Optional[str] = None
+    model_config = {"defer_build": True}
+
+
+@router.get("/catalog")
+def get_catalog():
+    return {"models": CATALOG}
+
+
+@router.get("/search")
+def search_hf_rerankers(q: str, limit: int = 20):
+    """
+    Live-searches Hugging Face for a cross-encoder beyond the curated CATALOG
+    above. Not tag-filtered — unlike embeddings, cross-encoder rerankers
+    don't share one consistent HF tag, so a plain free-text search (the same
+    permissive approach models_hub.py's LLM search uses) surfaces them
+    better than an over-narrow filter would. Read-only; nothing installs
+    from a search.
+    """
+    try:
+        return {"models": search_models(q, limit=limit)}
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("")
+def list_installed(db: Session = Depends(get_db)):
+    rows = db.query(RerankerModelRegistry).order_by(RerankerModelRegistry.created_at.desc()).all()
+    return {"models": [_serialize(r) for r in rows]}
+
+
+@router.delete("/{model_row_id}")
+def delete_installed(model_row_id: int, db: Session = Depends(get_db)):
+    row = db.query(RerankerModelRegistry).filter(RerankerModelRegistry.id == model_row_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Reranker not found.")
+
+    shutil.rmtree(row.cache_dir, ignore_errors=True)
+    db.delete(row)
+    db.commit()
+    return {"message": f"Deleted '{row.display_name}'."}
+
+
+async def _download_task(row_id: int, model_id: str, cache_dir: str) -> None:
+    async def broadcast(status: str, **kwargs) -> None:
+        await manager.broadcast_json({"type": "reranker_download_progress", "model_row_id": row_id, "status": status, **kwargs})
+
+    await broadcast("running", message=f"Downloading {model_id}…")
+    try:
+        import anyio
+        from sentence_transformers import CrossEncoder
+
+        # sentence_transformers' own downloader has no granular progress
+        # callback to hook into, same as fastembed's — a single blocking
+        # step reported as running -> complete/failed, not a percentage bar.
+        await anyio.to_thread.run_sync(lambda: CrossEncoder(model_id, cache_folder=cache_dir))
+
+        with SessionLocal() as db:
+            row = db.query(RerankerModelRegistry).filter(RerankerModelRegistry.id == row_id).first()
+            if row:
+                row.status = "downloaded"
+                db.commit()
+        await manager.broadcast_json({"type": "reranker_download_complete", "model_row_id": row_id})
+
+    except Exception as e:
+        logger.error(f"Reranker download {row_id} ({model_id}) failed: {e}")
+        with SessionLocal() as db:
+            row = db.query(RerankerModelRegistry).filter(RerankerModelRegistry.id == row_id).first()
+            if row:
+                row.status = "failed"
+                row.error_message = str(e)
+                db.commit()
+        await manager.broadcast_json({"type": "reranker_download_failed", "model_row_id": row_id, "message": str(e)})
+
+
+@router.post("/download")
+def download_model(req: DownloadRerankerRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    entry = get_catalog_entry(req.model_id)
+    # Not in the curated list — treat it as a custom Hugging Face repo id.
+    # get_cross_encoder (app.core.rerankers) already loads any model_id via
+    # sentence_transformers.CrossEncoder with no catalog check; a bad/
+    # incompatible repo id just fails the download below with a real error,
+    # same as it would for a curated one.
+    display_name = entry["display_name"] if entry else (req.display_name or req.model_id)
+    size_gb = entry["size_gb"] if entry else None
+
+    existing = db.query(RerankerModelRegistry).filter(
+        RerankerModelRegistry.model_id == req.model_id, RerankerModelRegistry.status != "failed"
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail=f"'{display_name}' is already installed or installing.")
+
+    instance_dir = RERANKERS_DIR / uuid.uuid4().hex[:12]
+    instance_dir.mkdir(parents=True, exist_ok=True)
+
+    row = RerankerModelRegistry(
+        model_id=req.model_id, display_name=display_name,
+        size_gb=size_gb, cache_dir=str(instance_dir), status="downloading",
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+
+    background_tasks.add_task(_download_task, row.id, req.model_id, str(instance_dir))
+    return _serialize(row)
+
+
+def _serialize(row: RerankerModelRegistry) -> Dict[str, Any]:
+    return {
+        "id": row.id,
+        "model_id": row.model_id,
+        "display_name": row.display_name,
+        "size_gb": row.size_gb,
+        "status": row.status,
+        "error_message": row.error_message,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }

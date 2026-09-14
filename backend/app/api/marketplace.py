@@ -24,23 +24,3 @@ async def install_tool(tool_id: str, background_tasks: BackgroundTasks):
     if installer is None:
         raise HTTPException(status_code=404, detail=f"Unknown tool: '{tool_id}'")
     return await installer(background_tasks)
-
-
-@router.get("/skills")
-def get_skills():
-    return {"skills": marketplace.list_marketplace_skills()}
-
-
-@router.post("/skills/{skill_id}/install")
-def install_skill(skill_id: str):
-    try:
-        marketplace.install_marketplace_skill(skill_id)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    return {"status": "installed"}
-
-
-@router.delete("/skills/{skill_id}")
-def uninstall_skill(skill_id: str):
-    marketplace.uninstall_marketplace_skill(skill_id)
-    return {"status": "removed"}

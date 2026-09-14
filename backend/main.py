@@ -49,10 +49,10 @@ from app.api.context_config import router as context_config_router
 from app.api.analytics import router as analytics_router
 from app.api.scraping import router as scraping_router
 from app.api.voice import router as voice_router
-from app.api.skills import router as skills_router
 from app.api.marketplace import router as marketplace_router
 from app.api.marketplace_databases import router as marketplace_databases_router
 from app.api.marketplace_embeddings import router as marketplace_embeddings_router
+from app.api.marketplace_rerankers import router as marketplace_rerankers_router
 from app.api.conversation_capabilities import router as conversation_capabilities_router
 from app.api.export import router as export_router
 from app.api.workflows import router as workflows_router
@@ -120,10 +120,10 @@ app.include_router(context_config_router) # /api/context-config
 app.include_router(analytics_router)     # /api/analytics
 app.include_router(scraping_router)      # /api/scrape/*
 app.include_router(voice_router)         # /api/voice/*
-app.include_router(skills_router)        # /api/skills/*
 app.include_router(marketplace_router)   # /api/marketplace/*
 app.include_router(marketplace_databases_router)  # /api/marketplace/databases/*
 app.include_router(marketplace_embeddings_router)  # /api/marketplace/embeddings/*
+app.include_router(marketplace_rerankers_router)  # /api/marketplace/rerankers/*
 app.include_router(conversation_capabilities_router)  # /api/conversations/{id}/capabilities
 app.include_router(export_router)        # /api/export
 app.include_router(workflows_router)     # /api/workflows/*
@@ -164,7 +164,7 @@ async def on_startup():
     import logging
     import threading
     from app.db.database import init_db, SessionLocal
-    from app.db.crud import get_active_google_credentials, reconcile_model_registry, reconcile_stuck_documents, reconcile_model_registry, reconcile_stuck_documents
+    from app.db.crud import get_active_google_credentials, reconcile_model_registry, reconcile_stuck_documents
     from app.mcp.registry import mcp_registry
     from app.core.scheduler import scheduler_daemon
     from app.core.rag.processor import init_qdrant
@@ -177,9 +177,10 @@ async def on_startup():
     init_qdrant()
     _system_status["qdrant"] = True
 
-    from app.core.workflows.seed import seed_default_pipeline, ensure_builtin_vector_store
+    from app.core.workflows.seed import seed_default_pipeline, ensure_builtin_vector_store, ensure_builtin_aegis_database
     with SessionLocal() as db:
         ensure_builtin_vector_store(db)
+        ensure_builtin_aegis_database(db)
         seed_default_pipeline(db)
 
     # Remove any "downloaded" model rows whose file no longer exists on disk —

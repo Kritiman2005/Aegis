@@ -195,7 +195,7 @@ export default function AegisDatabaseBrowser({ onClose }: { onClose: () => void 
           <div className="flex items-center gap-2.5">
             <Table2 className="w-5 h-5 text-aegis-primary" />
             <div>
-              <h3 className="text-sm font-bold text-aegis-text-primary">Aegis Database</h3>
+              <h3 className="text-sm font-bold text-aegis-text-primary">SQLite</h3>
               <p className="text-[11px] text-aegis-text-muted flex items-center gap-1">
                 <ShieldCheck className="w-3 h-3" /> Only a safe, credential-free set of tables is ever shown here
               </p>
@@ -319,7 +319,7 @@ export default function AegisDatabaseBrowser({ onClose }: { onClose: () => void 
                           {selectedTable.columns.map(c => (
                             <th key={c.name} className="text-left font-semibold text-aegis-text-muted uppercase text-[10px] px-3 py-2 border-b border-aegis-border whitespace-nowrap">{c.name}</th>
                           ))}
-                          <th className="border-b border-aegis-border w-8" />
+                          {selectedTable.user_created && <th className="border-b border-aegis-border w-8" />}
                         </tr>
                       </thead>
                       <tbody>
@@ -327,7 +327,7 @@ export default function AegisDatabaseBrowser({ onClose }: { onClose: () => void 
                           <tr key={row.id ?? ri} className="hover:bg-aegis-overlay">
                             {selectedTable.columns.map(c => (
                               <td key={c.name} className="px-1.5 py-1 border-b border-aegis-border">
-                                {c.name === 'id' ? (
+                                {c.name === 'id' || !selectedTable.user_created ? (
                                   <span className="px-1.5 text-aegis-text-muted">{String(row[c.name] ?? '')}</span>
                                 ) : (
                                   <input
@@ -339,11 +339,13 @@ export default function AegisDatabaseBrowser({ onClose }: { onClose: () => void 
                                 )}
                               </td>
                             ))}
-                            <td className="px-1.5 py-1 border-b border-aegis-border">
-                              <button onClick={() => deleteRow(row)} className="p-1 rounded hover:bg-aegis-error/10 text-aegis-text-muted hover:text-aegis-error">
-                                <Trash2 className="w-3 h-3" />
-                              </button>
-                            </td>
+                            {selectedTable.user_created && (
+                              <td className="px-1.5 py-1 border-b border-aegis-border">
+                                <button onClick={() => deleteRow(row)} className="p-1 rounded hover:bg-aegis-error/10 text-aegis-text-muted hover:text-aegis-error">
+                                  <Trash2 className="w-3 h-3" />
+                                </button>
+                              </td>
+                            )}
                           </tr>
                         ))}
                       </tbody>
@@ -351,12 +353,18 @@ export default function AegisDatabaseBrowser({ onClose }: { onClose: () => void 
                   )}
                 </div>
                 <div className="flex items-center justify-between px-3 py-2.5 border-t border-aegis-border flex-shrink-0">
-                  <button
-                    onClick={addRow}
-                    className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-[11px] font-semibold text-aegis-primary-light hover:bg-aegis-overlay transition-colors"
-                  >
-                    <Plus className="w-3.5 h-3.5" /> Add row
-                  </button>
+                  {selectedTable.user_created ? (
+                    <button
+                      onClick={addRow}
+                      className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-[11px] font-semibold text-aegis-primary-light hover:bg-aegis-overlay transition-colors"
+                    >
+                      <Plus className="w-3.5 h-3.5" /> Add row
+                    </button>
+                  ) : (
+                    <span className="flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] text-aegis-text-muted">
+                      <ShieldCheck className="w-3.5 h-3.5" /> System table — read-only. Create your own table to edit data.
+                    </span>
+                  )}
                   <div className="flex items-center gap-2">
                     <span className="text-[10px] text-aegis-text-muted">
                       {rowCount === 0 ? '0 rows' : `${page * PAGE_SIZE + 1}–${Math.min(rowCount, (page + 1) * PAGE_SIZE)} of ${rowCount}`}

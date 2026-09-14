@@ -1,9 +1,9 @@
 """
-Aegis — Per-conversation Tool/Skill activation
+Aegis — Per-conversation Tool activation
 
-Backs the chat composer's "+" menu Tools/Skills toggles (Claude Desktop-
-style): installed once globally via the Marketplace, then switched on/off
-per conversation. See db.models.ConversationDisabledCapability for the
+Backs the chat composer's "+" menu Tools toggles (Claude Desktop-style):
+installed once globally via the Marketplace, then switched on/off per
+conversation. See db.models.ConversationDisabledCapability for the
 storage model (absence of a row = active).
 """
 
@@ -13,7 +13,6 @@ from pydantic import BaseModel
 from app.db.database import SessionLocal
 from app.db.crud import is_capability_active, set_capability_active
 from app.core.marketplace import list_tools
-from app.core.skills import load_skills
 
 router = APIRouter(prefix="/api/conversations", tags=["Conversation Capabilities"])
 
@@ -32,16 +31,7 @@ def get_capabilities(conversation_id: str):
                 "active": is_capability_active(db, conversation_id, "tool", tool["id"]),
             })
 
-        skills = []
-        for skill in load_skills():
-            skills.append({
-                "id": skill.folder,
-                "name": skill.name,
-                "description": skill.description,
-                "active": is_capability_active(db, conversation_id, "skill", skill.folder),
-            })
-
-        return {"tools": tools, "skills": skills}
+        return {"tools": tools}
     finally:
         db.close()
 
@@ -52,8 +42,8 @@ class ToggleRequest(BaseModel):
 
 @router.post("/{conversation_id}/capabilities/{capability_type}/{capability_id}")
 def toggle_capability(conversation_id: str, capability_type: str, capability_id: str, req: ToggleRequest):
-    if capability_type not in ("tool", "skill"):
-        return {"error": "capability_type must be 'tool' or 'skill'"}
+    if capability_type != "tool":
+        return {"error": "capability_type must be 'tool'"}
     db = SessionLocal()
     try:
         set_capability_active(db, conversation_id, capability_type, capability_id, req.active)

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Plug, ShieldAlert, RefreshCw, Trash2, Loader2, CheckCircle2, XCircle, Plus, Download, Store, Eye, EyeOff, ChevronRight, Code2 } from 'lucide-react';
+import { Plug, ShieldAlert, RefreshCw, Trash2, Loader2, CheckCircle2, XCircle, Plus, Download, Store, Eye, EyeOff, ChevronRight, Code2, Search, Globe, Wrench } from 'lucide-react';
+import { SiGithub } from 'react-icons/si';
 import toast from 'react-hot-toast';
 import { useSocket } from '../hooks/useSocket';
 import { ServiceLogo } from '../lib/serviceIcons';
@@ -68,6 +69,110 @@ interface CatalogEntry {
   auth_type: 'api_key' | 'path' | 'connection_string' | 'none';
   env_schema: CatalogField[];
   input_schema: CatalogField[];
+}
+
+// Mirrors registry_client.py's _extract_install output — a single server
+// entry from the public MCP Registry reduced to one thing Aegis can act on
+// directly: either a hosted URL (Streamable HTTP) or a local npm/pypi
+// package run as a stdio subprocess. `install` is null when neither shape
+// was recognized (e.g. docker-only) — nothing to auto-install then.
+interface RegistryInstall {
+  kind: 'remote' | 'stdio';
+  url?: string;
+  transport?: string;
+  headers?: CatalogField[];
+  command?: string[];
+  env_schema?: CatalogField[];
+}
+
+interface RegistryResult {
+  name: string;
+  description?: string;
+  version?: string;
+  repository_url?: string;
+  install: RegistryInstall | null;
+}
+
+// Mirrors github_installer.py's detect_run_config output.
+interface GithubDetectResult {
+  repo_dir: string;
+  detected: boolean;
+  command: string[] | null;
+  build_steps: string[][];
+  runtime: string | null;
+  reason?: string;
+}
+
+function RegistryResultCard({ entry, connecting, onInstall }: { entry: RegistryResult; connecting: boolean; onInstall: (values: Record<string, string>) => void }) {
+  const install = entry.install;
+  const fields = install ? (install.kind === 'remote' ? install.headers : install.env_schema) || [] : [];
+  const hasRequiredFields = fields.some(f => f.required);
+  const [expanded, setExpanded] = useState(!hasRequiredFields);
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [revealed, setRevealed] = useState<Record<string, boolean>>({});
+
+  const handleClick = () => {
+    if (hasRequiredFields && !expanded) { setExpanded(true); return; }
+    onInstall(values);
+  };
+
+  return (
+    <div className={`bg-aegis-raised rounded-xl border border-aegis-border shadow-sm px-3.5 py-3 ${expanded && fields.length > 0 ? 'lg:col-span-2' : ''}`}>
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-semibold text-aegis-text-primary truncate">{entry.name}</span>
+            {install && (
+              <span className="flex-shrink-0 text-[9px] font-medium uppercase tracking-wide px-1.5 py-0.5 rounded bg-aegis-overlay text-aegis-text-muted">
+                {install.kind === 'remote' ? 'hosted' : 'local'}
+              </span>
+            )}
+            {entry.version && <span className="flex-shrink-0 text-[10px] text-aegis-text-muted">v{entry.version}</span>}
+          </div>
+          {entry.description && <div className="text-[10px] text-aegis-text-muted leading-relaxed line-clamp-2 mt-0.5">{entry.description}</div>}
+        </div>
+        {install ? (
+          <button
+            onClick={handleClick}
+            disabled={connecting}
+            className="flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 bg-aegis-primary text-white text-[11px] font-semibold rounded-lg hover:opacity-90 disabled:opacity-50 transition-opacity"
+          >
+            {connecting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+            {connecting ? 'Connecting…' : expanded || !hasRequiredFields ? 'Install' : 'Configure'}
+          </button>
+        ) : (
+          <span className="flex-shrink-0 text-[10px] text-aegis-text-muted">Not auto-installable</span>
+        )}
+      </div>
+
+      {expanded && fields.length > 0 && (
+        <div className="mt-3 flex flex-col gap-2">
+          {fields.map(f => (
+            <div key={f.key}>
+              <label className="text-[10px] text-aegis-text-muted">{f.label}{f.required && ' *'}</label>
+              <div className="relative">
+                <input
+                  type={f.secret && !revealed[f.key] ? 'password' : 'text'}
+                  value={values[f.key] || ''}
+                  onChange={e => setValues(v => ({ ...v, [f.key]: e.target.value }))}
+                  className="w-full bg-aegis-base border border-aegis-border rounded-md px-2 py-1.5 pr-8 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+                />
+                {f.secret && (
+                  <button
+                    type="button"
+                    onClick={() => setRevealed(r => ({ ...r, [f.key]: !r[f.key] }))}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-aegis-text-muted hover:text-aegis-text-secondary"
+                  >
+                    {revealed[f.key] ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function CatalogCard({ entry, connecting, onConnect }: { entry: CatalogEntry; connecting: boolean; onConnect: (env: Record<string, string>, inputParams: Record<string, string>) => void }) {
@@ -155,6 +260,28 @@ export default function MCPServersPanel() {
   const [catalog, setCatalog] = useState<CatalogEntry[]>([]);
   const [customServerOpen, setCustomServerOpen] = useState(false);
 
+  // Registry search
+  const [registryOpen, setRegistryOpen] = useState(false);
+  const [registryQuery, setRegistryQuery] = useState('');
+  const [registryResults, setRegistryResults] = useState<RegistryResult[]>([]);
+  const [registrySearching, setRegistrySearching] = useState(false);
+  const [registrySearched, setRegistrySearched] = useState(false);
+
+  // Remote (Streamable HTTP) server
+  const [remoteOpen, setRemoteOpen] = useState(false);
+  const [remoteName, setRemoteName] = useState('');
+  const [remoteUrl, setRemoteUrl] = useState('');
+  const [remoteHeaderKey, setRemoteHeaderKey] = useState('');
+  const [remoteHeaderValue, setRemoteHeaderValue] = useState('');
+
+  // GitHub install
+  const [githubOpen, setGithubOpen] = useState(false);
+  const [githubRepoUrl, setGithubRepoUrl] = useState('');
+  const [githubDetecting, setGithubDetecting] = useState(false);
+  const [githubDetected, setGithubDetected] = useState<GithubDetectResult | null>(null);
+  const [githubServerName, setGithubServerName] = useState('');
+  const [githubCommandText, setGithubCommandText] = useState('');
+
   const fetchStatus = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/api/connectors`);
@@ -200,6 +327,147 @@ export default function MCPServersPanel() {
     } catch (e) {
       toast.error('Could not reach the backend.');
       setPending(prev => { const n = { ...prev }; delete n[entry.name]; return n; });
+    }
+  };
+
+  const startStdioConnect = async (serverName: string, command: string[], env: Record<string, string> | null) => {
+    setPending(prev => ({ ...prev, [serverName]: { stage: 'detect', message: 'Starting…' } }));
+    try {
+      const res = await fetch(`${API_BASE}/api/connectors/connect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ server_name: serverName, command, env }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        toast.error(data.detail || `Failed to connect '${serverName}'.`);
+        setPending(prev => { const n = { ...prev }; delete n[serverName]; return n; });
+      }
+    } catch (e) {
+      toast.error('Could not reach the backend.');
+      setPending(prev => { const n = { ...prev }; delete n[serverName]; return n; });
+    }
+  };
+
+  const startRemoteConnect = async (serverName: string, url: string, headers: Record<string, string> | null) => {
+    setPending(prev => ({ ...prev, [serverName]: { stage: 'connect', message: `Connecting to '${serverName}'…` } }));
+    try {
+      const res = await fetch(`${API_BASE}/api/connectors/remote/connect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ server_name: serverName, url, headers }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        toast.error(data.detail || `Failed to connect '${serverName}'.`);
+        setPending(prev => { const n = { ...prev }; delete n[serverName]; return n; });
+      }
+    } catch (e) {
+      toast.error('Could not reach the backend.');
+      setPending(prev => { const n = { ...prev }; delete n[serverName]; return n; });
+    }
+  };
+
+  const handleRegistrySearch = async () => {
+    if (!registryQuery.trim()) return;
+    setRegistrySearching(true);
+    setRegistrySearched(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/connectors/registry/search?q=${encodeURIComponent(registryQuery.trim())}`);
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        setRegistryResults(data.results || []);
+      } else {
+        toast.error(data.detail || 'Registry search failed.');
+        setRegistryResults([]);
+      }
+    } catch (e) {
+      toast.error('Could not reach the backend.');
+    } finally {
+      setRegistrySearching(false);
+    }
+  };
+
+  const handleRegistryInstall = (entry: RegistryResult, values: Record<string, string>) => {
+    if (!entry.install) return;
+    const serverName = entry.name.split('/').pop() || entry.name;
+    if (entry.install.kind === 'remote' && entry.install.url) {
+      startRemoteConnect(serverName, entry.install.url, Object.keys(values).length ? values : null);
+    } else if (entry.install.kind === 'stdio' && entry.install.command) {
+      startStdioConnect(serverName, entry.install.command, Object.keys(values).length ? values : null);
+    }
+  };
+
+  const handleRemoteConnect = () => {
+    const name = remoteName.trim();
+    const url = remoteUrl.trim();
+    if (!name || !url) {
+      toast.error('Enter a name and a server URL.');
+      return;
+    }
+    const headers = remoteHeaderKey.trim() ? { [remoteHeaderKey.trim()]: remoteHeaderValue } : null;
+    startRemoteConnect(name, url, headers);
+    setRemoteName(''); setRemoteUrl(''); setRemoteHeaderKey(''); setRemoteHeaderValue('');
+  };
+
+  const handleGithubDetect = async () => {
+    const repoUrl = githubRepoUrl.trim();
+    if (!repoUrl) return;
+    setGithubDetecting(true);
+    setGithubDetected(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/connectors/github/detect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ repo_url: repoUrl }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast.error(data.detail || 'Failed to inspect the repo.');
+        return;
+      }
+      setGithubDetected(data);
+      setGithubCommandText((data.command || []).join(' '));
+      if (!githubServerName.trim()) {
+        const guess = repoUrl.replace(/\/$/, '').replace(/\.git$/, '').split('/').pop() || '';
+        setGithubServerName(guess);
+      }
+    } catch (e) {
+      toast.error('Could not reach the backend.');
+    } finally {
+      setGithubDetecting(false);
+    }
+  };
+
+  const handleGithubInstall = async () => {
+    const command = githubCommandText.trim().split(/\s+/).filter(Boolean);
+    const serverName = githubServerName.trim();
+    if (!serverName || command.length === 0) {
+      toast.error('Enter a server name and a run command.');
+      return;
+    }
+    setPending(prev => ({ ...prev, [serverName]: { stage: 'clone', message: 'Starting…' } }));
+    try {
+      const res = await fetch(`${API_BASE}/api/connectors/github/install`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          repo_url: githubRepoUrl.trim(),
+          server_name: serverName,
+          command,
+          build_steps: githubDetected?.build_steps || [],
+        }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        toast.error(data.detail || `Failed to install '${serverName}'.`);
+        setPending(prev => { const n = { ...prev }; delete n[serverName]; return n; });
+      } else {
+        setGithubRepoUrl(''); setGithubDetected(null); setGithubCommandText(''); setGithubServerName('');
+      }
+    } catch (e) {
+      toast.error('Could not reach the backend.');
+      setPending(prev => { const n = { ...prev }; delete n[serverName]; return n; });
     }
   };
 
@@ -338,10 +606,10 @@ export default function MCPServersPanel() {
       <div className="px-8 pt-8 pb-5">
         <div className="flex items-center gap-3 mb-1">
           <Plug className="w-6 h-6 text-aegis-primary" />
-          <h1 className="text-2xl font-bold text-aegis-text-primary">MCP Servers</h1>
+          <h1 className="text-2xl font-bold text-aegis-text-primary">Connectors</h1>
         </div>
         <p className="text-sm text-aegis-text-secondary">
-          Connect any Model Context Protocol server and give the agent its tools.
+          Connect any Model Context Protocol server — from the catalog, the public registry, a GitHub repo, or a hosted URL — and give the agent its tools.
         </p>
       </div>
 
@@ -382,6 +650,217 @@ export default function MCPServersPanel() {
             </div>
           </section>
         )}
+
+        {/* Search the public MCP Registry — the community index of published
+            servers, so a user can find one by name instead of already
+            knowing its package or repo. */}
+        <section>
+          <div className="bg-aegis-raised rounded-xl border border-aegis-border shadow-sm overflow-hidden">
+            <button
+              onClick={() => setRegistryOpen(v => !v)}
+              className="w-full flex items-center gap-2.5 px-5 py-4 text-left"
+            >
+              <Search className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
+              <p className="flex-1 min-w-0 text-[13px] text-aegis-text-secondary">Search the public MCP Registry for a server by name.</p>
+              <ChevronRight className={`w-4 h-4 text-aegis-text-muted flex-shrink-0 transition-transform duration-200 ${registryOpen ? 'rotate-90' : ''}`} />
+            </button>
+
+            {registryOpen && (
+              <div className="px-5 pb-5">
+                <div className="flex gap-2 mb-3">
+                  <input
+                    type="text"
+                    value={registryQuery}
+                    onChange={e => setRegistryQuery(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter') handleRegistrySearch(); }}
+                    placeholder="e.g. github, slack, filesystem…"
+                    className="flex-1 bg-aegis-overlay border border-aegis-border rounded-lg px-3 py-2 text-xs text-aegis-text-primary placeholder:text-aegis-text-muted focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+                  />
+                  <button
+                    onClick={handleRegistrySearch}
+                    disabled={registrySearching || !registryQuery.trim()}
+                    className="flex-shrink-0 inline-flex items-center gap-1.5 text-[12px] font-medium text-white bg-aegis-primary hover:bg-aegis-primary-dark px-3.5 py-1.5 rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    {registrySearching ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />}
+                    Search
+                  </button>
+                </div>
+
+                {registrySearched && !registrySearching && registryResults.length === 0 && (
+                  <p className="text-[12px] text-aegis-text-muted">No servers found for that search.</p>
+                )}
+
+                {registryResults.length > 0 && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 items-start">
+                    {registryResults.map(entry => (
+                      <RegistryResultCard
+                        key={entry.name}
+                        entry={entry}
+                        connecting={(entry.install ? (entry.name.split('/').pop() || entry.name) : '') in pending}
+                        onInstall={values => handleRegistryInstall(entry, values)}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* Connect a remote server over Streamable HTTP — a hosted MCP
+            endpoint by URL, no local process. No OAuth: only a static
+            header value the user already has (an API key, a bearer token
+            they generated themselves) — Aegis never runs a login flow. */}
+        <section>
+          <div className="bg-aegis-raised rounded-xl border border-aegis-border shadow-sm overflow-hidden">
+            <button
+              onClick={() => setRemoteOpen(v => !v)}
+              className="w-full flex items-center gap-2.5 px-5 py-4 text-left"
+            >
+              <Globe className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
+              <p className="flex-1 min-w-0 text-[13px] text-aegis-text-secondary">Connect a hosted server by URL (Streamable HTTP).</p>
+              <ChevronRight className={`w-4 h-4 text-aegis-text-muted flex-shrink-0 transition-transform duration-200 ${remoteOpen ? 'rotate-90' : ''}`} />
+            </button>
+
+            {remoteOpen && (
+              <div className="px-5 pb-5 flex flex-col gap-3">
+                <p className="text-[11px] text-aegis-text-muted">
+                  If the server needs a static API key or bearer token (not a login redirect), add it as a header below —
+                  Aegis doesn't support servers that require an OAuth sign-in.
+                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <div>
+                    <label className="text-[10px] text-aegis-text-muted">Name</label>
+                    <input
+                      type="text"
+                      value={remoteName}
+                      onChange={e => setRemoteName(e.target.value)}
+                      placeholder="my-remote-server"
+                      className="w-full bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary placeholder:text-aegis-text-muted focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-aegis-text-muted">Server URL</label>
+                    <input
+                      type="text"
+                      value={remoteUrl}
+                      onChange={e => setRemoteUrl(e.target.value)}
+                      placeholder="https://example.com/mcp"
+                      className="w-full bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary placeholder:text-aegis-text-muted focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-aegis-text-muted">Header name (optional)</label>
+                    <input
+                      type="text"
+                      value={remoteHeaderKey}
+                      onChange={e => setRemoteHeaderKey(e.target.value)}
+                      placeholder="Authorization"
+                      className="w-full bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary placeholder:text-aegis-text-muted focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-aegis-text-muted">Header value</label>
+                    <input
+                      type="password"
+                      value={remoteHeaderValue}
+                      onChange={e => setRemoteHeaderValue(e.target.value)}
+                      placeholder="Bearer …"
+                      className="w-full bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary placeholder:text-aegis-text-muted focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+                    />
+                  </div>
+                </div>
+                <div className="flex justify-end">
+                  <button
+                    onClick={handleRemoteConnect}
+                    disabled={!remoteName.trim() || !remoteUrl.trim()}
+                    className="inline-flex items-center gap-1.5 text-[12px] font-medium text-white bg-aegis-primary hover:bg-aegis-primary-dark px-3.5 py-1.5 rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    <Plus className="w-3.5 h-3.5" /> Connect
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* Install from a GitHub repo — clone, auto-detect a run command,
+            let the user review/edit it, then build + connect. */}
+        <section>
+          <div className="bg-aegis-raised rounded-xl border border-aegis-border shadow-sm overflow-hidden">
+            <button
+              onClick={() => setGithubOpen(v => !v)}
+              className="w-full flex items-center gap-2.5 px-5 py-4 text-left"
+            >
+              <SiGithub className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
+              <p className="flex-1 min-w-0 text-[13px] text-aegis-text-secondary">Install a server straight from a GitHub repo.</p>
+              <ChevronRight className={`w-4 h-4 text-aegis-text-muted flex-shrink-0 transition-transform duration-200 ${githubOpen ? 'rotate-90' : ''}`} />
+            </button>
+
+            {githubOpen && (
+              <div className="px-5 pb-5 flex flex-col gap-3">
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={githubRepoUrl}
+                    onChange={e => setGithubRepoUrl(e.target.value)}
+                    placeholder="https://github.com/owner/repo"
+                    className="flex-1 bg-aegis-overlay border border-aegis-border rounded-lg px-3 py-2 text-xs text-aegis-text-primary placeholder:text-aegis-text-muted focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+                  />
+                  <button
+                    onClick={handleGithubDetect}
+                    disabled={githubDetecting || !githubRepoUrl.trim()}
+                    className="flex-shrink-0 inline-flex items-center gap-1.5 text-[12px] font-medium text-white bg-aegis-primary hover:bg-aegis-primary-dark px-3.5 py-1.5 rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    {githubDetecting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Wrench className="w-3.5 h-3.5" />}
+                    {githubDetecting ? 'Inspecting…' : 'Inspect repo'}
+                  </button>
+                </div>
+
+                {githubDetected && (
+                  <div className="flex flex-col gap-2 bg-aegis-overlay rounded-lg p-3">
+                    {githubDetected.detected ? (
+                      <p className="text-[11px] text-aegis-text-secondary">
+                        Detected a {githubDetected.runtime} server{githubDetected.build_steps.length > 0 ? ` — will run ${githubDetected.build_steps.map(s => s.join(' ')).join(' then ')} first` : ''}. Review the command below before installing.
+                      </p>
+                    ) : (
+                      <p className="text-[11px] text-aegis-text-secondary">{githubDetected.reason}</p>
+                    )}
+                    <div>
+                      <label className="text-[10px] text-aegis-text-muted">Name</label>
+                      <input
+                        type="text"
+                        value={githubServerName}
+                        onChange={e => setGithubServerName(e.target.value)}
+                        className="w-full bg-aegis-base border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[10px] text-aegis-text-muted">Run command</label>
+                      <input
+                        type="text"
+                        value={githubCommandText}
+                        onChange={e => setGithubCommandText(e.target.value)}
+                        placeholder="node /path/to/index.js"
+                        spellCheck={false}
+                        className="w-full bg-aegis-base border border-aegis-border rounded-md px-2 py-1.5 text-xs font-mono text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+                      />
+                    </div>
+                    <div className="flex justify-end">
+                      <button
+                        onClick={handleGithubInstall}
+                        disabled={!githubServerName.trim() || !githubCommandText.trim()}
+                        className="inline-flex items-center gap-1.5 text-[12px] font-medium text-white bg-aegis-primary hover:bg-aegis-primary-dark px-3.5 py-1.5 rounded-lg transition-colors disabled:opacity-50"
+                      >
+                        <Plus className="w-3.5 h-3.5" /> Build & connect
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </section>
 
         {/* Add a custom server — collapsed by default so a wall of raw JSON
             doesn't compete for attention with the friendly catalog above;

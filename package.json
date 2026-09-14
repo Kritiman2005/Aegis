@@ -58,12 +58,18 @@
         "nsis"
       ]
     },
+    "nsis": {
+      "deleteAppDataOnUninstall": true
+    },
     "linux": {
       "icon": "assets/icon.png",
       "target": [
         "AppImage",
         "deb"
       ]
+    },
+    "deb": {
+      "afterRemove": "packaging/linux/after-remove.sh"
     }
   },
   "dependencies": {

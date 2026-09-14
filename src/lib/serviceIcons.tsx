@@ -8,6 +8,8 @@ import {
 import { FaSlack, FaSalesforce } from 'react-icons/fa6';
 import {
   Folder, Globe, Brain, Cpu, Clock, Database, Layers, Wrench,
+  FileText, FileType2, Presentation, FileSpreadsheet, AudioLines, ScanText,
+  ArrowDownUp,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -56,12 +58,33 @@ const SERVICE_ICONS: Record<string, ServiceIconSpec> = {
   sqlite: { Icon: SiSqlite, color: '#003B57' },
   duckdb: { Icon: SiDuckdb, color: '#FFC825' },
   qdrant: { Icon: SiQdrant, color: '#DC244C' },
+  // The bundled built-in rows (app.core.workflows.seed) are really just a
+  // SQLite database and a Qdrant store under the hood — same icon as the
+  // real engine, not a generic fallback, since they're not a different
+  // product from what the Marketplace catalog itself offers.
+  aegis_app_db: { Icon: SiSqlite, color: '#003B57' },
+  aegis_hybrid: { Icon: SiQdrant, color: '#DC244C' },
   lancedb: { Icon: Layers, color: '#FF6A3D' },   // no published brand mark yet
   chromadb: { Icon: Database, color: '#8B5CF6' }, // no published brand mark yet
 
-  // Marketplace — automation tools and embedding models
+  // Marketplace — automation tools, extraction engines, and downloadable models
   playwright_scraper: { Icon: Globe, color: '#2EAD33' }, // no published Playwright brand mark in this icon set
+  web_extraction: { Icon: Globe, color: '#4B9EF4' },
+  media_transcription: { Icon: AudioLines, color: '#F4622D' },
+  ocr_extraction: { Icon: ScanText, color: '#8B5CF6' },
+  document_extraction: { Icon: FileText, color: '#8A94A6' },
+  // Per-format Document Extraction cards (keyed by format, not by the
+  // specific engine — e.g. every PDF engine, pymupdf/pdfplumber/pypdf/...,
+  // shares the same icon, since the icon represents the FILE FORMAT, not
+  // which library reads it; the card's own name/description already says
+  // which engine it is). See MarketplaceView.tsx's ToolCard.
+  extract_pdf: { Icon: FileText, color: '#E23F3F' },
+  extract_docx: { Icon: FileType2, color: '#2B579A' },
+  extract_pptx: { Icon: Presentation, color: '#D24726' },
+  extract_xlsx: { Icon: FileSpreadsheet, color: '#217346' },
+  extract_text: { Icon: FileText, color: '#6B7280' },
   embedding: { Icon: SiHuggingface, color: '#FFD21E' }, // fastembed's catalog is mostly HF-hub-hosted models
+  reranker: { Icon: ArrowDownUp, color: '#F4622D' },
 };
 
 const DEFAULT_ICON: ServiceIconSpec = { Icon: Wrench, color: '#8A94A6' };

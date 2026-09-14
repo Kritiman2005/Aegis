@@ -9,12 +9,28 @@ other engine below is an alternative a Workflow's Extract node can opt
 into (app.core.workflows.engine._run_extract_node) — purely additive,
 mirroring the shape of app.core.embeddings' model catalog (several
 choices per capability, one marked as the default).
+
+On top of this fixed, bundled list, a user can also point the Extract node
+at a connected MCP tool (Connectors) — the app's own way for a user to
+integrate an extraction tool Aegis doesn't ship itself, without Aegis
+running arbitrary third-party Python. An MCP-backed choice is addressed by
+a synthetic engine_id of the form "mcp:<server_name>:<tool_name>" rather
+than a real registry entry — extract() recognizes that prefix and routes
+to _extract_via_mcp_tool instead of the ENGINES lookup below. See
+list_mcp_candidates for how a connected server's tools are offered as
+candidates in the first place.
 """
 
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# A candidate MCP tool's declared input schema is checked for one of these
+# parameter names, in priority order, to know which argument to hand the
+# local file path to — most MCP filesystem/document tools use one of these
+# conventional names. See _guess_file_arg_name.
+_FILE_ARG_PRIORITY = ["file_path", "filepath", "path", "file"]
 
 
 def _default(file_path: str, ext: str) -> str:
@@ -107,22 +123,22 @@ def _xlsx_pandas(file_path: str, ext: str) -> str:
 
 ENGINES: Dict[str, List[Dict[str, Any]]] = {
     "pdf": [
-        {"id": "pymupdf", "name": "PyMuPDF", "description": "Aegis's built-in PDF extractor — fast, handles most PDFs well.", "default": True, "fn": _default},
+        {"id": "pymupdf", "name": "PyMuPDF", "description": "Fast, general-purpose PDF extraction — handles most PDFs well.", "default": True, "fn": _default},
         {"id": "pdfplumber", "name": "pdfplumber", "description": "Slower but much better at tables and layout-heavy PDFs.", "default": False, "fn": _pdf_pdfplumber},
         {"id": "pypdf", "name": "pypdf", "description": "Lightweight, pure-Python alternative — good for simple text-only PDFs.", "default": False, "fn": _pdf_pypdf},
         {"id": "pdfminer_six", "name": "pdfminer.six", "description": "Low-level raw text extraction — sometimes recovers text the others miss.", "default": False, "fn": _pdf_pdfminer},
         {"id": "ocr", "name": "OCR (scanned PDFs)", "description": "Renders each page as an image and runs OCR — for scanned PDFs with no real text layer.", "default": False, "fn": _pdf_ocr},
     ],
     "docx": [
-        {"id": "python_docx", "name": "python-docx", "description": "Aegis's built-in Word extractor — preserves headings and tables.", "default": True, "fn": _default},
+        {"id": "python_docx", "name": "python-docx", "description": "Preserves headings and tables when extracting Word documents.", "default": True, "fn": _default},
         {"id": "docx2txt", "name": "docx2txt", "description": "Simpler, faster plain-paragraph extraction.", "default": False, "fn": _docx_docx2txt},
         {"id": "mammoth", "name": "mammoth", "description": "Converts via its HTML pipeline — good structure preservation.", "default": False, "fn": _docx_mammoth},
     ],
     "pptx": [
-        {"id": "python_pptx", "name": "python-pptx", "description": "Aegis's built-in PowerPoint extractor.", "default": True, "fn": _default},
+        {"id": "python_pptx", "name": "python-pptx", "description": "Extracts text from PowerPoint slide decks.", "default": True, "fn": _default},
     ],
     "xlsx": [
-        {"id": "openpyxl", "name": "openpyxl", "description": "Aegis's built-in Excel extractor — cell-by-cell, exact values.", "default": True, "fn": _default},
+        {"id": "openpyxl", "name": "openpyxl", "description": "Cell-by-cell exact values from Excel spreadsheets.", "default": True, "fn": _default},
         {"id": "pandas", "name": "pandas", "description": "Renders each sheet as a formatted table — often better for numeric/tabular data.", "default": False, "fn": _xlsx_pandas},
     ],
     "text": [
@@ -145,6 +161,83 @@ def list_engines(fmt: str) -> List[Dict[str, Any]]:
     return [{k: v for k, v in e.items() if k != "fn"} for e in ENGINES.get(fmt, [])]
 
 
+def _guess_file_arg_name(tool_def: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Which of a candidate MCP tool's declared parameters should get the
+    local file path — checked against _FILE_ARG_PRIORITY's conventional
+    names first; if none match but the tool declares exactly one string
+    parameter, that's an unambiguous single choice worth using too. Returns
+    None (not installable as an extractor) when neither applies, or when
+    the tool has more than one required parameter — Aegis can only supply
+    the file path, so a tool needing a second required argument (write_file's
+    "content", move_file's "destination", ...) can never actually be called
+    successfully and shouldn't clutter the picker. This is still just a
+    naming/shape heuristic, not proof the tool actually extracts text —
+    the tool's own name and description (shown next to it in the picker)
+    are what a user judges fitness from, same as picking between the
+    bundled PDF engines."""
+    if not tool_def:
+        return None
+    schema = tool_def.get("inputSchema") or {}
+    props = schema.get("properties") or {}
+    required = schema.get("required") or []
+    if len(required) > 1:
+        return None
+    for name in _FILE_ARG_PRIORITY:
+        if name in props:
+            return name
+    string_props = [k for k, v in props.items() if isinstance(v, dict) and v.get("type") == "string"]
+    return string_props[0] if len(string_props) == 1 else None
+
+
+def list_mcp_candidates() -> List[Dict[str, Any]]:
+    """
+    Every currently-connected MCP tool (app.mcp.registry.mcp_registry) that
+    plausibly accepts a file path — offered as an Extract-node engine
+    choice alongside the bundled ones above, addressed by the synthetic
+    "mcp:<server>:<tool>" engine_id extract() recognizes. Not scoped to one
+    format: Aegis has no way to know which file types a given MCP tool
+    actually handles, so every format's picker gets the same candidate list
+    and the user judges fit from the tool's own name/description, same as
+    picking between the bundled PDF engines by reading what each one says
+    it's good at.
+    """
+    from app.mcp.registry import mcp_registry
+
+    candidates = []
+    for tool in mcp_registry.list_all_tools():
+        name = tool.get("name")
+        if not name or not _guess_file_arg_name(tool):
+            continue
+        server = mcp_registry.get_server_for_tool(name)
+        if not server:
+            continue
+        candidates.append({
+            "engine_id": f"mcp:{server}:{name}",
+            "name": f"{server} → {name}",
+            "description": tool.get("description") or "Custom extractor connected via Connectors.",
+            "server": server,
+            "tool": name,
+        })
+    return candidates
+
+
+def _extract_via_mcp_tool(file_path: str, server_name: str, tool_name: str) -> str:
+    from app.mcp.registry import mcp_registry
+
+    if mcp_registry.get_server_for_tool(tool_name) != server_name:
+        raise ValueError(
+            f"MCP tool '{tool_name}' from server '{server_name}' isn't connected right now — "
+            f"reconnect it from Connectors and try again."
+        )
+
+    tool_def = next((t for t in mcp_registry.list_all_tools() if t.get("name") == tool_name), None)
+    arg_name = _guess_file_arg_name(tool_def)
+    if not arg_name:
+        raise ValueError(f"MCP tool '{tool_name}' doesn't declare a file-path parameter Aegis recognizes.")
+
+    return mcp_registry.call_tool(tool_name, {arg_name: file_path})
+
+
 def extract(file_path: str, ext: str, engine_id: Optional[str] = None) -> str:
     """
     Runs the given engine (or the format's default when engine_id is unset
@@ -152,7 +245,15 @@ def extract(file_path: str, ext: str, engine_id: Optional[str] = None) -> str:
     app.core.rag.processor.extract_text directly for any format with no
     registry entry (e.g. an extension not in _EXT_TO_FORMAT at all) so this
     is always at least as capable as calling that function directly.
+
+    engine_id prefixed "mcp:" (see list_mcp_candidates) routes to a
+    connected MCP tool instead of anything in ENGINES below — Aegis's
+    integration point for an extraction tool it doesn't bundle itself.
     """
+    if engine_id and engine_id.startswith("mcp:"):
+        _, server_name, tool_name = engine_id.split(":", 2)
+        return _extract_via_mcp_tool(file_path, server_name, tool_name)
+
     fmt = format_for_ext(ext)
     engines = ENGINES.get(fmt or "", [])
     if not engines:

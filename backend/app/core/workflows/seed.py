@@ -33,9 +33,13 @@ Shape of the one tree, read top to bottom:
        whole_document, query — DEFAULT_DECIDE_SEARCH_PROMPT's exact shape)
          -> logic "Needs search?" (needs_search is_true)
               -> embedding "Embed Query" -> vector "Search documents"
-                 (search, same bundled store — its own real dense+sparse
-                 re-embed wins there, but a Marketplace-installed store
-                 genuinely uses Embed Query's vector as-is)
+                 (search, same bundled store, topK 20 candidates — its own
+                 real dense+sparse re-embed wins there, but a Marketplace-
+                 installed store genuinely uses Embed Query's vector as-is)
+                   -> reranker "Rerank documents" (bundled cross-encoder,
+                      topK 5 — a separate node, not a checkbox on "vector",
+                      so search-wide-then-rerank-down is visible as two
+                      real steps)
     -> logic "Looks export/multi-part?" (message matches_regex — an
        approximation of _classify_export_and_compound's real regex
        pre-gate, close enough to keep skipping the classify call on a
@@ -45,8 +49,7 @@ Shape of the one tree, read top to bottom:
     -> llm "Reply" (model config lives ONLY on "llm" nodes — this is the
        one wired directly into "chat_reply" below, with nothing else
        wired after it, so engine.py's run_chat_workflow treats it as the
-       real generator: folds in skill guidance itself, see
-       includeSkillGuidance; every other "llm" node above is a plain,
+       real generator; every other "llm" node above is a plain,
        non-streaming judgment call, unaffected)
          -> chat_reply "Send Reply" (a thin "send" marker, no config of
             its own — see _run_chat_generation_node/run_chat_workflow)
@@ -114,7 +117,14 @@ logger = logging.getLogger(__name__)
 
 SEED_WORKFLOW_NAME = "Aegis Default Pipeline"
 SEED_WORKFLOW_KEY = "default_pipeline"
-SEED_VERSION = 9
+# Bumped 10 -> 11: the "rerank" node (kind "reranker", between
+# vector_search and reply_llm) was added to the template below without a
+# matching version bump at the time — every install that seeded at
+# version 10 kept running vector_search's raw hybrid-fused order straight
+# into reply_llm, never actually reranked, despite the template already
+# describing a reranker. This bump is what makes the self-healing
+# overwrite below actually fire for those installs.
+SEED_VERSION = 11
 
 # Pre-merge identity — only used for the one-time migration described in
 # this module's docstring, folding these two into the single row above.
@@ -123,7 +133,7 @@ _LEGACY_CHAT_NAME = "Aegis Default Chat Pipeline"
 _LEGACY_INGESTION_KEY = "document_ingestion_pipeline"
 _LEGACY_INGESTION_NAME = "Aegis Document Ingestion Pipeline"
 
-BUILTIN_VECTOR_STORE_NAME = "Qdrant — hybrid + BM25 + rerank (bundled)"
+BUILTIN_VECTOR_STORE_NAME = "Qdrant"
 BUILTIN_VECTOR_ENGINE_ID = "aegis_hybrid"
 
 
@@ -161,6 +171,47 @@ def ensure_builtin_vector_store(db: Session) -> None:
     ))
     db.commit()
     logger.info(f"Registered built-in vector store '{BUILTIN_VECTOR_STORE_NAME}'.")
+
+
+BUILTIN_AEGIS_DB_NAME = "SQLite"
+BUILTIN_AEGIS_DB_ENGINE_ID = "aegis_app_db"
+
+
+def ensure_builtin_aegis_database(db: Session) -> None:
+    """
+    Registers Aegis's own SQLite database (chat history, workflows,
+    installed databases, ... — the same curated allowlist
+    app.core.aegis_db_browser already exposes) as a normal-looking
+    InstalledDatabase row, category "relational" — one real "database" node
+    now covers BOTH a Marketplace-installed database of the user's own
+    choosing (SQL query) AND this one (list/insert/update/delete through
+    the safety-checked browser), rather than a second, separate node kind
+    hardcoding "Aegis Database" as its own thing (see engine.py's
+    _run_database_node for the engine_id==BUILTIN_AEGIS_DB_ENGINE_ID
+    special-casing). is_builtin=True keeps it from ever being deleted
+    through the ordinary Marketplace databases API. storage_path is unused
+    for this engine_id (aegis_db_browser always operates through the app's
+    own SessionLocal, never a raw file path) — kept non-empty only because
+    the column itself is NOT NULL.
+    """
+    from app.db.models import InstalledDatabase
+
+    row = db.query(InstalledDatabase).filter(InstalledDatabase.engine_id == BUILTIN_AEGIS_DB_ENGINE_ID).first()
+    if row:
+        if row.name != BUILTIN_AEGIS_DB_NAME:
+            row.name = BUILTIN_AEGIS_DB_NAME
+            db.commit()
+        return
+    db.add(InstalledDatabase(
+        name=BUILTIN_AEGIS_DB_NAME,
+        engine_id=BUILTIN_AEGIS_DB_ENGINE_ID,
+        category="relational",
+        storage_path="(app database)",
+        status="ready",
+        is_builtin=True,
+    ))
+    db.commit()
+    logger.info(f"Registered built-in database '{BUILTIN_AEGIS_DB_NAME}'.")
 
 
 def _find_or_adopt_seed_row(db: Session, seed_key: str, by_name: str) -> Workflow | None:
@@ -286,8 +337,12 @@ def seed_default_pipeline(db: Session) -> None:
         _node("embedding_query", 540, 400, {"label": "Embed Query", "kind": "embedding", "isAi": False}),
         _node("vector_search", 540, 520, {
             "label": "Search documents", "kind": "vector", "isAi": False,
-            "operation": "search", "topK": 5,
+            "operation": "search", "topK": 20,
             "databaseId": builtin_id,
+        }),
+        _node("rerank", 540, 640, {
+            "label": "Rerank documents", "kind": "reranker", "isAi": False,
+            "topK": 5,
         }),
 
         _node("classify_gate", 940, 160, {"label": "Looks export/multi-part?", "kind": "logic", "field": "message", "operator": "matches_regex", "value": _CLASSIFY_GATE_PATTERN}),
@@ -301,12 +356,12 @@ def seed_default_pipeline(db: Session) -> None:
             ],
         }),
 
-        _node("reply_llm", 540, 660, {
+        _node("reply_llm", 540, 780, {
             "label": "Reply", "kind": "llm", "isAi": False,
-            "modelName": "", "instruction": build_chat_prompt(), "includeSkillGuidance": True,
+            "modelName": "", "instruction": build_chat_prompt(),
         }),
-        _node("reply", 540, 780, {"label": "Send Reply", "kind": "chat_reply"}),
-        _node("export", 540, 900, {"label": "Export Reply", "kind": "export_document"}),
+        _node("reply", 540, 900, {"label": "Send Reply", "kind": "chat_reply"}),
+        _node("export", 540, 1020, {"label": "Export Reply", "kind": "export_document"}),
     ]
     edges = [
         {"id": "trigger-ingest_loop", "source": "trigger", "target": "ingest_loop", "data": {}},
@@ -325,11 +380,12 @@ def seed_default_pipeline(db: Session) -> None:
         {"id": "decide-search_gate", "source": "decide", "target": "search_gate", "data": {}},
         {"id": "search_gate-embedding_query", "source": "search_gate", "target": "embedding_query", "data": {}},
         {"id": "embedding_query-vector_search", "source": "embedding_query", "target": "vector_search", "data": {}},
+        {"id": "vector_search-rerank", "source": "vector_search", "target": "rerank", "data": {}},
 
         {"id": "trigger-classify_gate", "source": "trigger", "target": "classify_gate", "data": {}},
         {"id": "classify_gate-classifier", "source": "classify_gate", "target": "classifier", "data": {}},
 
-        {"id": "vector_search-reply_llm", "source": "vector_search", "target": "reply_llm", "data": {}},
+        {"id": "rerank-reply_llm", "source": "rerank", "target": "reply_llm", "data": {}},
         {"id": "classifier-reply_llm", "source": "classifier", "target": "reply_llm", "data": {}},
         # reply_llm's ONLY downstream edge — this is what marks it (not
         # any other "llm" node above) as the real generator; see

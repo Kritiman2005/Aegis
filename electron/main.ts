@@ -180,6 +180,36 @@ function killSidecar(): void {
   }, 3000);
 }
 
+/**
+ * Same shutdown as killSidecar, but awaited — needed before deleting
+ * userData (the sidecar has aegis.db open; deleting out from under a still-
+ * running process risks a half-written file rather than a clean wipe).
+ * Resolves once the process has actually exited (or after a hard timeout,
+ * in case it's wedged) rather than killSidecar's fire-and-forget escalation.
+ */
+function killSidecarAndWait(timeoutMs = 5000): Promise<void> {
+  return new Promise((resolve) => {
+    if (!sidecarProcess || sidecarProcess.killed) {
+      resolve();
+      return;
+    }
+    const proc = sidecarProcess;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardTimeout);
+      resolve();
+    };
+    proc.once('exit', finish);
+    proc.kill('SIGTERM');
+    const hardTimeout = setTimeout(() => {
+      if (!proc.killed) proc.kill('SIGKILL');
+      finish();
+    }, timeoutMs);
+  });
+}
+
 // ─── Health Check ────────────────────────────────────────────────────────────
 
 /**
@@ -382,6 +412,27 @@ function registerIpcHandlers(): void {
   ipcMain.on('backend:restart', () => {
     killSidecar();
     setTimeout(spawnSidecar, 500);
+  });
+
+  // The in-app "erase all my data" action (Sidebar's account menu) — the
+  // practical substitute for an OS-level uninstall hook on platforms that
+  // don't have one (macOS drag-to-Trash, Linux AppImage both run zero
+  // uninstall code; see package.json's nsis.deleteAppDataOnUninstall and
+  // build/linux/after-remove.sh for the platforms that DO support one).
+  // Stops the sidecar first so aegis.db/downloaded models aren't deleted
+  // out from under a process that still has them open, then wipes
+  // userData and relaunches fresh — same directory init_db()/seed.py
+  // already know how to populate from nothing on a brand-new install.
+  ipcMain.on('app:erase-all-data', async () => {
+    console.log('[Aegis] Erasing all user data...');
+    await killSidecarAndWait();
+    try {
+      await fs.promises.rm(app.getPath('userData'), { recursive: true, force: true });
+    } catch (err) {
+      console.error('[Aegis] Failed to erase user data:', err);
+    }
+    app.relaunch();
+    app.exit(0);
   });
 
   // Open URLs in the system browser (used for OAuth flows)
