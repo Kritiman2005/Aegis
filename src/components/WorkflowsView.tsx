@@ -24,7 +24,7 @@ import {
   FileSpreadsheet, Presentation, FileType2, Link2,
   Layers, Upload,
   Boxes, FileOutput, MessageSquareText, GitBranch, ArrowDownUp,
-  History as HistoryIcon, Clock, AlertTriangle,
+  History as HistoryIcon, Clock, AlertTriangle, Send,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { useSocket } from '../hooks/useSocket';
@@ -45,6 +45,14 @@ interface ModelDef {
   name: string;
   display_name?: string;
   status: string;
+  // Mirrors GET /api/hub/downloaded — true + "downloaded" together mean
+  // this model can actually see an image (its vision-tower/mmproj file is
+  // present, not just that it's architecturally a vision model). Used by
+  // an "llm" node's config panel to surface when picking this model
+  // enables reading an image an upstream document_upload_trigger fed in
+  // (see NodeData.includeImages and engine.py's _attach_workflow_vision_image).
+  is_vision?: boolean;
+  mmproj_status?: string | null;
 }
 
 interface InstalledDB {
@@ -84,6 +92,16 @@ interface ChunkingStrategyDef {
   name: string;
   description: string;
   default: boolean;
+}
+
+// Mirrors GET /api/chat/sessions — every existing conversation, for the
+// picker on chat_trigger/document_upload_trigger/send_to_chat's
+// conversationId field (see NodeData.conversationId's docstring).
+interface ChatSessionDef {
+  id: string;
+  preview: string;
+  message_count: number;
+  created_at: string | null;
 }
 
 // A connected MCP tool an Extract node can pick as a custom extractor —
@@ -189,10 +207,26 @@ type NodeStatus = 'idle' | 'running' | 'completed' | 'failed';
 // mirrors "chat_trigger" exactly but fires on a document upload instead of
 // a chat message (app.api.workflows's /set-ingestion-handler and
 // engine.run_ingestion_workflow); also never runs through a manual "Run".
+// "schedule_trigger" is a third entry point, for a chain nothing live
+// kicks off — it fires on its own timer (data.intervalMinutes, set by the
+// user on the node itself) instead of waiting for a chat message or an
+// upload. Runs in the background (app.core.scheduler's SchedulerDaemon →
+// engine.run_schedule_workflow), never through a manual "Run" either — the
+// canonical use is a poll-and-check chain: this trigger -> an "mcp"/"tool"
+// node like gmail_list_messages -> a "logic" node with
+// operator=="changed_since_last_run" (only lets the rest of the chain run
+// when the fetched value is actually different from last time) -> "llm" to
+// summarize -> "send_to_chat" to deliver it. "send_to_chat" is the
+// dedicated delivery node for exactly that last step — unlike "chat_reply"
+// (which only works inside a live chat_trigger turn, replying into the
+// SAME conversation the user just typed into), "send_to_chat" works from
+// a schedule_trigger chain with no such conversation to reply into: it
+// writes a real message into one dedicated conversation per workflow and
+// notifies the user, wherever they are right now.
 type NodeKind =
   | 'tool' | 'llm' | 'logic' | 'loop' | 'database' | 'vector' | 'reranker' | 'embedding' | 'extract' | 'chunk' | 'chat_trigger'
-  | 'document_upload_trigger'
-  | 'chat_reply' | 'export_document';
+  | 'document_upload_trigger' | 'schedule_trigger'
+  | 'chat_reply' | 'export_document' | 'send_to_chat';
 
 interface NodeData {
   label: string;
@@ -222,11 +256,51 @@ interface NodeData {
   // upstream value through unchanged when true, or skips everything
   // downstream of it when false — app.core.workflows.engine._run_logic_node.
   field?: string;
-  operator?: 'is_true' | 'is_false' | 'equals' | 'not_equals' | 'contains' | 'matches_regex';
+  // "changed_since_last_run" compares against the value this SAME node saw
+  // last time (persisted server-side, keyed by this node), not anything in
+  // the current run — see app.core.workflows.engine._run_logic_node. Only
+  // meaningful inside a saved workflow (needs a workflow_id to key state
+  // by), which is always true once it's actually connected/scheduled.
+  operator?: 'is_true' | 'is_false' | 'equals' | 'not_equals' | 'contains' | 'matches_regex' | 'changed_since_last_run';
   value?: string;
   // "loop" kind — iterates the chain of nodes wired directly after it once
   // per item of this upstream field.
   itemsField?: string;
+  // "schedule_trigger" kind — how often this fires, in minutes, set by the
+  // user on the node itself (no fixed default baked into the backend —
+  // app.core.scheduler.SchedulerDaemon.check_and_run_workflow_triggers
+  // reads this directly off the node).
+  intervalMinutes?: number;
+  // "chat_trigger"/"document_upload_trigger": which conversation this
+  // workflow handles. Blank = the one GLOBAL handler (every conversation
+  // with no more specific match) — the only option before this existed.
+  // Set = scoped to exactly that conversation; app.api.workflows's
+  // /set-chat-handler and /set-ingestion-handler read this off the
+  // trigger node at connect time (see _trigger_conversation_id) and
+  // persist it onto the Workflow row, so app.db.crud
+  // .get_active_chat_workflow/get_active_ingestion_workflow's
+  // scoped-then-global lookup doesn't need to re-parse the graph on every
+  // message/upload. "send_to_chat": which conversation this delivers
+  // into — blank uses the dedicated per-workflow thread
+  // ("workflow_{id}_auto") it's always used; set targets any real
+  // conversation directly (e.g. your main chat). All three share one
+  // picker UI (NodeConfigPanel's conversationField) populated from
+  // GET /api/chat/sessions.
+  conversationId?: string;
+  // "document_upload_trigger" only — off (default) means EXACTLY today's
+  // behavior: an image upload never reaches this trigger at all, handled
+  // instead by the vision-at-chat-send-time path (or rejected if no
+  // vision model is active) — see app.api.documents's upload endpoint.
+  // On, an image upload fires this trigger like any other file
+  // ({file_path, document_id, filename, file_type}, file_type one of
+  // png/jpg/jpeg) — nothing downstream is auto-routed for it: Extract
+  // only understands pdf/docx/pptx/xlsx/text, so an image reaching it
+  // fails. Branch on file_type with a Logic node (the autocomplete
+  // suggests it) before wiring an image toward an "llm" node with a
+  // vision-capable model picked — that node reads the image as real
+  // vision input (app.core.workflows.engine._attach_workflow_vision_image),
+  // independent of whatever model happens to be active for chat.
+  includeImages?: boolean;
   // "database" and "vector" kinds — an installed database (see
   // app.db.models.InstalledDatabase), referenced by id rather than a raw
   // file path so any engine in the catalog works the same way. For
@@ -331,6 +405,8 @@ function extractFormatIcon(format?: string) {
 function nodeIcon(data: NodeData) {
   if (data.kind === 'chat_trigger') return <MessageCircle className="w-3 h-3 text-aegis-success flex-shrink-0" />;
   if (data.kind === 'document_upload_trigger') return <Upload className="w-3 h-3 text-aegis-success flex-shrink-0" />;
+  if (data.kind === 'schedule_trigger') return <Clock className="w-3 h-3 text-aegis-success flex-shrink-0" />;
+  if (data.kind === 'send_to_chat') return <Send className="w-3 h-3 text-aegis-primary-light flex-shrink-0" />;
   // "llm" is a real model call under the hood regardless of what it's
   // configured to do (freeform text or a structured judgment call) —
   // Brain icon, same as "chat_reply" (also a model call, just the
@@ -357,6 +433,10 @@ function nodeSubtitle(data: NodeData): string {
       return 'Starts when you send a chat message';
     case 'document_upload_trigger':
       return 'Starts when you upload a document';
+    case 'schedule_trigger':
+      return data.intervalMinutes ? `Every ${data.intervalMinutes} min` : 'Set how often to check';
+    case 'send_to_chat':
+      return 'Posts to a dedicated chat thread for this workflow';
     case 'export_document':
       return 'Turns the reply into a file, if requested';
     case 'llm':
@@ -366,6 +446,7 @@ function nodeSubtitle(data: NodeData): string {
     case 'chat_reply':
       return 'Sends whatever the upstream "llm" node generates';
     case 'logic':
+      if (data.operator === 'changed_since_last_run') return 'Only continues when this changes';
       return data.field
         ? `${data.field} ${data.operator || 'is_true'}${data.value ? ` "${data.value}"` : ''}`
         : 'Set a field and condition';
@@ -415,6 +496,7 @@ function outputPortType(data: NodeData): PortType {
   switch (data.kind) {
     case 'chat_trigger':
     case 'document_upload_trigger':
+    case 'schedule_trigger':
     case 'embedding':
       return 'record';
     case 'llm':
@@ -433,6 +515,10 @@ function outputPortType(data: NodeData): PortType {
       // _run_export_document_node returns the (possibly export-augmented)
       // reply text — a real string, not a dead end; nothing happens to be
       // wired after it in practice, but that's a graph shape, not a rule.
+      return 'text';
+    case 'send_to_chat':
+      // _run_send_to_chat_node returns the exact text it delivered — a
+      // real string, same reasoning as export_document above.
       return 'text';
     case 'chat_reply':
     case 'logic':
@@ -458,6 +544,7 @@ function inputPortTypes(data: NodeData): PortType[] {
   switch (data.kind) {
     case 'chat_trigger':
     case 'document_upload_trigger':
+    case 'schedule_trigger':
       return ['none'];
     case 'vector':
       // Both "search" and "upsert" need an Embedding node's {texts, vectors}
@@ -475,6 +562,11 @@ function inputPortTypes(data: NodeData): PortType[] {
       return ['text'];
     case 'chat_reply':
       return ['text'];
+    case 'send_to_chat':
+      // _run_send_to_chat_node stringifies whatever it receives — plain
+      // text (the common case, an "llm" summary) or a structured "record"
+      // (json.dumps'd) — same reasoning as export_document below.
+      return ['text', 'record'];
     case 'export_document':
       // Genuinely two different upstream shapes, both real (see
       // _run_export_document_node): the reply text from a "chat_reply"
@@ -579,6 +671,7 @@ export default function WorkflowsView() {
   const [extractionEngines, setExtractionEngines] = useState<ExtractionEngineDef[]>([]);
   const [mcpExtractionTools, setMcpExtractionTools] = useState<McpExtractionToolDef[]>([]);
   const [chunkingStrategies, setChunkingStrategies] = useState<ChunkingStrategyDef[]>([]);
+  const [chatSessions, setChatSessions] = useState<ChatSessionDef[]>([]);
   const [aegisDbTables, setAegisDbTables] = useState<{ name: string; label: string; user_created: boolean }[]>([]);
   const [aegisDbBrowserOpen, setAegisDbBrowserOpen] = useState(false);
   const [activeId, setActiveId] = useState<number | 'new' | null>(null);
@@ -710,7 +803,16 @@ export default function WorkflowsView() {
     } catch (e) {}
   }, []);
 
-  useEffect(() => { fetchWorkflows(); fetchTools(); fetchModels(); fetchDatabases(); fetchEmbeddingModels(); fetchRerankerModels(); fetchExtractionEngines(); fetchMcpExtractionTools(); fetchChunkingStrategies(); fetchAegisDbTables(); }, [fetchWorkflows, fetchTools, fetchModels, fetchDatabases, fetchEmbeddingModels, fetchRerankerModels, fetchExtractionEngines, fetchMcpExtractionTools, fetchChunkingStrategies, fetchAegisDbTables]);
+  // Powers the conversation picker on chat_trigger/document_upload_trigger/
+  // send_to_chat — see NodeData.conversationId's docstring.
+  const fetchChatSessions = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/chat/sessions`);
+      if (res.ok) setChatSessions(await res.json());
+    } catch (e) {}
+  }, []);
+
+  useEffect(() => { fetchWorkflows(); fetchTools(); fetchModels(); fetchDatabases(); fetchEmbeddingModels(); fetchRerankerModels(); fetchExtractionEngines(); fetchMcpExtractionTools(); fetchChunkingStrategies(); fetchAegisDbTables(); fetchChatSessions(); }, [fetchWorkflows, fetchTools, fetchModels, fetchDatabases, fetchEmbeddingModels, fetchRerankerModels, fetchExtractionEngines, fetchMcpExtractionTools, fetchChunkingStrategies, fetchAegisDbTables, fetchChatSessions]);
 
   // Live per-node status while a run is in flight — same WebSocket
   // broadcast pattern MCPServersPanel/ModelHub already use.
@@ -906,6 +1008,14 @@ export default function WorkflowsView() {
 
   const addIngestionTriggerNode = () => {
     placeNode({ label: 'On document upload', kind: 'document_upload_trigger', isAi: false, status: 'idle' });
+  };
+
+  const addScheduleTriggerNode = () => {
+    placeNode({ label: 'On a schedule', kind: 'schedule_trigger', isAi: false, intervalMinutes: 5, status: 'idle' });
+  };
+
+  const addSendToChatNode = () => {
+    placeNode({ label: 'Post to Chat', kind: 'send_to_chat', isAi: false, status: 'idle' });
   };
 
   const addExportDocumentNode = () => {
@@ -1129,6 +1239,8 @@ export default function WorkflowsView() {
   );
   const showTrigger = !search || 'chat'.includes(search) || 'trigger'.includes(search) || 'message'.includes(search);
   const showIngestionTrigger = !search || 'upload'.includes(search) || 'trigger'.includes(search) || 'document'.includes(search) || 'ingest'.includes(search);
+  const showScheduleTrigger = !search || 'schedule'.includes(search) || 'trigger'.includes(search) || 'timer'.includes(search) || 'poll'.includes(search) || 'cron'.includes(search);
+  const showSendToChat = !search || 'chat'.includes(search) || 'send'.includes(search) || 'post'.includes(search) || 'notify'.includes(search);
   const showChatContext = !search || 'chat'.includes(search) || 'reply'.includes(search) || 'export'.includes(search);
   const showLogic = !search || 'logic'.includes(search) || 'if'.includes(search) || 'gate'.includes(search) || 'condition'.includes(search);
   const showLlm = !search || 'llm'.includes(search) || 'model'.includes(search);
@@ -1434,6 +1546,7 @@ export default function WorkflowsView() {
                 <NodeConfigPanel
                   data={selectedNode.data as NodeData}
                   isReplyGenerator={replyGenerationIds.includes(selectedNode.id)}
+                  upstreamFieldSuggestions={getUpstreamFieldSuggestions(selectedNode.id, edges, nodes)}
                   tools={tools}
                   models={models}
                   databases={databases}
@@ -1443,6 +1556,7 @@ export default function WorkflowsView() {
                   mcpExtractionTools={mcpExtractionTools}
                   chunkingStrategies={chunkingStrategies}
                   aegisDbTables={aegisDbTables}
+                  chatSessions={chatSessions}
                   onOpenAegisDbBrowser={() => setAegisDbBrowserOpen(true)}
                   selectedTool={selectedTool}
                   onChange={updateSelectedNode}
@@ -1551,7 +1665,7 @@ export default function WorkflowsView() {
           </div>
 
           {/* Triggers — listed first, matching n8n's own node picker */}
-          {((showTrigger && !hasChatTrigger) || (showIngestionTrigger && !hasIngestionTrigger)) && (
+          {((showTrigger && !hasChatTrigger) || (showIngestionTrigger && !hasIngestionTrigger) || showScheduleTrigger) && (
             <section>
               <div className="text-[10px] font-bold text-aegis-text-muted uppercase tracking-wider mb-1.5">Triggers</div>
               {showTrigger && !hasChatTrigger && (
@@ -1570,6 +1684,14 @@ export default function WorkflowsView() {
                   onClick={addIngestionTriggerNode}
                 />
               )}
+              {showScheduleTrigger && (
+                <PaletteRow
+                  icon={<Clock className="w-4 h-4 text-aegis-success flex-shrink-0" />}
+                  title="On a schedule"
+                  description="Fires on its own timer — set the interval on the node. Runs in the background, no chat message or upload needed. Add as many as you like, each on its own cadence."
+                  onClick={addScheduleTriggerNode}
+                />
+              )}
             </section>
           )}
 
@@ -1582,6 +1704,21 @@ export default function WorkflowsView() {
                 <PaletteRow icon={<MessageSquareText className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />} title="Send Reply" description="No config of its own — wire exactly one 'llm' node directly into it (nothing else wired after that llm node) to generate the reply; this just marks where it's sent" onClick={addChatReplyNode} />
                 <PaletteRow icon={<FileOutput className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />} title="Export Reply" description="Turns the reply into a downloadable file, if requested — wire it after the Send Reply node" onClick={addExportDocumentNode} />
               </div>
+            </section>
+          )}
+
+          {/* Post to Chat — the delivery node for a schedule-triggered
+              chain, which has no live chat turn to reply into the way
+              Send Reply does. */}
+          {showSendToChat && (
+            <section>
+              <div className="text-[10px] font-bold text-aegis-text-muted uppercase tracking-wider mb-1.5">Automation</div>
+              <PaletteRow
+                icon={<Send className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />}
+                title="Post to Chat"
+                description="Delivers upstream text into a dedicated chat thread for this workflow — for a schedule-triggered chain with no live chat turn to reply into"
+                onClick={addSendToChatNode}
+              />
             </section>
           )}
 
@@ -1770,6 +1907,8 @@ const EXTRACT_FORMAT_LABELS: Record<NonNullable<NodeData['extractorFormat']>, st
 const NODE_OUTPUT_SHAPE: Partial<Record<NodeKind, string>> = {
   chat_trigger: '{ message, history, attachments, pending_attachments }',
   document_upload_trigger: '{ file_path, document_id, filename, file_type }',
+  schedule_trigger: '{ fired_at } — just a timestamp; wire an "mcp"/"tool" node after it to actually fetch something fresh on each firing.',
+  send_to_chat: 'The exact text it delivered — a real string, useful if you wire something after it too.',
   llm: 'Plain text — or, with structured Output configured, exactly those field names as a JSON object.',
   logic: "Whatever came in, unchanged (or nothing at all if this gate's condition is false).",
   loop: 'A list — one entry per item, each the last step in the chain\'s own output for that item.',
@@ -1783,6 +1922,47 @@ const NODE_OUTPUT_SHAPE: Partial<Record<NodeKind, string>> = {
   chat_reply: 'The exact text the reply-generation "llm" node produced, unchanged.',
   export_document: 'The reply text, with a download link appended if a file was actually exported.',
 };
+
+// The subset of NODE_OUTPUT_SHAPE whose keys are actually fixed and
+// enumerable (not "depends which operation" or "whatever that tool
+// returns") — used to power real autocomplete suggestions on a "Field"
+// input (Logic node) or "Items field" input (Loop node) instead of asking
+// the user to already know and correctly spell an upstream key name.
+// Deliberately narrower than NODE_OUTPUT_SHAPE: database/vector/tool are
+// left out here (and so give no suggestions) rather than risk suggesting a
+// field name that's wrong for the operation actually configured.
+const NODE_OUTPUT_FIELDS: Partial<Record<NodeKind, string[]>> = {
+  chat_trigger: ['message', 'history', 'attachments', 'pending_attachments'],
+  document_upload_trigger: ['file_path', 'document_id', 'filename', 'file_type'],
+  schedule_trigger: ['fired_at'],
+  embedding: ['texts', 'vectors'],
+};
+
+// Real, this-graph field suggestions for a "Field"/"Items field" input —
+// looks at what's ACTUALLY wired directly upstream of `nodeId`, not just
+// the node's own kind. An upstream "llm" node with Output switched to
+// structured JSON contributes its own user-authored field names (the
+// exact shape it will actually return); every other kind falls back to
+// NODE_OUTPUT_FIELDS above. Empty when nothing's wired in yet, or when
+// what's wired in has no statically-knowable shape (a plain-text "llm",
+// a "tool" call, "database"/"vector" — the input stays a free-text field
+// exactly as before, no suggestions is honest here, not a bug).
+function getUpstreamFieldSuggestions(nodeId: string, edges: Edge[], nodes: Node[]): string[] {
+  const seen = new Set<string>();
+  for (const edge of edges) {
+    if (edge.target !== nodeId) continue;
+    const source = nodes.find(n => n.id === edge.source);
+    const sourceData = source?.data as NodeData | undefined;
+    if (!sourceData) continue;
+    if (sourceData.kind === 'llm' && sourceData.outputFields?.length) {
+      for (const f of sourceData.outputFields) if (f.name) seen.add(f.name);
+      continue;
+    }
+    const fixed = NODE_OUTPUT_FIELDS[sourceData.kind];
+    if (fixed) for (const name of fixed) seen.add(name);
+  }
+  return Array.from(seen);
+}
 
 // A connection between two nodes — click one on the canvas to explicitly
 // map a single named field from the source's output onto what the target
@@ -1809,7 +1989,7 @@ function NodeInputColumn({ node, edges, nodes, onUpdateMapping }: {
       <h3 className="text-[10px] font-bold text-aegis-text-muted uppercase tracking-wider">Input</h3>
       {incoming.length === 0 ? (
         <p className="text-[10px] text-aegis-text-muted leading-relaxed">
-          {(node.data as NodeData).kind === 'chat_trigger' || (node.data as NodeData).kind === 'document_upload_trigger'
+          {(['chat_trigger', 'document_upload_trigger', 'schedule_trigger'] as NodeKind[]).includes((node.data as NodeData).kind)
             ? "This is a trigger — it's the entry point, nothing feeds into it."
             : 'Nothing wired in yet — connect a step to it on the canvas.'}
         </p>
@@ -1908,7 +2088,7 @@ function NodeOutputColumn({ node, edges, nodes }: { node: Node; edges: Edge[]; n
 }
 
 function NodeConfigPanel({
-  data, isReplyGenerator, tools, models, databases, embeddingModels, rerankerModels, extractionEngines, mcpExtractionTools, chunkingStrategies, aegisDbTables, onOpenAegisDbBrowser, selectedTool, onChange, onDelete,
+  data, isReplyGenerator, upstreamFieldSuggestions, tools, models, databases, embeddingModels, rerankerModels, extractionEngines, mcpExtractionTools, chunkingStrategies, aegisDbTables, chatSessions, onOpenAegisDbBrowser, selectedTool, onChange, onDelete,
 }: {
   data: NodeData;
   // Only meaningful for kind "llm" — true when THIS node is the one whose
@@ -1917,6 +2097,13 @@ function NodeConfigPanel({
   // of which "llm" node actually generates+streams the reply vs. a plain
   // judgment-call step elsewhere in the same graph.
   isReplyGenerator: boolean;
+  // Real field names pulled from whatever's actually wired directly
+  // upstream of this node (see getUpstreamFieldSuggestions) — powers a
+  // <datalist> on the Logic node's "Field" input and the Loop node's
+  // "Items field" input, so the user picks a real key instead of having
+  // to already know and correctly spell one. Empty when nothing's wired
+  // in, or what's wired in has no statically-knowable shape.
+  upstreamFieldSuggestions: string[];
   tools: ToolDef[];
   models: ModelDef[];
   databases: InstalledDB[];
@@ -1926,6 +2113,7 @@ function NodeConfigPanel({
   mcpExtractionTools: McpExtractionToolDef[];
   chunkingStrategies: ChunkingStrategyDef[];
   aegisDbTables: { name: string; label: string; user_created: boolean }[];
+  chatSessions: ChatSessionDef[];
   onOpenAegisDbBrowser: () => void;
   selectedTool?: ToolDef;
   onChange: (patch: Partial<NodeData>) => void;
@@ -1953,13 +2141,47 @@ function NodeConfigPanel({
     </div>
   );
 
+  // Shared by chat_trigger/document_upload_trigger/send_to_chat — see
+  // NodeData.conversationId's docstring. blankOptionLabel is the only
+  // thing that differs per kind (what leaving it unset actually means).
+  const conversationField = (blankOptionLabel: string) => (
+    <div>
+      <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Conversation</label>
+      <select
+        value={data.conversationId || ''}
+        onChange={e => onChange({ conversationId: e.target.value || undefined })}
+        className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+      >
+        <option value="">{blankOptionLabel}</option>
+        {chatSessions.map(s => (
+          <option key={s.id} value={s.id}>{s.preview.length > 60 ? s.preview.slice(0, 60) + '…' : s.preview}</option>
+        ))}
+      </select>
+    </div>
+  );
+
+  // Native browser autocomplete backing the "Field"/"Items field" inputs
+  // below (via list="upstream-field-suggestions") — the clickable chips
+  // rendered next to each input are the more discoverable affordance
+  // (datalist's own dropdown indicator varies a lot by browser/OS), this
+  // is just the typing shortcut on top of them.
+  const fieldDatalist = (
+    <datalist id="upstream-field-suggestions">
+      {upstreamFieldSuggestions.map(f => <option key={f} value={f} />)}
+    </datalist>
+  );
+
   if (data.kind === 'chat_trigger') {
     return (
       <div className="flex flex-col gap-3">
         {header}
         {labelField}
         <p className="text-[10px] text-aegis-text-muted leading-relaxed">
-          Fires when you send a message in the normal chat window — only if this workflow is connected via the toolbar's "Connect to chat" button. No configuration needed; needs exactly one Send Reply node fed by exactly one "llm" node (that llm node is the real reply generator — model, prompt, and memory settings live there), and exactly one final step overall.
+          Fires when you send a message in the normal chat window — only if this workflow is connected via the toolbar's "Connect to chat" button. Needs exactly one Send Reply node fed by exactly one "llm" node (that llm node is the real reply generator — model, prompt, and memory settings live there), and exactly one final step overall.
+        </p>
+        {conversationField('Every conversation (global handler)')}
+        <p className="text-[10px] text-aegis-text-muted leading-relaxed">
+          Leave blank to take over ALL your chats when connected — the only option before per-conversation scoping existed. Pick one here to scope this workflow to just that conversation instead; your other chats keep using the normal pipeline (or a different workflow scoped to them). A global handler and any number of conversation-scoped ones can all be connected at the same time.
         </p>
         <p className="text-[10px] text-aegis-text-muted leading-relaxed border-t border-aegis-border pt-2">
           A document attached to a chat message uses the SAME upload path as the standalone document library, and this turn's output includes a "pending_attachments" list — wire a Loop node off this trigger (itemsField "pending_attachments") into an Extract → Chunk → Embedding → Vector chain to index it as part of this same turn, exactly like the seeded pipeline does.
@@ -1974,8 +2196,30 @@ function NodeConfigPanel({
         {header}
         {labelField}
         <p className="text-[10px] text-aegis-text-muted leading-relaxed">
-          Fires when you upload a document — only if this workflow is connected via the toolbar's "Connect to uploads" button. No configuration needed; needs exactly one final step overall. Typically feeds an Extract → Chunk → Embedding → Vector store chain.
+          Fires when you upload a document — only if this workflow is connected via the toolbar's "Connect to uploads" button. Needs exactly one final step overall. Typically feeds an Extract → Chunk → Embedding → Vector store chain.
         </p>
+        {conversationField('Every upload (global handler)')}
+        <p className="text-[10px] text-aegis-text-muted leading-relaxed">
+          Leave blank to handle every upload anywhere when connected. Pick one here to scope this workflow to uploads made within just that conversation instead — uploads elsewhere keep using the normal pipeline (or a different workflow scoped to them).
+        </p>
+        <label className="flex items-start gap-2 text-xs text-aegis-text-secondary pt-1 border-t border-aegis-border">
+          <input
+            type="checkbox"
+            checked={!!data.includeImages}
+            onChange={e => onChange({ includeImages: e.target.checked || undefined })}
+            className="mt-0.5"
+          />
+          <span>Also trigger on image uploads</span>
+        </label>
+        {data.includeImages ? (
+          <p className="text-[10px] text-aegis-text-muted leading-relaxed">
+            Off by default: an uploaded image (PNG/JPG) normally never reaches this trigger at all — it's read by whatever vision model is active for chat instead, or rejected if none is. With this on, an image fires this trigger like any file ({'{'}file_path, document_id, filename, file_type{'}'}), letting THIS workflow's own "llm" node read it with whatever model it picks — independent of the active chat model. Extract only understands documents, not images, so branch first: add a Logic node right after this trigger, Field "file_type", condition "matches regex", value <code className="font-mono">png|jpe?g</code> — route matches to an "llm" node with a vision-capable model picked, everything else to your normal Extract chain.
+          </p>
+        ) : (
+          <p className="text-[10px] text-aegis-text-muted leading-relaxed">
+            Leave this off unless you're specifically building something for uploaded images — every existing workflow keeps working exactly as before either way.
+          </p>
+        )}
       </div>
     );
   }
@@ -1987,6 +2231,54 @@ function NodeConfigPanel({
         {labelField}
         <p className="text-[10px] text-aegis-text-muted leading-relaxed">
           Wire this AFTER the Send Reply node, with a classifier "llm" node (outputFields including is_export/format) also feeding it directly if you want real export detection. If a file was requested, turns the reply into a real PDF/DOCX/XLSX and appends a download link — otherwise passes the reply through unchanged. Make this the workflow's final step.
+        </p>
+      </div>
+    );
+  }
+
+  if (data.kind === 'schedule_trigger') {
+    return (
+      <div className="flex flex-col gap-3">
+        {header}
+        {labelField}
+        <div>
+          <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Check every</label>
+          <div className="flex items-center gap-2 mt-1">
+            <input
+              type="number"
+              min={1}
+              value={data.intervalMinutes ?? ''}
+              onChange={e => onChange({ intervalMinutes: e.target.value ? Math.max(1, parseInt(e.target.value, 10)) : undefined })}
+              placeholder="5"
+              className="w-24 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+            />
+            <span className="text-[11px] text-aegis-text-muted">minutes</span>
+          </div>
+        </div>
+        <p className="text-[10px] text-aegis-text-muted leading-relaxed border-t border-aegis-border pt-2">
+          Fires on its own in the background — no chat message or upload needed, and never runs from the toolbar's Run button (it just skips, since there's nothing to fire it with). Checked at most once a minute either way, so an interval under 1 isn't meaningfully faster.
+        </p>
+        <p className="text-[10px] text-aegis-text-muted leading-relaxed">
+          Wire an "mcp"/"tool" node after it (e.g. gmail_list_messages) to actually fetch something fresh each time it fires. To only act when something's genuinely new — not re-process the same latest item every firing — add a Logic node set to "Changed since last run" between that tool call and whatever comes next.
+        </p>
+      </div>
+    );
+  }
+
+  if (data.kind === 'send_to_chat') {
+    return (
+      <div className="flex flex-col gap-3">
+        {header}
+        {labelField}
+        <p className="text-[10px] text-aegis-text-muted leading-relaxed">
+          Delivers whatever's wired into it (usually an "llm" summary) as a real chat message. Notifies you immediately wherever you are in the app, and the message is there for good whenever you open that conversation.
+        </p>
+        {conversationField('Dedicated thread for this workflow (default)')}
+        <p className="text-[10px] text-aegis-text-muted leading-relaxed">
+          Leave blank and it lands in one dedicated conversation kept just for this workflow's automated updates, titled from the workflow's own name. Pick an existing conversation here instead — your main chat, say — to have it show up right there.
+        </p>
+        <p className="text-[10px] text-aegis-text-muted leading-relaxed border-t border-aegis-border pt-2">
+          Different from Send Reply: Send Reply only works inside a live chat turn, replying into the SAME conversation you just typed into. This node works from a schedule-triggered chain, which has no such conversation to reply into.
         </p>
       </div>
     );
@@ -2013,6 +2305,14 @@ function NodeConfigPanel({
             <option value="">{models.length === 0 ? 'No models downloaded yet' : 'Select a model…'}</option>
             {models.map(m => <option key={m.name} value={m.name}>{m.display_name || m.name}</option>)}
           </select>
+          {(() => {
+            const selected = models.find(m => m.name === data.modelName);
+            return selected?.is_vision && selected.mmproj_status === 'downloaded' && (
+              <p className="text-[10px] text-aegis-text-muted mt-1">
+                Vision-capable — if an upstream "On document upload" trigger has "Also trigger on image uploads" on and an image reaches this node, it reads the actual image, not just this text prompt.
+              </p>
+            );
+          })()}
         </div>
         <div>
           <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Prompt</label>
@@ -2112,6 +2412,7 @@ function NodeConfigPanel({
       <div className="flex flex-col gap-3">
         {header}
         {labelField}
+        {fieldDatalist}
         <p className="text-[10px] text-aegis-text-muted leading-relaxed">
           Passes the upstream value through unchanged when the condition holds; otherwise everything wired after this node is skipped for this run.
         </p>
@@ -2121,8 +2422,19 @@ function NodeConfigPanel({
             value={data.field || ''}
             onChange={e => onChange({ field: e.target.value })}
             placeholder="e.g. needs_search — blank uses the upstream value directly"
+            list="upstream-field-suggestions"
             className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
           />
+          {upstreamFieldSuggestions.length > 0 && (
+            <p className="text-[10px] text-aegis-text-muted mt-1">
+              Known fields from what's wired in: {upstreamFieldSuggestions.map((f, i) => (
+                <span key={f}>
+                  <button type="button" onClick={() => onChange({ field: f })} className="text-aegis-primary-light hover:underline font-mono">{f}</button>
+                  {i < upstreamFieldSuggestions.length - 1 ? ', ' : ''}
+                </span>
+              ))}
+            </p>
+          )}
         </div>
         <div>
           <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Condition</label>
@@ -2137,9 +2449,15 @@ function NodeConfigPanel({
             <option value="not_equals">does not equal</option>
             <option value="contains">contains</option>
             <option value="matches_regex">matches regex</option>
+            <option value="changed_since_last_run">changed since last run</option>
           </select>
         </div>
-        {!['is_true', 'is_false'].includes(data.operator || 'is_true') && (
+        {data.operator === 'changed_since_last_run' && (
+          <p className="text-[10px] text-aegis-text-muted leading-relaxed">
+            Compares against what THIS node saw last time it ran (remembered across runs, not just this one) — holds only when it's different. Built for a schedule-triggered chain: wire gmail_list_messages (or anything else you're polling) in, leave Field blank to compare its whole output, and everything after this node only runs when something's actually changed.
+          </p>
+        )}
+        {!['is_true', 'is_false', 'changed_since_last_run'].includes(data.operator || 'is_true') && (
           <div>
             <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Value</label>
             <input
@@ -2170,6 +2488,7 @@ function NodeConfigPanel({
       <div className="flex flex-col gap-3">
         {header}
         {labelField}
+        {fieldDatalist}
         <div>
           <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Items field</label>
           <input
@@ -2177,8 +2496,19 @@ function NodeConfigPanel({
             onChange={e => onChange({ itemsField: e.target.value })}
             placeholder="e.g. pending_attachments — blank loops the whole input"
             title="Wire a chain of steps directly after this loop — the whole chain runs once per item."
+            list="upstream-field-suggestions"
             className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
           />
+          {upstreamFieldSuggestions.length > 0 && (
+            <p className="text-[10px] text-aegis-text-muted mt-1">
+              Known fields from what's wired in: {upstreamFieldSuggestions.map((f, i) => (
+                <span key={f}>
+                  <button type="button" onClick={() => onChange({ itemsField: f })} className="text-aegis-primary-light hover:underline font-mono">{f}</button>
+                  {i < upstreamFieldSuggestions.length - 1 ? ', ' : ''}
+                </span>
+              ))}
+            </p>
+          )}
         </div>
         <p className="text-[10px] text-aegis-text-muted leading-relaxed">
           Runs the whole chain of steps wired directly after this node once per item (e.g. Extract → Chunk → Embedding → Vector, once per attachment) — a step that's also fed from somewhere else ends the chain and runs once, after every item finishes.
@@ -2744,13 +3074,19 @@ function NodeConfigPanel({
             <div className="flex flex-col gap-2 mt-1">
               {Object.entries(properties).map(([key, meta]: [string, any]) => (
                 <div key={key}>
-                  <label className="text-[10px] text-aegis-text-muted">{key}</label>
+                  <label className="text-[10px] text-aegis-text-muted">
+                    {key}{selectedTool?.inputSchema?.required?.includes(key) && ' *'}
+                  </label>
                   <input
                     value={data.staticInputs?.[key] || ''}
                     onChange={e => onChange({ staticInputs: { ...(data.staticInputs || {}), [key]: e.target.value } })}
+                    placeholder={meta.description ? `Blank = ${meta.description}` : 'Blank = the tool\'s own default'}
                     title={meta.description}
-                    className="w-full bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+                    className="w-full bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary placeholder:text-aegis-text-muted/70"
                   />
+                  {meta.description && (
+                    <p className="text-[10px] text-aegis-text-muted mt-0.5 leading-snug">{meta.description}</p>
+                  )}
                 </div>
               ))}
             </div>

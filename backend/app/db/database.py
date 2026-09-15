@@ -99,6 +99,12 @@ def init_db():
         if "seed_key" not in existing_workflow_cols:
             conn.execute(text("ALTER TABLE workflows ADD COLUMN seed_key VARCHAR"))
             conn.commit()
+        if "chat_handler_conversation_id" not in existing_workflow_cols:
+            conn.execute(text("ALTER TABLE workflows ADD COLUMN chat_handler_conversation_id VARCHAR"))
+            conn.commit()
+        if "ingestion_handler_conversation_id" not in existing_workflow_cols:
+            conn.execute(text("ALTER TABLE workflows ADD COLUMN ingestion_handler_conversation_id VARCHAR"))
+            conn.commit()
 
         existing_installed_db_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(installed_databases)"))}
         if "is_builtin" not in existing_installed_db_cols:

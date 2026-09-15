@@ -54,6 +54,15 @@ export default function SplashScreen({ onReady, onGoToLLMPanel, onBackendReachab
   // etc.) below.
   const INTRO_HOLD_MS = 2600;
   const INTRO_EXIT_MS = 500;
+  // Real content used to start its own fade-in at INTRO_HOLD_MS — the exact
+  // instant the overlay BEGINS fading, not once it's actually gone. Since
+  // the overlay's mark and this content are both centered on the same
+  // spot on screen, that meant a ~500ms window where the mark (fading out)
+  // and the progress bar/checklist (fading in) visibly overlapped each
+  // other. Waiting for the overlay to fully finish before anything real
+  // starts appearing removes that window entirely — a clean handoff
+  // instead of a collision.
+  const CONTENT_REVEAL_MS = INTRO_HOLD_MS + INTRO_EXIT_MS;
   const [introPhase, setIntroPhase] = useState<'building' | 'exiting' | 'done'>('building');
   useEffect(() => {
     const t1 = setTimeout(() => setIntroPhase('exiting'), INTRO_HOLD_MS);
@@ -184,15 +193,20 @@ export default function SplashScreen({ onReady, onGoToLLMPanel, onBackendReachab
             this phase is pure initialization status (DBs, models), so it
             deliberately doesn't repeat the mark or wordmark here. */}
 
-        {/* Progress bar — delayed to start exactly when the intro overlay
-            begins fading (see INTRO_HOLD_MS below), not at mount. It used
-            to fire immediately: at 0.25s per fade-in-up, it (and the rest
-            of this real content) had always finished and gone fully
-            static well before the 2.6s overlay hold ended, so the overlay
-            fading away just revealed an already-settled screen instead of
-            a second thing animating in — reads as one continuous handoff
-            now instead of a flat "curtain drop". */}
-        <div className="w-full space-y-2 animate-fade-in-up" style={{ animationDelay: `${INTRO_HOLD_MS}ms`, animationFillMode: 'backwards' }}>
+        {/* Progress bar — delayed until the intro overlay has fully
+            finished fading (CONTENT_REVEAL_MS above), not until it merely
+            *starts* fading and not at mount either. Starting it at mount
+            meant this (and the rest of the real content) had always
+            finished animating and gone fully static well before the 2.6s
+            overlay hold even ended, so the overlay fading away just
+            revealed an already-settled screen. Starting it when the fade
+            merely *began* was hardly better: the overlay's mark and this
+            content are both centered on the same spot on screen, so for
+            the ~500ms fade duration the outgoing mark and the incoming
+            progress bar/checklist were visibly overlapping each other.
+            Waiting for the overlay to be fully gone avoids both — one
+            clean handoff, nothing on screen twice at once. */}
+        <div className="w-full space-y-2 animate-fade-in-up" style={{ animationDelay: `${CONTENT_REVEAL_MS}ms`, animationFillMode: 'backwards' }}>
           <div className="h-1 w-full bg-aegis-overlay rounded-full overflow-hidden">
             <div
               className="h-full rounded-full bg-gradient-to-r from-aegis-primary to-aegis-accent transition-all duration-700 ease-out"
@@ -205,14 +219,15 @@ export default function SplashScreen({ onReady, onGoToLLMPanel, onBackendReachab
           </div>
         </div>
 
-        {/* Status checklist — same re-sync: staggered off INTRO_HOLD_MS
-            instead of 0, so the stagger plays out as the logo fades away. */}
+        {/* Status checklist — same re-sync: staggered off CONTENT_REVEAL_MS
+            instead of 0, so the stagger plays out only once the logo is
+            fully gone, not overlapping it mid-fade. */}
         <div className="w-full space-y-3">
           {checks.map(({ key, label, done }, i) => (
             <div
               key={key}
               className="flex items-center gap-3 animate-fade-in-up"
-              style={{ animationDelay: `${INTRO_HOLD_MS + i * 80}ms`, animationFillMode: 'backwards' }}
+              style={{ animationDelay: `${CONTENT_REVEAL_MS + i * 80}ms`, animationFillMode: 'backwards' }}
             >
               <div className="flex-shrink-0 w-4 h-4 relative">
                 {done ? (
@@ -233,7 +248,10 @@ export default function SplashScreen({ onReady, onGoToLLMPanel, onBackendReachab
             bold headline, a clean bordered card instead of a warning-tinted
             box, one solid primary CTA, lighter secondary text actions. */}
         {noModel && (
-          <div className="w-full animate-fade-in-up">
+          <div
+            className="w-full animate-fade-in-up"
+            style={{ animationDelay: `${CONTENT_REVEAL_MS + checks.length * 80}ms`, animationFillMode: 'backwards' }}
+          >
             <div className="flex items-center gap-2 mb-3">
               <span className="w-2 h-2 rounded-sm bg-aegis-primary flex-shrink-0" />
               <span className="text-[11px] font-bold tracking-widest text-aegis-text-muted uppercase">Model Setup</span>
@@ -304,7 +322,10 @@ export default function SplashScreen({ onReady, onGoToLLMPanel, onBackendReachab
 
         {/* Downloaded model badge */}
         {coreReady && (status?.downloaded_models?.length ?? 0) > 0 && (
-          <div className="flex items-center gap-2 px-3 py-1.5 bg-aegis-success/5 border border-aegis-success/20 rounded-full animate-fade-in-up">
+          <div
+            className="flex items-center gap-2 px-3 py-1.5 bg-aegis-success/5 border border-aegis-success/20 rounded-full animate-fade-in-up"
+            style={{ animationDelay: `${CONTENT_REVEAL_MS + checks.length * 80}ms`, animationFillMode: 'backwards' }}
+          >
             <CheckCircle2 className="w-3.5 h-3.5 text-aegis-success" />
             <span className="text-xs text-aegis-success">
               {status!.downloaded_models[0]} ready

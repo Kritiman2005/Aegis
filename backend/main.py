@@ -152,12 +152,6 @@ async def get_feature_flags():
     return {"connectors_enabled": CONNECTORS_ENABLED}
 
 
-@app.get("/api/feature-flags")
-async def get_feature_flags():
-    """Single source of truth the frontend reads instead of hardcoding its own copy of these flags."""
-    return {"connectors_enabled": CONNECTORS_ENABLED}
-
-
 @app.on_event("startup")
 async def on_startup():
     """Initialize SQLite, Vector DB, and auto-restore OAuth sessions."""

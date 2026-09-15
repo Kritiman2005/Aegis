@@ -123,17 +123,49 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _get_active_ingestion_workflow_id() -> Optional[int]:
-    """The one workflow (if any) connected as the live ingestion handler
-    (Workflow.is_ingestion_handler — see app.api.workflows's
-    /set-ingestion-handler). A fresh SessionLocal since this runs inside
-    process_upload_task's own worker thread, not the request's session."""
+def _get_active_ingestion_workflow_id(conversation_id: Optional[str]) -> Optional[int]:
+    """The workflow (if any) that should handle an upload made in
+    `conversation_id` — scoped handler first, then the one GLOBAL handler,
+    if any (Workflow.is_ingestion_handler — see app.api.workflows's
+    /set-ingestion-handler and app.db.crud.get_active_ingestion_workflow).
+    A fresh SessionLocal since this runs inside process_upload_task's own
+    worker thread, not the request's session."""
     from app.db.database import SessionLocal
-    from app.db.models import Workflow
+    from app.db.crud import get_active_ingestion_workflow
     db = SessionLocal()
     try:
-        row = db.query(Workflow).filter(Workflow.is_ingestion_handler == True).first()  # noqa: E712
+        row = get_active_ingestion_workflow(db, conversation_id=conversation_id)
         return row.id if row else None
+    finally:
+        db.close()
+
+
+def _ingestion_workflow_wants_images(conversation_id: Optional[str]) -> bool:
+    """
+    True only if the workflow that would handle an upload in this
+    conversation (see _get_active_ingestion_workflow_id) has its
+    "document_upload_trigger" node's data.includeImages explicitly set —
+    an opt-in, since a connected workflow's own "llm" node decides for
+    itself whether to actually look at the image (via
+    engine.py's _attach_workflow_vision_image), independent of whatever
+    model happens to be active for chat. False (the default) preserves
+    the existing behavior below exactly: an image upload is handled by
+    the vision-at-chat-send-time path, never the workflow system.
+    """
+    import json as _json
+    from app.db.database import SessionLocal
+    from app.db.crud import get_active_ingestion_workflow
+    db = SessionLocal()
+    try:
+        row = get_active_ingestion_workflow(db, conversation_id=conversation_id)
+        if not row:
+            return False
+        graph = _json.loads(row.graph_json)
+        for node in graph.get("nodes", []):
+            data = node.get("data", {})
+            if data.get("kind") == "document_upload_trigger" and data.get("includeImages"):
+                return True
+        return False
     finally:
         db.close()
 
@@ -174,7 +206,7 @@ def process_upload_task(doc_id: int, file_path: str, file_type: str, filename: s
 
         def _run():
             try:
-                active_workflow_id = _get_active_ingestion_workflow_id()
+                active_workflow_id = _get_active_ingestion_workflow_id(doc.conversation_id)
                 if active_workflow_id is not None:
                     # A workflow is connected as the ingestion handler (see
                     # app.api.workflows's /set-ingestion-handler) — run it
@@ -361,18 +393,36 @@ async def upload_document(
     # app.api.websocket's message handler and app.core.agents.chat's
     # _handle_idle(attachments=...).
 
-    # Images never go through RAG ingestion at all now — vision is the only
-    # way their content is ever read. A vision-capable active model gets the
-    # image as real vision input at send-time (BaseAgent._attach_vision_images);
-    # with no vision model active, OCR is no longer used as a fallback (it
-    # silently produced garbled/unreliable text for a feature — "read this
-    # image" — users expect to just work), so the upload fails immediately
-    # with an explicit reason instead of quietly indexing OCR noise.
+    # Images never go through RAG ingestion at all by default — vision is
+    # the only way their content is ever read. A vision-capable active
+    # model gets the image as real vision input at send-time
+    # (BaseAgent._attach_vision_images); with no vision model active, OCR
+    # is no longer used as a fallback (it silently produced garbled/
+    # unreliable text for a feature — "read this image" — users expect to
+    # just work), so the upload fails immediately with an explicit reason
+    # instead of quietly indexing OCR noise. The one way around this
+    # default: a connected ingestion workflow can opt in to receiving
+    # images too (document_upload_trigger's "Also trigger on image
+    # uploads") — its own "llm" node decides for itself whether to look at
+    # the image (engine.py's _attach_workflow_vision_image checks THAT
+    # node's own picked model, not whatever's active for chat), so this
+    # bypasses the vision-gate below entirely rather than depending on it.
     from app.db.crud import get_active_vision_mmproj_path
     is_image = ext in ("png", "jpg", "jpeg")
     has_vision = get_active_vision_mmproj_path(db) is not None
+    workflow_wants_images = is_image and _ingestion_workflow_wants_images(conversation_id)
 
-    if is_image and has_vision:
+    if workflow_wants_images:
+        logger.info(f"Received image upload: {file.filename} -> routing to connected ingestion workflow (opted into images).")
+        background_tasks.add_task(
+            async_process_upload_task,
+            doc_id=doc.id,
+            file_path=doc.file_path,
+            file_type=doc.file_type,
+            filename=doc.filename,
+            conversation_id=conversation_id
+        )
+    elif is_image and has_vision:
         doc.status = "ready"
         # Flags this row as having NO searchable content at all — see
         # ChatAgent._get_document_context (chat.py), which checks this at

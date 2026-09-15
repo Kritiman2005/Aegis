@@ -217,32 +217,69 @@ OAUTH_CONFIGS: Dict[str, dict] = {
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def get_client_credentials(service_name: str) -> Tuple[str, str]:
-    """Reads CLIENT_ID and CLIENT_SECRET from the bundled credentials module.
+    """Reads the user's own OAuth app credentials for this service.
 
-    In dev, credentials.py falls back to os.environ (loaded from .env).
-    In prod, credentials.py is compiled into the binary with hardcoded values
-    injected from GitHub Secrets at CI build time.
+    Aegis has no hosted OAuth broker and runs no shared app on anyone's
+    behalf — each user registers their own OAuth client with the provider
+    and pastes the two values into the Connectors panel, which calls
+    save_client_credentials() below. Read from app.db.models.OAuthAppCredential.
     """
-    from app.config import credentials as creds
-
     config = OAUTH_CONFIGS.get(service_name)
     if not config:
         raise ValueError(f"Unknown OAuth service: '{service_name}'")
 
-    # Attribute names in credentials.py match the env-var names exactly
-    # e.g. "SLACK_CLIENT_ID" → creds.SLACK_CLIENT_ID
-    id_attr     = config["client_id_env"]      # e.g. "SLACK_CLIENT_ID"
-    secret_attr = config["client_secret_env"]  # e.g. "SLACK_CLIENT_SECRET"
-
-    client_id     = getattr(creds, id_attr, "").strip()
-    client_secret = getattr(creds, secret_attr, "").strip()
-
-    if not client_id or not client_secret:
-        raise ValueError(
-            f"OAuth credentials for {config['display_name']} are not configured in this build. "
-            f"Please contact Aegis support or add your credentials to the .env file in dev mode."
+    from app.db.database import SessionLocal
+    from app.db.models import OAuthAppCredential
+    with SessionLocal() as db:
+        row = (
+            db.query(OAuthAppCredential)
+            .filter(OAuthAppCredential.service_name == service_name)
+            .first()
         )
-    return client_id, client_secret
+
+    if not row or not row.client_id or not row.client_secret:
+        raise ValueError(
+            f"No OAuth app configured for {config['display_name']} yet. "
+            f"Open Connectors, click Configure on {config['display_name']}, "
+            f"and paste in your own OAuth client ID and secret."
+        )
+    return row.client_id, row.client_secret
+
+
+def save_client_credentials(service_name: str, client_id: str, client_secret: str) -> None:
+    """Upserts the user's own OAuth app credentials for a service."""
+    if service_name not in OAUTH_CONFIGS:
+        raise ValueError(f"Unknown OAuth service: '{service_name}'")
+
+    from app.db.database import SessionLocal
+    from app.db.models import OAuthAppCredential
+    with SessionLocal() as db:
+        row = (
+            db.query(OAuthAppCredential)
+            .filter(OAuthAppCredential.service_name == service_name)
+            .first()
+        )
+        if row:
+            row.client_id = client_id
+            row.client_secret = client_secret
+        else:
+            db.add(OAuthAppCredential(
+                service_name=service_name, client_id=client_id, client_secret=client_secret
+            ))
+        db.commit()
+
+
+def has_client_credentials(service_name: str) -> bool:
+    """True if the user has already configured their own OAuth app for this service."""
+    from app.db.database import SessionLocal
+    from app.db.models import OAuthAppCredential
+    with SessionLocal() as db:
+        row = (
+            db.query(OAuthAppCredential)
+            .filter(OAuthAppCredential.service_name == service_name)
+            .first()
+        )
+        return bool(row and row.client_id and row.client_secret)
 
 
 def generate_pkce_pair() -> Tuple[str, str]:

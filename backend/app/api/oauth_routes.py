@@ -22,6 +22,8 @@ import anyio
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
+from pydantic import BaseModel
+
 from app.auth.oauth_service import (
     OAUTH_CONFIGS,
     build_auth_url,
@@ -29,6 +31,8 @@ from app.auth.oauth_service import (
     extract_env_vars,
     generate_pkce_pair,
     get_client_credentials,
+    has_client_credentials,
+    save_client_credentials,
     jira_fetch_cloud_id,
     github_fetch_username,
 )
@@ -138,6 +142,12 @@ def _error_html(display_name: str, message: str) -> str:
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
+class ConfigureOAuthAppRequest(BaseModel):
+    client_id: str
+    client_secret: str
+    model_config = {"defer_build": True}
+
+
 @router.get("/services")
 def list_oauth_services():
     """Returns all services that support 1-click OAuth (for the frontend Connect buttons)."""
@@ -147,16 +157,44 @@ def list_oauth_services():
                 "service": name,
                 "display_name": cfg["display_name"],
                 "login_url":    f"/auth/{name}/login",
-                "configured":   bool(
-                    __import__("os").environ.get(cfg["client_id_env"])
-                    and __import__("os").environ.get(cfg["client_secret_env"])
-                ),
+                "configured":   has_client_credentials(name),
                 "setup_url":  cfg.get("setup_url", ""),
                 "setup_hint": cfg.get("setup_hint", ""),
             }
             for name, cfg in OAUTH_CONFIGS.items()
         ]
     }
+
+
+@router.post("/{service_name}/configure")
+def configure_oauth_app(service_name: str, req: ConfigureOAuthAppRequest):
+    """Saves the user's own OAuth app credentials for a service — called by
+    the Connectors panel before the first Connect click. Never echoes the
+    secret back; the frontend only ever learns whether a service is
+    "configured" (see GET /services and /{service_name}/configured)."""
+    if service_name not in OAUTH_CONFIGS:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Unknown service: '{service_name}'. Available: {list(OAUTH_CONFIGS.keys())}"}
+        )
+    client_id = req.client_id.strip()
+    client_secret = req.client_secret.strip()
+    if not client_id or not client_secret:
+        return JSONResponse(status_code=400, content={"error": "Both client_id and client_secret are required."})
+
+    save_client_credentials(service_name, client_id, client_secret)
+    return {"configured": True}
+
+
+@router.get("/{service_name}/configured")
+def oauth_app_configured(service_name: str):
+    """Whether the user has already saved an OAuth app for this service."""
+    if service_name not in OAUTH_CONFIGS:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Unknown service: '{service_name}'. Available: {list(OAUTH_CONFIGS.keys())}"}
+        )
+    return {"configured": has_client_credentials(service_name)}
 
 
 @router.get("/{service_name}/login")

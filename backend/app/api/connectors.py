@@ -7,14 +7,17 @@ app.core.feature_flags.CONNECTORS_ENABLED, not about hiding it entirely:
 
 - `router`: the pre-configured catalog. Listing (`GET .../catalog`) and
   connecting (`POST .../catalog/connect`) filter out every auth_type=="oauth"
-  entry while CONNECTORS_ENABLED is off — those genuinely need a hosted
-  OAuth broker Aegis doesn't have yet (see that flag's docstring). Every
-  other auth_type (api_key/path/connection_string/none — about 14 of the
-  ~24 catalog entries) needs nothing from Aegis beyond what
-  custom_mcp_router already does for a pasted config, so there's no reason
-  to hide those behind the same flag. `auth_router`/`oauth_router` (the
-  actual `/auth/{service}/login` OAuth dance) stay separately gated in
-  main.py — that part really does need the broker.
+  entry while CONNECTORS_ENABLED is off — those need the user's own OAuth
+  app credentials (see that flag's docstring), configured via
+  `/auth/{service}/configure` before a Connect click can work, never a
+  hosted broker Aegis runs on their behalf. `POST .../catalog/connect`
+  itself always rejects auth_type=="oauth" regardless of the flag — that
+  path only spawns a stdio command, which doesn't apply to OAuth entries.
+  Every other auth_type (api_key/path/connection_string/none) needs nothing
+  from Aegis beyond what custom_mcp_router already does for a pasted
+  config, so there's no reason to hide those behind the same flag.
+  `auth_router`/`oauth_router` (the actual `/auth/{service}/login` OAuth
+  dance) stay separately gated in main.py.
 - `custom_mcp_router`: everything that isn't a curated catalog entry — a raw
   stdio command/args/env the user provides directly (see http_client.py's
   sibling module, stdio_client.py), a hosted server connected by URL over

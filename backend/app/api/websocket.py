@@ -203,7 +203,7 @@ async def websocket_endpoint(
                             from app.db.crud import get_active_chat_workflow
                             db = SessionLocal()
                             try:
-                                wf = get_active_chat_workflow(db)
+                                wf = get_active_chat_workflow(db, conversation_id=connection_id)
                                 return wf.id if wf else None
                             finally:
                                 db.close()

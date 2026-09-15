@@ -32,7 +32,12 @@ class SchedulerDaemon:
                 await self.check_and_run_jobs()
             except Exception as e:
                 logger.error(f"Error in scheduler loop: {e}")
-            
+
+            try:
+                await self.check_and_run_workflow_triggers()
+            except Exception as e:
+                logger.error(f"Error checking workflow schedule triggers: {e}")
+
             await asyncio.sleep(60)  # Check every minute
 
     def _calculate_next_run(self, cron_expr: str, from_time: datetime) -> datetime:
@@ -128,5 +133,78 @@ class SchedulerDaemon:
             )
             
         await manager.broadcast_json({"type": "toast", "content": f"Scheduled plan (Job {job.id}) completed successfully."})
+
+    async def check_and_run_workflow_triggers(self):
+        """
+        The workflow-canvas equivalent of check_and_run_jobs, on the same
+        60s cadence — scans every saved Workflow's graph for
+        "schedule_trigger" nodes (data.intervalMinutes, user-set on the
+        node itself) and runs app.core.workflows.engine.run_schedule_workflow
+        for whichever ones are due. Due-ness is tracked per (workflow, node)
+        in WorkflowNodeState under key "next_run_at" — a trigger newly added
+        to a graph gets its first next_run_at set one interval from now
+        (not run immediately the moment it's saved) the first time this
+        loop ever sees it.
+        """
+        from app.db.database import SessionLocal
+        from app.db.models import Workflow, WorkflowNodeState
+        from app.core.workflows.engine import run_schedule_workflow
+
+        now = datetime.utcnow()
+        due: list[tuple[int, str]] = []
+
+        db = SessionLocal()
+        try:
+            for wf in db.query(Workflow).all():
+                try:
+                    graph = json.loads(wf.graph_json)
+                except (TypeError, ValueError):
+                    continue
+
+                for node in graph.get("nodes", []):
+                    data = node.get("data", {})
+                    if data.get("kind") != "schedule_trigger":
+                        continue
+
+                    node_id = node["id"]
+                    interval_minutes = data.get("intervalMinutes")
+                    if not interval_minutes or interval_minutes <= 0:
+                        continue  # not configured yet — nothing to schedule
+
+                    state = db.query(WorkflowNodeState).filter(
+                        WorkflowNodeState.workflow_id == wf.id,
+                        WorkflowNodeState.node_id == node_id,
+                        WorkflowNodeState.key == "next_run_at",
+                    ).first()
+
+                    if not state or not state.value:
+                        next_run_at = now + timedelta(minutes=interval_minutes)
+                        if state:
+                            state.value = next_run_at.isoformat()
+                        else:
+                            db.add(WorkflowNodeState(
+                                workflow_id=wf.id, node_id=node_id,
+                                key="next_run_at", value=next_run_at.isoformat(),
+                            ))
+                        db.commit()
+                        continue
+
+                    if datetime.fromisoformat(state.value) <= now:
+                        due.append((wf.id, node_id))
+                        state.value = (now + timedelta(minutes=interval_minutes)).isoformat()
+                        db.commit()
+        finally:
+            db.close()
+
+        for workflow_id, node_id in due:
+            try:
+                logger.info(f"Running schedule trigger '{node_id}' on workflow {workflow_id}")
+                await run_schedule_workflow(workflow_id, node_id)
+            except Exception as e:
+                logger.error(f"Schedule trigger '{node_id}' on workflow {workflow_id} failed: {e}")
+                await manager.broadcast_json({
+                    "type": "toast",
+                    "content": f"Scheduled workflow step failed: {e}",
+                })
 
 scheduler_daemon = SchedulerDaemon()

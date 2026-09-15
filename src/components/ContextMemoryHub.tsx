@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Cpu, Zap, BrainCircuit, ShieldAlert, AlertTriangle, Play, RefreshCw, HardDrive, Database, CircleSlash, Check, LogOut } from 'lucide-react';
+import { Cpu, Zap, BrainCircuit, ShieldAlert, AlertTriangle, Play, RefreshCw, HardDrive, Database, CircleSlash, Check, LogOut, Trash2 } from 'lucide-react';
 import toast from 'react-hot-toast';
 
 interface HardwareStatus {
@@ -37,6 +37,12 @@ export default function ContextMemoryHub() {
   const [downloadedModels, setDownloadedModels] = useState<any[]>([]);
   const [unloading, setUnloading] = useState(false);
   const [loadingModelId, setLoadingModelId] = useState<number | null>(null);
+  const [deletingModelId, setDeletingModelId] = useState<number | null>(null);
+  // Deleting a model is consequential (re-downloading can mean gigabytes
+  // again) but a native confirm() blocks the whole renderer until
+  // dismissed — same reasoning as the workflow-list delete button — so
+  // this is a plain "click again to confirm" arm instead of a dialog.
+  const [armedDeleteId, setArmedDeleteId] = useState<number | null>(null);
 
   useEffect(() => {
     fetchHardware();
@@ -124,6 +130,29 @@ export default function ContextMemoryHub() {
     }
   };
 
+  const handleDeleteModel = async (modelId: number, displayName: string) => {
+    if (armedDeleteId !== modelId) {
+      setArmedDeleteId(modelId);
+      return;
+    }
+    setArmedDeleteId(null);
+    setDeletingModelId(modelId);
+    try {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hub/${modelId}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        toast.success(`Deleted '${displayName}'.`);
+        fetchDownloadedModels();
+      } else {
+        toast.error(data.detail || 'Failed to delete model.');
+      }
+    } catch (e) {
+      toast.error('Network error.');
+    } finally {
+      setDeletingModelId(null);
+    }
+  };
+
   // === Dynamic RAM & Latency Estimation ===
   const modelMaxContext = hardware?.max_context || 4096;
 
@@ -167,7 +196,7 @@ export default function ContextMemoryHub() {
             <Database className="w-4 h-4" />
           </div>
           <div className="min-w-0">
-            <h1 className="text-xl font-bold text-aegis-text-primary leading-tight">Context & Memory Hub</h1>
+            <h1 className="text-xl font-bold text-aegis-text-primary leading-tight">Memory Hub</h1>
             <p className="text-xs text-aegis-text-secondary truncate">How the local AI remembers context, and its real-time system impact.</p>
           </div>
         </div>
@@ -256,14 +285,19 @@ export default function ContextMemoryHub() {
                 const cleanName = (m.display_name || m.repo_id || m.name || 'Unknown model')
                   .replace(/\s*\([^)]*\)\s*$/, '').trim();
                 const isLoadingThis = loadingModelId === m.id;
+                const isDeletingThis = deletingModelId === m.id;
+                const isArmed = armedDeleteId === m.id;
                 return (
-                  <button
+                  <div
                     key={m.id}
+                    role="button"
+                    tabIndex={0}
                     onClick={() => !m.is_active && handleLoadModel(m.id)}
-                    disabled={m.is_active || loadingModelId !== null}
-                    className={`w-full flex items-center justify-between gap-3 px-4 py-2.5 text-left transition-colors border-b border-aegis-border last:border-b-0 ${
-                      m.is_active ? 'bg-aegis-primary/5' : 'hover:bg-aegis-overlay disabled:hover:bg-transparent'
-                    } ${loadingModelId !== null && !isLoadingThis ? 'opacity-50' : ''}`}
+                    onKeyDown={e => { if (e.key === 'Enter' && !m.is_active) handleLoadModel(m.id); }}
+                    aria-disabled={m.is_active || loadingModelId !== null}
+                    className={`w-full flex items-center justify-between gap-3 px-4 py-2.5 text-left transition-colors border-b border-aegis-border last:border-b-0 cursor-pointer ${
+                      m.is_active ? 'bg-aegis-primary/5' : 'hover:bg-aegis-overlay'
+                    } ${loadingModelId !== null && !isLoadingThis ? 'opacity-50 pointer-events-none' : ''}`}
                   >
                     <div className="min-w-0">
                       <p className="text-sm font-medium text-aegis-text-primary truncate">{cleanName}</p>
@@ -271,12 +305,28 @@ export default function ContextMemoryHub() {
                         <p className="text-[11px] text-aegis-text-muted mt-0.5">{m.context_length.toLocaleString()}-token context</p>
                       )}
                     </div>
-                    {isLoadingThis ? (
-                      <RefreshCw className="w-4 h-4 text-aegis-primary-light animate-spin flex-shrink-0" />
-                    ) : m.is_active ? (
-                      <Check className="w-4 h-4 text-aegis-primary flex-shrink-0" />
-                    ) : null}
-                  </button>
+                    <div className="flex-shrink-0 flex items-center gap-2">
+                      {isLoadingThis ? (
+                        <RefreshCw className="w-4 h-4 text-aegis-primary-light animate-spin flex-shrink-0" />
+                      ) : m.is_active ? (
+                        <Check className="w-4 h-4 text-aegis-primary flex-shrink-0" />
+                      ) : null}
+                      {/* Can't delete the model currently loaded in RAM —
+                          eject it first (same rule the backend enforces). */}
+                      {!m.is_active && (
+                        <button
+                          onClick={e => { e.stopPropagation(); handleDeleteModel(m.id, cleanName); }}
+                          disabled={isDeletingThis}
+                          title={isArmed ? 'Click again to delete' : `Delete ${cleanName}`}
+                          className={`p-1 rounded-md transition-colors disabled:opacity-50 ${
+                            isArmed ? 'bg-aegis-error/10 text-aegis-error' : 'text-aegis-text-muted hover:bg-aegis-error/10 hover:text-aegis-error'
+                          }`}
+                        >
+                          {isDeletingThis ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+                        </button>
+                      )}
+                    </div>
+                  </div>
                 );
               })
             )}

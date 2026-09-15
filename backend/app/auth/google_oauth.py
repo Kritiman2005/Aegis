@@ -30,24 +30,73 @@ DOCS_SCOPES = [
 
 REDIRECT_URI = "http://127.0.0.1:8000/auth/google/callback"
 
+# Every Google catalog entry (Mail, Drive, Docs, Sheets) shares one GCP OAuth
+# client — Google issues a single client_id/secret covering however many
+# scopes are requested, so there's no reason to make the user register four
+# separate apps for one project. Stored under this one shared key.
+_GOOGLE_CREDENTIAL_KEY = "google"
+
+
+def save_google_credentials(client_id: str, client_secret: str) -> None:
+    """Saves the user's own Google OAuth app credentials (shared across all
+    google_* catalog entries). Called by the Connectors panel's Configure
+    step, before the first Connect click on any Google service."""
+    from app.db.database import SessionLocal
+    from app.db.models import OAuthAppCredential
+    with SessionLocal() as db:
+        row = (
+            db.query(OAuthAppCredential)
+            .filter(OAuthAppCredential.service_name == _GOOGLE_CREDENTIAL_KEY)
+            .first()
+        )
+        if row:
+            row.client_id = client_id
+            row.client_secret = client_secret
+        else:
+            db.add(OAuthAppCredential(
+                service_name=_GOOGLE_CREDENTIAL_KEY, client_id=client_id, client_secret=client_secret
+            ))
+        db.commit()
+
+
+def has_google_credentials() -> bool:
+    from app.db.database import SessionLocal
+    from app.db.models import OAuthAppCredential
+    with SessionLocal() as db:
+        row = (
+            db.query(OAuthAppCredential)
+            .filter(OAuthAppCredential.service_name == _GOOGLE_CREDENTIAL_KEY)
+            .first()
+        )
+        return bool(row and row.client_id and row.client_secret)
+
 
 def get_google_flow(service_name: str) -> Flow:
-    """Initialize the Google OAuth Flow using bundled app credentials.
+    """Initialize the Google OAuth Flow using the user's own OAuth app.
 
-    In dev, credentials.py falls back to os.environ (loaded from .env).
-    In prod, credentials.py is compiled into the binary at CI build time.
+    Aegis has no hosted OAuth broker — there is no Aegis-owned Google app
+    shared across every install. The user creates their own OAuth client in
+    Google Cloud Console and pastes it into the Connectors panel, which
+    saves it via save_google_credentials() above.
     """
-    from app.config import credentials as creds
-    client_id     = creds.GOOGLE_CLIENT_ID
-    client_secret = creds.GOOGLE_CLIENT_SECRET
+    from app.db.database import SessionLocal
+    from app.db.models import OAuthAppCredential
+    with SessionLocal() as db:
+        row = (
+            db.query(OAuthAppCredential)
+            .filter(OAuthAppCredential.service_name == _GOOGLE_CREDENTIAL_KEY)
+            .first()
+        )
+    client_id     = row.client_id if row else None
+    client_secret = row.client_secret if row else None
 
     if not client_id or not client_secret:
         raise ValueError(
-            "Google OAuth credentials are not configured in this build. "
-            "Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in your .env file (dev) "
-            "or as GitHub Secrets (production build)."
+            "No Google OAuth app configured yet. Open Connectors, click "
+            "Configure on Google Mail or Google Drive, and paste in your "
+            "own OAuth client ID and secret from Google Cloud Console."
         )
-        
+
     client_config = {
         "installed": {
             "client_id": client_id,

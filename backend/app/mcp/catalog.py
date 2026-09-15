@@ -15,6 +15,15 @@ Each entry includes:
 
 from typing import Dict, List, Optional
 
+# Google's four catalog entries (mail/drive/docs/sheets) share one GCP OAuth
+# client under this key — see google_oauth.py's _GOOGLE_CREDENTIAL_KEY.
+_GOOGLE_OAUTH_SERVICE_KEY = "google"
+_GOOGLE_SETUP_URL = "https://console.cloud.google.com/apis/credentials"
+_GOOGLE_SETUP_HINT = (
+    "Google Cloud Console → Credentials → Create Credentials → OAuth client ID "
+    "→ Application type: Desktop app. Redirect URI: http://127.0.0.1:8000/auth/google/callback"
+)
+
 
 CONNECTORS_CATALOG: Dict[str, dict] = {
 
@@ -41,6 +50,34 @@ CONNECTORS_CATALOG: Dict[str, dict] = {
         "display_name": "Google Drive",
         "category": "Files & Documents",
         "description": "Search, list, and read documents from Google Drive.",
+        "icon": "google",
+        "auth_type": "oauth",
+        "command": None,          # Handled natively via Aegis Google OAuth flow
+        "env_schema": [],
+        "input_schema": [],
+        "target_audience": ["hr", "marketing", "sales", "operations", "all"],
+        "official": True,
+    },
+
+    "google_sheets": {
+        "name": "google_sheets",
+        "display_name": "Google Sheets",
+        "category": "Files & Documents",
+        "description": "Read and update values in a Google Sheets spreadsheet by range.",
+        "icon": "google",
+        "auth_type": "oauth",
+        "command": None,          # Handled natively via Aegis Google OAuth flow
+        "env_schema": [],
+        "input_schema": [],
+        "target_audience": ["hr", "marketing", "sales", "operations", "all"],
+        "official": True,
+    },
+
+    "google_docs": {
+        "name": "google_docs",
+        "display_name": "Google Docs",
+        "category": "Files & Documents",
+        "description": "Read the text content of a Google Doc.",
         "icon": "google",
         "auth_type": "oauth",
         "command": None,          # Handled natively via Aegis Google OAuth flow
@@ -538,6 +575,51 @@ CONNECTORS_CATALOG: Dict[str, dict] = {
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _apply_oauth_app_fields() -> None:
+    """
+    Aegis has no hosted OAuth broker and runs no shared app on anyone's
+    behalf — every auth_type=="oauth" entry needs the USER'S OWN OAuth app
+    credentials. This populates env_schema with the same
+    OAUTH_CLIENT_ID/OAUTH_CLIENT_SECRET field shape used by api_key
+    connectors, so the existing CatalogCard UI renders the input form here
+    too — the submit action calls /api/connectors/oauth/{name}/configure
+    (or /auth/google/configure for Google) instead of spawning a process.
+    """
+    from app.auth.oauth_service import OAUTH_CONFIGS
+
+    for entry in CONNECTORS_CATALOG.values():
+        if entry.get("auth_type") != "oauth":
+            continue
+
+        service_key = entry.get("oauth_service")
+        if service_key and service_key in OAUTH_CONFIGS:
+            cfg = OAUTH_CONFIGS[service_key]
+            help_url = cfg.get("setup_url", "")
+            entry["setup_hint"] = cfg.get("setup_hint", "")
+        else:
+            help_url = _GOOGLE_SETUP_URL
+            entry["setup_hint"] = _GOOGLE_SETUP_HINT
+
+        entry["env_schema"] = [
+            {
+                "key": "OAUTH_CLIENT_ID",
+                "label": "OAuth Client ID",
+                "required": True,
+                "help_url": help_url,
+            },
+            {
+                "key": "OAUTH_CLIENT_SECRET",
+                "label": "OAuth Client Secret",
+                "required": True,
+                "secret": True,
+                "help_url": help_url,
+            },
+        ]
+
+
+_apply_oauth_app_fields()
+
 
 def get_catalog_list() -> List[dict]:
     """Returns all connectors for frontend display."""

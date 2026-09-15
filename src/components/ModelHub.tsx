@@ -167,7 +167,7 @@ function guessCategory(model: ModelResult): ModelCategory {
 // model's repo id or author identifies who actually trained it — orthogonal
 // to CATEGORIES above, which groups by "what it's good for" rather than
 // "who made it". Simplified stylized marks (same fidelity as the connector
-// icons in ConnectorsView.tsx), not exact trademark reproductions. Falls
+// icons in MCPServersPanel.tsx), not exact trademark reproductions. Falls
 // back to the category badge (guessCategory) for every quantizer/finetune
 // whose base model isn't one of these — most of what search actually
 // returns, so that fallback carries most of the weight.

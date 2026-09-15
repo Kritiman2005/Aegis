@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Plug, ShieldAlert, RefreshCw, Trash2, Loader2, CheckCircle2, XCircle, Plus, Download, Store, Eye, EyeOff, ChevronRight, Code2, Search, Globe, Wrench } from 'lucide-react';
+import { Plug, ShieldAlert, RefreshCw, Trash2, Loader2, CheckCircle2, XCircle, Plus, Download, Store, Eye, EyeOff, ChevronRight, Code2, Search, Globe, Wrench, X } from 'lucide-react';
 import { SiGithub } from 'react-icons/si';
 import toast from 'react-hot-toast';
 import { useSocket } from '../hooks/useSocket';
@@ -48,10 +48,12 @@ const PLACEHOLDER = `{
   }
 }`;
 
-// Mirrors app.mcp.catalog's CONNECTORS_CATALOG entry shape — only
-// auth_type != "oauth" entries ever reach the frontend (the backend
-// filters oauth ones out while app.core.feature_flags.CONNECTORS_ENABLED
-// is off, since those need a hosted broker Aegis doesn't have yet).
+// Mirrors app.mcp.catalog's CONNECTORS_CATALOG entry shape. auth_type=="oauth"
+// entries only reach the frontend while app.core.feature_flags.CONNECTORS_ENABLED
+// is on — Aegis has no hosted OAuth broker, so these need the user's OWN OAuth
+// app (client_id/client_secret) pasted in via env_schema, same as an api_key
+// connector; the difference is only in what "Connect" does afterward (see
+// handleCatalogConnect).
 interface CatalogField {
   key: string;
   label: string;
@@ -66,9 +68,11 @@ interface CatalogEntry {
   display_name: string;
   category: string;
   description: string;
-  auth_type: 'api_key' | 'path' | 'connection_string' | 'none';
+  auth_type: 'api_key' | 'path' | 'connection_string' | 'none' | 'oauth';
   env_schema: CatalogField[];
   input_schema: CatalogField[];
+  oauth_service?: string;  // matches oauth_service.OAUTH_CONFIGS key; absent for google_* entries
+  setup_hint?: string;
 }
 
 // Mirrors registry_client.py's _extract_install output — a single server
@@ -116,6 +120,12 @@ function RegistryResultCard({ entry, connecting, onInstall }: { entry: RegistryR
     onInstall(values);
   };
 
+  const handleCancel = () => {
+    setExpanded(false);
+    setValues({});
+    setRevealed({});
+  };
+
   return (
     <div className={`bg-aegis-raised rounded-xl border border-aegis-border shadow-sm px-3.5 py-3 ${expanded && fields.length > 0 ? 'lg:col-span-2' : ''}`}>
       <div className="flex items-center justify-between gap-3">
@@ -132,14 +142,25 @@ function RegistryResultCard({ entry, connecting, onInstall }: { entry: RegistryR
           {entry.description && <div className="text-[10px] text-aegis-text-muted leading-relaxed line-clamp-2 mt-0.5">{entry.description}</div>}
         </div>
         {install ? (
-          <button
-            onClick={handleClick}
-            disabled={connecting}
-            className="flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 bg-aegis-primary text-white text-[11px] font-semibold rounded-lg hover:opacity-90 disabled:opacity-50 transition-opacity"
-          >
-            {connecting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
-            {connecting ? 'Connecting…' : expanded || !hasRequiredFields ? 'Install' : 'Configure'}
-          </button>
+          <div className="flex-shrink-0 flex items-center gap-1.5">
+            {hasRequiredFields && expanded && !connecting && (
+              <button
+                onClick={handleCancel}
+                title="Cancel"
+                className="p-1.5 rounded-lg text-aegis-text-muted hover:bg-aegis-overlay hover:text-aegis-text-secondary transition-colors"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
+            <button
+              onClick={handleClick}
+              disabled={connecting}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-aegis-primary text-white text-[11px] font-semibold rounded-lg hover:opacity-90 disabled:opacity-50 transition-opacity"
+            >
+              {connecting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+              {connecting ? 'Connecting…' : expanded || !hasRequiredFields ? 'Install' : 'Configure'}
+            </button>
+          </div>
         ) : (
           <span className="flex-shrink-0 text-[10px] text-aegis-text-muted">Not auto-installable</span>
         )}
@@ -176,18 +197,25 @@ function RegistryResultCard({ entry, connecting, onInstall }: { entry: RegistryR
 }
 
 function CatalogCard({ entry, connecting, onConnect }: { entry: CatalogEntry; connecting: boolean; onConnect: (env: Record<string, string>, inputParams: Record<string, string>) => void }) {
-  const [expanded, setExpanded] = useState(entry.auth_type === 'none');
+  const needsConfiguring = entry.auth_type !== 'none';
+  const [expanded, setExpanded] = useState(!needsConfiguring);
   const [values, setValues] = useState<Record<string, string>>({});
   const [revealed, setRevealed] = useState<Record<string, boolean>>({});
   const fields = [...entry.env_schema, ...entry.input_schema];
 
   const handleConnect = () => {
-    if (entry.auth_type !== 'none' && !expanded) { setExpanded(true); return; }
+    if (needsConfiguring && !expanded) { setExpanded(true); return; }
     const env: Record<string, string> = {};
     entry.env_schema.forEach(f => { if (values[f.key]) env[f.key] = values[f.key]; });
     const inputParams: Record<string, string> = {};
     entry.input_schema.forEach(f => { if (values[f.key]) inputParams[f.key] = values[f.key]; });
     onConnect(env, inputParams);
+  };
+
+  const handleCancel = () => {
+    setExpanded(false);
+    setValues({});
+    setRevealed({});
   };
 
   return (
@@ -202,18 +230,36 @@ function CatalogCard({ entry, connecting, onConnect }: { entry: CatalogEntry; co
             <div className="text-[10px] text-aegis-text-muted leading-relaxed line-clamp-2">{entry.description}</div>
           </div>
         </div>
-        <button
-          onClick={handleConnect}
-          disabled={connecting}
-          className="flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 bg-aegis-primary text-white text-[11px] font-semibold rounded-lg hover:opacity-90 disabled:opacity-50 transition-opacity"
-        >
-          {connecting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
-          {connecting ? 'Connecting…' : entry.auth_type === 'none' ? 'Connect' : expanded ? 'Connect' : 'Configure'}
-        </button>
+        <div className="flex-shrink-0 flex items-center gap-1.5">
+          {/* Only a real "in-progress configuration" has anything to cancel back
+              out of — an auth_type "none" entry never expands into a form. */}
+          {needsConfiguring && expanded && !connecting && (
+            <button
+              onClick={handleCancel}
+              title="Cancel"
+              className="p-1.5 rounded-lg text-aegis-text-muted hover:bg-aegis-overlay hover:text-aegis-text-secondary transition-colors"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          )}
+          <button
+            onClick={handleConnect}
+            disabled={connecting}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-aegis-primary text-white text-[11px] font-semibold rounded-lg hover:opacity-90 disabled:opacity-50 transition-opacity"
+          >
+            {connecting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+            {connecting ? 'Connecting…' : entry.auth_type === 'none' ? 'Connect' : expanded ? 'Connect' : 'Configure'}
+          </button>
+        </div>
       </div>
 
       {expanded && fields.length > 0 && (
         <div className="mt-3 pl-[52px] flex flex-col gap-2">
+          {entry.auth_type === 'oauth' && entry.setup_hint && (
+            <p className="text-[10px] text-aegis-text-muted bg-aegis-overlay rounded-md px-2 py-1.5 leading-relaxed">
+              {entry.setup_hint}
+            </p>
+          )}
           {fields.map(f => (
             <div key={f.key}>
               <label className="text-[10px] text-aegis-text-muted">{f.label}{f.required && ' *'}</label>
@@ -311,7 +357,62 @@ export default function MCPServersPanel() {
     return () => clearInterval(interval);
   }, [fetchStatus, fetchCatalog]);
 
+  // Opens a URL in the system browser (required for the OAuth redirect back
+  // to the local backend to work — an embedded Electron window can't handle
+  // that), falling back to window.open for dev-in-Chrome.
+  const openInSystemBrowser = (url: string) => {
+    if ((window as any).aegis?.openExternal) {
+      (window as any).aegis.openExternal(url);
+    } else {
+      window.open(url, '_blank');
+    }
+  };
+
+  const handleOAuthConnect = async (entry: CatalogEntry, env: Record<string, string>) => {
+    const clientId = env['OAUTH_CLIENT_ID'];
+    const clientSecret = env['OAUTH_CLIENT_SECRET'];
+    const isGoogle = entry.name.startsWith('google_');
+    // Already configured (fields were left blank because a prior save
+    // exists) — just go straight to login.
+    if (!clientId || !clientSecret) {
+      const loginUrl = isGoogle
+        ? `${API_BASE}/auth/google/login?service=${entry.name}`
+        : `${API_BASE}/auth/${entry.oauth_service || entry.name}/login`;
+      openInSystemBrowser(loginUrl);
+      return;
+    }
+    setPending(prev => ({ ...prev, [entry.name]: { stage: 'connect', message: 'Saving OAuth app…' } }));
+    try {
+      const configureUrl = isGoogle
+        ? `${API_BASE}/auth/google/configure`
+        : `${API_BASE}/auth/${entry.oauth_service || entry.name}/configure`;
+      const res = await fetch(configureUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ client_id: clientId, client_secret: clientSecret }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        toast.error(data.error || data.detail || `Failed to save the OAuth app for '${entry.display_name}'.`);
+        return;
+      }
+      const loginUrl = isGoogle
+        ? `${API_BASE}/auth/google/login?service=${entry.name}`
+        : `${API_BASE}/auth/${entry.oauth_service || entry.name}/login`;
+      openInSystemBrowser(loginUrl);
+      toast.success(`OAuth app saved. Finish signing in to ${entry.display_name} in the browser window that just opened.`, { duration: 6000 });
+    } catch (e) {
+      toast.error('Could not reach the backend.');
+    } finally {
+      setPending(prev => { const n = { ...prev }; delete n[entry.name]; return n; });
+    }
+  };
+
   const handleCatalogConnect = async (entry: CatalogEntry, env: Record<string, string>, inputParams: Record<string, string>) => {
+    if (entry.auth_type === 'oauth') {
+      await handleOAuthConnect(entry, env);
+      return;
+    }
     setPending(prev => ({ ...prev, [entry.name]: { stage: 'detect', message: 'Starting…' } }));
     try {
       const res = await fetch(`${API_BASE}/api/connectors/catalog/connect`, {
@@ -493,6 +594,22 @@ export default function MCPServersPanel() {
       } else if (type === 'mcp_connect_failed') {
         setPending(prev => { const n = { ...prev }; delete n[server_name]; return n; });
         toast.error(`${server_name}: ${payload.message}`, { duration: 8000 });
+      }
+    });
+  }, [addMessageHandler, fetchStatus]);
+
+  // OAuth connects finish in the system browser (google_oauth.py /
+  // oauth_routes.py), not the background-task pipeline above — they
+  // broadcast `auth_ready`/`error` keyed by `service`, not `server_name`.
+  useEffect(() => {
+    return addMessageHandler((payload: any) => {
+      const { type, service } = payload;
+      if (!service) return;
+      if (type === 'auth_ready') {
+        toast.success(payload.content || `Connected '${service}'.`);
+        fetchStatus();
+      } else if (type === 'error') {
+        toast.error(payload.content || `Could not connect '${service}'.`, { duration: 8000 });
       }
     });
   }, [addMessageHandler, fetchStatus]);

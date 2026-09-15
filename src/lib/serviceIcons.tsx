@@ -1,6 +1,6 @@
 import type { IconType } from 'react-icons';
 import {
-  SiGmail, SiGoogledrive, SiNotion, SiFigma, SiHubspot, SiAirtable,
+  SiGmail, SiGoogledrive, SiGooglesheets, SiGoogledocs, SiNotion, SiFigma, SiHubspot, SiAirtable,
   SiLinear, SiJira, SiStripe, SiShopify, SiBrave, SiGooglemaps, SiZendesk,
   SiGithub, SiPostgresql, SiSentry, SiElasticsearch, SiSqlite, SiDuckdb,
   SiQdrant, SiGit, SiHuggingface,
@@ -26,6 +26,8 @@ const SERVICE_ICONS: Record<string, ServiceIconSpec> = {
   // MCP catalog — real brand marks wherever the vendor has one
   google_mail: { Icon: SiGmail, color: '#EA4335' },
   google_drive: { Icon: SiGoogledrive, color: '#1FA463' },
+  google_sheets: { Icon: SiGooglesheets, color: '#0F9D58' },
+  google_docs: { Icon: SiGoogledocs, color: '#4285F4' },
   slack: { Icon: FaSlack, color: '#4A154B' },
   notion: { Icon: SiNotion, color: '#000000' },
   figma: { Icon: SiFigma, color: '#F24E1E' },

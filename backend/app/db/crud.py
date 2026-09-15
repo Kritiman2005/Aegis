@@ -677,6 +677,25 @@ def get_active_vision_mmproj_path(db: Session) -> Optional[str]:
     return active.mmproj_path if os.path.exists(active.mmproj_path) else None
 
 
+def get_model_vision_mmproj_path(db: Session, model_name: str) -> Optional[str]:
+    """
+    Same as get_active_vision_mmproj_path, but for one SPECIFIC named model
+    rather than whichever one is currently active for chat — a workflow
+    "llm" node picks its own model explicitly (data.modelName), which may
+    or may not be the active chat model, so vision input for a workflow run
+    (see engine.py's _attach_workflow_vision_image) must check the model
+    the node actually resolved, not the globally active one.
+    """
+    import os
+    row = db.query(ModelRegistry).filter(
+        ModelRegistry.status == "downloaded",
+        ModelRegistry.name == model_name,
+    ).first()
+    if not row or row.mmproj_status != "downloaded" or not row.mmproj_path:
+        return None
+    return row.mmproj_path if os.path.exists(row.mmproj_path) else None
+
+
 def log_token_usage(
     db: Session,
     conversation_id: Optional[str],
@@ -786,12 +805,49 @@ def set_capability_active(db: Session, conversation_id: str, capability_type: st
 from app.db.models import Workflow
 
 
-def get_active_chat_workflow(db: Session) -> Optional[Workflow]:
-    """The one workflow (if any) currently connected to power real chat
-    messages — see app.core.workflows.engine.run_chat_workflow and the
-    /set-chat-handler, /unset-chat-handler endpoints in app.api.workflows.
-    At most one row ever has is_chat_handler=True, enforced there."""
-    return db.query(Workflow).filter(Workflow.is_chat_handler == True).first()  # noqa: E712
+def get_active_chat_workflow(db: Session, conversation_id: Optional[str] = None) -> Optional[Workflow]:
+    """The workflow (if any) that should handle a chat message in
+    `conversation_id` — see app.core.workflows.engine.run_chat_workflow and
+    the /set-chat-handler, /unset-chat-handler endpoints in
+    app.api.workflows. A workflow scoped to exactly this conversation (its
+    chat_trigger node's data.conversationId) wins if one exists; otherwise
+    falls back to the one GLOBAL handler (chat_handler_conversation_id
+    NULL), if any — matches how it always worked before per-conversation
+    scoping existed. `conversation_id=None` skips straight to the global
+    lookup (used wherever the caller genuinely has no conversation
+    context)."""
+    if conversation_id is not None:
+        scoped = (
+            db.query(Workflow)
+            .filter(Workflow.is_chat_handler == True, Workflow.chat_handler_conversation_id == conversation_id)  # noqa: E712
+            .first()
+        )
+        if scoped:
+            return scoped
+    return (
+        db.query(Workflow)
+        .filter(Workflow.is_chat_handler == True, Workflow.chat_handler_conversation_id.is_(None))  # noqa: E712
+        .first()
+    )
+
+
+def get_active_ingestion_workflow(db: Session, conversation_id: Optional[str] = None) -> Optional[Workflow]:
+    """Same scoped-then-global lookup as get_active_chat_workflow, for
+    document uploads — see app.api.documents's upload handler and the
+    /set-ingestion-handler, /unset-ingestion-handler endpoints."""
+    if conversation_id is not None:
+        scoped = (
+            db.query(Workflow)
+            .filter(Workflow.is_ingestion_handler == True, Workflow.ingestion_handler_conversation_id == conversation_id)  # noqa: E712
+            .first()
+        )
+        if scoped:
+            return scoped
+    return (
+        db.query(Workflow)
+        .filter(Workflow.is_ingestion_handler == True, Workflow.ingestion_handler_conversation_id.is_(None))  # noqa: E712
+        .first()
+    )
 
 
 # ─── Token Usage / Analytics ─────────────────────────────────────────────────

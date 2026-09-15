@@ -310,32 +310,61 @@ def _validate_chat_handler_graph(graph: Dict) -> None:
         raise HTTPException(status_code=400, detail="More than one node has nothing wired after it — there must be exactly one final step.")
 
 
+def _trigger_conversation_id(graph: Dict, trigger_kind: str) -> Any:
+    """Reads data.conversationId off the ONE trigger node of this kind —
+    already validated to exist and be singular by the caller's own
+    _validate_*_handler_graph. None/blank means "global" (every
+    conversation with no more specific match), matching how this worked
+    before per-conversation scoping existed."""
+    for n in graph.get("nodes", []):
+        if n.get("data", {}).get("kind") == trigger_kind:
+            return n.get("data", {}).get("conversationId") or None
+    return None
+
+
 @router.post("/{workflow_id}/set-chat-handler")
 def set_chat_handler(workflow_id: int, db: Session = Depends(get_db)):
-    """Connects this workflow as the live handler for real chat messages —
-    at most one workflow may hold this at a time (mirrors ModelRegistry's
-    single-active-row pattern in app.api.context_config's load_active_model).
-    See app.api.websocket's process_message_task for where this is read."""
+    """Connects this workflow as A live chat handler — either the one
+    GLOBAL handler (its chat_trigger node's conversationId left blank) or
+    scoped to one specific conversation (conversationId set on that node).
+    Unseats only the previous holder of the SAME scope — a global handler
+    and any number of differently-scoped handlers coexist; at most one
+    workflow may hold any single scope (mirrors ModelRegistry's
+    single-active-row pattern in app.api.context_config's load_active_model,
+    just per-scope instead of globally). See app.db.crud.get_active_chat_workflow
+    for the scoped-first-then-global lookup app.api.websocket's
+    process_message_task reads at send time."""
     w = db.query(Workflow).filter(Workflow.id == workflow_id).first()
     if not w:
         raise HTTPException(status_code=404, detail="Workflow not found.")
 
-    _validate_chat_handler_graph(json.loads(w.graph_json))
+    graph = json.loads(w.graph_json)
+    _validate_chat_handler_graph(graph)
+    conversation_id = _trigger_conversation_id(graph, "chat_trigger")
+    same_scope = (
+        Workflow.chat_handler_conversation_id.is_(None) if conversation_id is None
+        else Workflow.chat_handler_conversation_id == conversation_id
+    )
 
-    db.query(Workflow).update({Workflow.is_chat_handler: False})
+    db.query(Workflow).filter(Workflow.id != workflow_id, same_scope).update(
+        {Workflow.is_chat_handler: False, Workflow.chat_handler_conversation_id: None}, synchronize_session=False,
+    )
     w.is_chat_handler = True
+    w.chat_handler_conversation_id = conversation_id
     db.commit()
-    return {"success": True}
+    return {"success": True, "conversation_id": conversation_id}
 
 
 @router.post("/{workflow_id}/unset-chat-handler")
 def unset_chat_handler(workflow_id: int, db: Session = Depends(get_db)):
-    """Disconnects this workflow — chat reverts to the built-in ChatAgent
-    pipeline exactly as it behaves with nothing connected."""
+    """Disconnects this workflow — its scope (global or one conversation)
+    reverts to the built-in ChatAgent pipeline exactly as it behaves with
+    nothing connected there."""
     w = db.query(Workflow).filter(Workflow.id == workflow_id).first()
     if not w:
         raise HTTPException(status_code=404, detail="Workflow not found.")
     w.is_chat_handler = False
+    w.chat_handler_conversation_id = None
     db.commit()
     return {"success": True}
 
@@ -369,29 +398,43 @@ def _validate_ingestion_handler_graph(graph: Dict) -> None:
 
 @router.post("/{workflow_id}/set-ingestion-handler")
 def set_ingestion_handler(workflow_id: int, db: Session = Depends(get_db)):
-    """Connects this workflow as the live handler for future document
-    uploads — at most one workflow may hold this at a time. See
-    app.api.documents's upload handler for where this is read."""
+    """Connects this workflow as A live ingestion handler — either the one
+    GLOBAL handler (its document_upload_trigger node's conversationId left
+    blank) or scoped to uploads made within one conversation. Same
+    unseat-only-the-same-scope rule as set_chat_handler above. See
+    app.api.documents's upload handler and app.db.crud
+    .get_active_ingestion_workflow for where/how this is read."""
     w = db.query(Workflow).filter(Workflow.id == workflow_id).first()
     if not w:
         raise HTTPException(status_code=404, detail="Workflow not found.")
 
-    _validate_ingestion_handler_graph(json.loads(w.graph_json))
+    graph = json.loads(w.graph_json)
+    _validate_ingestion_handler_graph(graph)
+    conversation_id = _trigger_conversation_id(graph, "document_upload_trigger")
+    same_scope = (
+        Workflow.ingestion_handler_conversation_id.is_(None) if conversation_id is None
+        else Workflow.ingestion_handler_conversation_id == conversation_id
+    )
 
-    db.query(Workflow).update({Workflow.is_ingestion_handler: False})
+    db.query(Workflow).filter(Workflow.id != workflow_id, same_scope).update(
+        {Workflow.is_ingestion_handler: False, Workflow.ingestion_handler_conversation_id: None}, synchronize_session=False,
+    )
     w.is_ingestion_handler = True
+    w.ingestion_handler_conversation_id = conversation_id
     db.commit()
-    return {"success": True}
+    return {"success": True, "conversation_id": conversation_id}
 
 
 @router.post("/{workflow_id}/unset-ingestion-handler")
 def unset_ingestion_handler(workflow_id: int, db: Session = Depends(get_db)):
-    """Disconnects this workflow — uploads revert to the built-in
-    app.core.rag.processor.ingest_document pipeline exactly as before."""
+    """Disconnects this workflow — its scope (global or one conversation)
+    reverts to the built-in app.core.rag.processor.ingest_document pipeline
+    exactly as before."""
     w = db.query(Workflow).filter(Workflow.id == workflow_id).first()
     if not w:
         raise HTTPException(status_code=404, detail="Workflow not found.")
     w.is_ingestion_handler = False
+    w.ingestion_handler_conversation_id = None
     db.commit()
     return {"success": True}
 

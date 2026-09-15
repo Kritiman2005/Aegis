@@ -322,6 +322,78 @@ def _build_structured_output_grammar(fields: List[Dict[str, Any]]):
         return None
 
 
+_VISION_IMAGE_EXTS = {"png", "jpg", "jpeg"}
+_MAX_VISION_IMAGE_BYTES = 15 * 1024 * 1024  # matches BaseAgent._MAX_VISION_IMAGE_BYTES
+
+
+def _find_upstream_image(upstream_outputs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Looks for an image reference directly among this node's upstream
+    outputs — the shape a "document_upload_trigger" injects
+    ({file_path, document_id, filename, file_type}) when its own
+    "Also trigger on image uploads" option is on (see
+    app.api.documents's upload endpoint). Only ever finds one this way:
+    images never flow through Extract/Chunk (no OCR path for them — see
+    that endpoint's comment), so a trigger's own direct output is the only
+    place an image shows up in a workflow today. Returns the first match,
+    or None.
+    """
+    for value in upstream_outputs.values():
+        if isinstance(value, dict) and str(value.get("file_type", "")).lower() in _VISION_IMAGE_EXTS and value.get("file_path"):
+            return value
+    return None
+
+
+def _attach_workflow_vision_image(messages: List[Dict], model_name: Optional[str], upstream_outputs: Dict[str, Any]) -> None:
+    """
+    Mirrors app.core.agents.base.BaseAgent._attach_vision_images for a
+    workflow "llm" node — mutates messages[-1]'s content into an OpenAI-
+    style content-parts list with the image embedded as real vision input,
+    but ONLY when:
+      1. an image is actually present among this node's upstream outputs
+         (see _find_upstream_image), and
+      2. the model THIS NODE resolved (data.modelName, or the active model
+         when left blank) is itself vision-capable.
+    Deliberately does NOT reuse BaseAgent._attach_vision_images directly —
+    that method checks whether the globally ACTIVE chat model is vision-
+    capable, which is the wrong question here: a workflow node picks its
+    own model explicitly, independent of whatever's active for chat.
+    """
+    image = _find_upstream_image(upstream_outputs)
+    if not image or not messages or messages[-1].get("role") != "user":
+        return
+
+    from app.db.database import SessionLocal
+    from app.db.crud import get_active_vision_mmproj_path, get_model_vision_mmproj_path
+    with SessionLocal() as db:
+        if model_name:
+            mmproj_path = get_model_vision_mmproj_path(db, model_name)
+        else:
+            mmproj_path = get_active_vision_mmproj_path(db)
+    if not mmproj_path:
+        return
+
+    import os
+    import base64
+    file_path = image["file_path"]
+    try:
+        if os.path.getsize(file_path) > _MAX_VISION_IMAGE_BYTES:
+            logger.warning(f"Skipping oversized image for workflow vision input: {file_path}")
+            return
+        with open(file_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+    except OSError as e:
+        logger.warning(f"Could not read image '{file_path}' for workflow vision input: {e}")
+        return
+
+    ext = str(image.get("file_type", "")).lower()
+    mime = "jpeg" if ext == "jpg" else ext
+    messages[-1]["content"] = [
+        {"type": "text", "text": messages[-1]["content"]},
+        {"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{b64}"}},
+    ]
+
+
 async def _run_ai_reasoning_node(
     executor: ExecutorAgent, instruction: str, upstream_outputs: Dict[str, Any], model_name: str,
     output_fields: Optional[List[Dict[str, Any]]] = None,
@@ -391,6 +463,10 @@ async def _run_ai_reasoning_node(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": f"Instruction: {instruction}\n\nUpstream data:\n{context_str}"},
     ]
+    # Purely additive — a no-op unless an image is actually sitting among
+    # this node's upstream outputs AND its own picked model is vision-
+    # capable (see _attach_workflow_vision_image's docstring).
+    _attach_workflow_vision_image(messages, model_name, upstream_outputs)
     # Every blocking llama.cpp call for one chat turn must run on the SAME
     # thread (llm_executor is single-worker by default — see chat.py) as
     # any other call sharing this model instance (_run_chat_generation_node's
@@ -415,7 +491,46 @@ async def _run_ai_reasoning_node(
         return {f["name"]: _STRUCTURED_FIELD_DEFAULTS.get(f.get("type"), "") for f in output_fields if f.get("name")}
 
 
-def _run_logic_node(node: Dict, edges: List[Dict], node_outputs: Dict[str, Any]) -> Any:
+def _get_node_state(workflow_id: int, node_id: str, key: str) -> Optional[str]:
+    """Reads one persisted (workflow, node, key) value — state a node needs
+    to remember BETWEEN separate runs. See app.db.models.WorkflowNodeState."""
+    from app.db.database import SessionLocal
+    from app.db.models import WorkflowNodeState
+    with SessionLocal() as db:
+        row = (
+            db.query(WorkflowNodeState)
+            .filter(
+                WorkflowNodeState.workflow_id == workflow_id,
+                WorkflowNodeState.node_id == node_id,
+                WorkflowNodeState.key == key,
+            )
+            .first()
+        )
+        return row.value if row else None
+
+
+def _set_node_state(workflow_id: int, node_id: str, key: str, value: str) -> None:
+    """Upserts one persisted (workflow, node, key) value — see _get_node_state."""
+    from app.db.database import SessionLocal
+    from app.db.models import WorkflowNodeState
+    with SessionLocal() as db:
+        row = (
+            db.query(WorkflowNodeState)
+            .filter(
+                WorkflowNodeState.workflow_id == workflow_id,
+                WorkflowNodeState.node_id == node_id,
+                WorkflowNodeState.key == key,
+            )
+            .first()
+        )
+        if row:
+            row.value = value
+        else:
+            db.add(WorkflowNodeState(workflow_id=workflow_id, node_id=node_id, key=key, value=value))
+        db.commit()
+
+
+def _run_logic_node(node: Dict, edges: List[Dict], node_outputs: Dict[str, Any], workflow_id: Optional[int] = None) -> Any:
     """
     A generic gate/condition — n8n's "IF" node. data.field names a key to
     read off the upstream value (blank uses the upstream value directly —
@@ -426,11 +541,22 @@ def _run_logic_node(node: Dict, edges: List[Dict], node_outputs: Dict[str, Any])
     false — the same "None means skip" signal a "needs_search: False"
     decision used to silently short-circuit search with before this node
     kind existed. The dispatch loops (run_chat_workflow/run_workflow/
-    run_ingestion_workflow) separately track which node IDS are gated
-    closed (by identity, not by inspecting return values — a ordinary
-    node legitimately returning None elsewhere must not be mistaken for a
-    closed gate) and skip running anything with no other path in whose
-    sole upstream is one of those ids, cascading forward.
+    run_ingestion_workflow/run_schedule_workflow) separately track which
+    node IDS are gated closed (by identity, not by inspecting return
+    values — a ordinary node legitimately returning None elsewhere must
+    not be mistaken for a closed gate) and skip running anything with no
+    other path in whose sole upstream is one of those ids, cascading
+    forward.
+
+    operator=="changed_since_last_run" is the odd one out: unlike every
+    other operator (a pure function of THIS run's data), it compares
+    against a value persisted from the PREVIOUS run (WorkflowNodeState,
+    keyed by this exact node) and holds only when the subject is
+    different — this is what makes a schedule-triggered chain (e.g.
+    gmail_list_messages on a timer) fire the rest of the chain only when
+    there's actually something new, instead of re-processing the same
+    latest item every single poll. Requires workflow_id — raises if it's
+    missing rather than silently always/never holding.
     """
     data = node.get("data", {})
     label = data.get("label") or node["id"]
@@ -459,6 +585,14 @@ def _run_logic_node(node: Dict, edges: List[Dict], node_outputs: Dict[str, Any])
             holds = bool(re.search(str(value or ""), str(subject or ""), re.IGNORECASE))
         except re.error as e:
             raise WorkflowError(f"Node '{label}': invalid regex — {e}")
+    elif operator == "changed_since_last_run":
+        if workflow_id is None:
+            raise WorkflowError(f"Node '{label}': \"changed since last run\" only works inside a saved workflow.")
+        subject_str = "" if subject is None else str(subject)
+        previous = _get_node_state(workflow_id, node["id"], "last_value")
+        holds = subject_str != (previous or "")
+        if holds:
+            _set_node_state(workflow_id, node["id"], "last_value", subject_str)
     else:
         raise WorkflowError(f"Node '{label}' has an unknown condition '{operator}'.")
 
@@ -883,6 +1017,69 @@ def _run_chunk_node(node: Dict, edges: List[Dict], node_outputs: Dict[str, Any])
     return chunking_engines.chunk(text, chunk_size=chunk_size, overlap=overlap, strategy_id=data.get("strategy"))
 
 
+async def _run_send_to_chat_node(node: Dict, edges: List[Dict], node_outputs: Dict[str, Any], workflow_id: Optional[int] = None) -> str:
+    """
+    Delivers upstream text into a chat conversation from OUTSIDE any live
+    chat turn — the node a schedule-triggered chain uses to actually
+    notify the user. A "chat_reply" node only works inside a real
+    chat_trigger turn (it replies into the SAME conversation the user just
+    typed into); a schedule_trigger has no such conversation to reply
+    into. Writes a real ChatMessage row (so it's there whenever the
+    conversation is opened, durable across restarts) into one dedicated,
+    stable conversation per workflow — every "Post to Chat" node on the
+    same workflow lands in the same thread by default, titled from the
+    workflow's own name via the normal first-message preview — and
+    broadcasts a notification so the user learns about it immediately,
+    wherever they are in the app right now, without having to go check.
+    """
+    if workflow_id is None:
+        raise WorkflowError("A \"Post to Chat\" node only works inside a saved workflow.")
+
+    data = node.get("data", {})
+    label = data.get("label") or node["id"]
+    upstream_ids = _upstream_node_ids(node["id"], edges)
+    if not upstream_ids:
+        raise WorkflowError(f"Node '{label}' has nothing wired into it to send.")
+    upstream = node_outputs.get(upstream_ids[0])
+
+    field = data.get("field")
+    content = upstream.get(field) if field and isinstance(upstream, dict) else upstream
+    if content is None:
+        content = ""
+    elif not isinstance(content, str):
+        content = json.dumps(content, default=str)
+    if not content.strip():
+        raise WorkflowError(f"Node '{label}' received empty content — nothing to send.")
+
+    from app.db.database import SessionLocal
+    from app.db.crud import add_chat_message
+    from app.db.models import Workflow as WorkflowModel
+
+    # data.conversationId (set on the node — a real conversation the user
+    # picked, e.g. their main chat) wins when present; otherwise the
+    # dedicated per-workflow thread this node has always used.
+    conversation_id = data.get("conversationId") or f"workflow_{workflow_id}_auto"
+
+    def _persist():
+        with SessionLocal() as db:
+            row = db.query(WorkflowModel).filter(WorkflowModel.id == workflow_id).first()
+            workflow_name = row.name if row else "Workflow"
+            add_chat_message(db, conversation_id, "assistant", content)
+            return workflow_name
+
+    workflow_name = await anyio.to_thread.run_sync(_persist)
+
+    await manager.broadcast_json({
+        "type": "workflow_chat_message",
+        "workflow_id": workflow_id,
+        "conversation_id": conversation_id,
+        "workflow_name": workflow_name,
+        "content": content,
+    })
+
+    return content
+
+
 _RETRYABLE_KINDS = {"mcp", "tool", "database", "vector", "embedding", "reranker"}
 _RETRY_DELAYS = (0.5, 1.5)  # gaps between attempts — 3 tries total
 
@@ -896,6 +1093,7 @@ async def _execute_node_with_retry(
     executor: ExecutorAgent,
     conversation_id: Optional[str] = None,
     chat_ctx: Optional[Dict[str, Any]] = None,
+    workflow_id: Optional[int] = None,
 ) -> Any:
     """
     Thin wrapper around _execute_node that automatically retries node kinds
@@ -916,7 +1114,7 @@ async def _execute_node_with_retry(
     """
     kind = nodes[node_id].get("data", {}).get("kind", "tool")
     if kind not in _RETRYABLE_KINDS:
-        return await _execute_node(node_id, nodes, edges, node_outputs, chat_agent, executor, conversation_id=conversation_id, chat_ctx=chat_ctx)
+        return await _execute_node(node_id, nodes, edges, node_outputs, chat_agent, executor, conversation_id=conversation_id, chat_ctx=chat_ctx, workflow_id=workflow_id)
 
     label = nodes[node_id].get("data", {}).get("label") or node_id
     last_exc: Exception = None
@@ -925,7 +1123,7 @@ async def _execute_node_with_retry(
             logger.warning(f"Node '{label}' failed ({last_exc}) — retrying in {delay}s (attempt {attempt + 1}/{len(_RETRY_DELAYS) + 1}).")
             await anyio.sleep(delay)
         try:
-            return await _execute_node(node_id, nodes, edges, node_outputs, chat_agent, executor, conversation_id=conversation_id, chat_ctx=chat_ctx)
+            return await _execute_node(node_id, nodes, edges, node_outputs, chat_agent, executor, conversation_id=conversation_id, chat_ctx=chat_ctx, workflow_id=workflow_id)
         except WorkflowError:
             raise
         except Exception as e:
@@ -942,6 +1140,7 @@ async def _execute_node(
     executor: ExecutorAgent,
     conversation_id: Optional[str] = None,
     chat_ctx: Optional[Dict[str, Any]] = None,
+    workflow_id: Optional[int] = None,
 ) -> Any:
     """Runs exactly one node and returns its output. Shared by the main
     top-to-bottom pass and _run_loop_node (which calls this once per item
@@ -949,7 +1148,10 @@ async def _execute_node(
     item as that body's "upstream" for the duration of that one call).
     conversation_id/chat_ctx are only ever set when called from within a
     chat-connected run (run_chat_workflow) — needed by the "vector" node's
-    engine_id=="aegis_hybrid" special case; every other node ignores them."""
+    engine_id=="aegis_hybrid" special case; every other node ignores them.
+    workflow_id is only needed by a "logic" node using the
+    "changed_since_last_run" operator (persisted dedup state) — every other
+    kind ignores it."""
     node = nodes[node_id]
     data = node.get("data", {})
     kind = data.get("kind", "tool")
@@ -1005,7 +1207,7 @@ async def _execute_node(
         )
 
     elif kind == "logic":
-        return _run_logic_node(node, edges, node_outputs)
+        return _run_logic_node(node, edges, node_outputs, workflow_id=workflow_id)
 
     elif kind == "database":
         return await _run_database_node(node, edges, node_outputs)
@@ -1026,13 +1228,19 @@ async def _execute_node(
         return _run_chunk_node(node, edges, node_outputs)
 
     elif kind == "loop":
-        return await _run_loop_node(node_id, nodes, edges, node_outputs, chat_agent, executor, conversation_id=conversation_id, chat_ctx=chat_ctx)
+        return await _run_loop_node(node_id, nodes, edges, node_outputs, chat_agent, executor, conversation_id=conversation_id, chat_ctx=chat_ctx, workflow_id=workflow_id)
+
+    elif kind == "send_to_chat":
+        return await _run_send_to_chat_node(node, edges, node_outputs, workflow_id=workflow_id)
 
     elif kind in ("chat_trigger", "chat_reply", "export_document"):
         raise WorkflowError(f"'{label}' only runs when this workflow is connected as the chat handler — connect it from the toolbar, or send a chat message instead of clicking Run.")
 
     elif kind == "document_upload_trigger":
         raise WorkflowError(f"'{label}' only runs when this workflow is connected as the ingestion handler — connect it from the toolbar, or upload a document instead of clicking Run.")
+
+    elif kind == "schedule_trigger":
+        raise WorkflowError(f"'{label}' only runs on its own schedule — it fires automatically in the background, nothing to click.")
 
     else:
         raise WorkflowError(f"Node '{label}' has an unrecognized type '{kind}'.")
@@ -1110,6 +1318,7 @@ async def _run_loop_node(
     executor: ExecutorAgent,
     conversation_id: Optional[str] = None,
     chat_ctx: Optional[Dict[str, Any]] = None,
+    workflow_id: Optional[int] = None,
 ) -> List[Any]:
     """
     Deliberately scoped down from full n8n loop semantics: the loop's body
@@ -1162,7 +1371,7 @@ async def _run_loop_node(
         try:
             last_result = None
             for step_id in chain:
-                last_result = await _execute_node_with_retry(step_id, nodes, edges, node_outputs, chat_agent, executor, conversation_id=conversation_id, chat_ctx=chat_ctx)
+                last_result = await _execute_node_with_retry(step_id, nodes, edges, node_outputs, chat_agent, executor, conversation_id=conversation_id, chat_ctx=chat_ctx, workflow_id=workflow_id)
                 node_outputs[step_id] = last_result
             results.append(last_result)
             if marks_documents_ready and isinstance(item, dict) and item.get("document_id") is not None:
@@ -1735,7 +1944,7 @@ async def _run_chat_workflow_body(
             else:
                 result = await _execute_node_with_retry(
                     node_id, nodes, edges, node_outputs, chat_agent, executor,
-                    conversation_id=chat_agent.connection_id, chat_ctx=chat_ctx,
+                    conversation_id=chat_agent.connection_id, chat_ctx=chat_ctx, workflow_id=workflow_id,
                 )
         except WorkflowError:
             raise
@@ -1863,7 +2072,7 @@ async def _run_ingestion_workflow_body(
             "node_id": node_id, "status": "running", "message": f"Running '{label}'…",
         })
         try:
-            result = await _execute_node_with_retry(node_id, nodes, edges, node_outputs, chat_agent, executor)
+            result = await _execute_node_with_retry(node_id, nodes, edges, node_outputs, chat_agent, executor, workflow_id=workflow_id)
         except WorkflowError:
             raise
         except Exception as e:
@@ -1875,6 +2084,103 @@ async def _run_ingestion_workflow_body(
             "type": "workflow_node_progress", "workflow_id": workflow_id, "run_id": f"ingest_{document_id}",
             "node_id": node_id, "status": "completed", "message": f"'{label}' completed.",
         })
+
+
+async def run_schedule_workflow(workflow_id: int, trigger_node_id: str) -> None:
+    """
+    Runs one workflow graph because its "On a schedule" trigger came due —
+    invoked periodically by app.core.scheduler_daemon's background loop
+    (see _check_schedule_triggers), never by an HTTP request. Structurally
+    mirrors run_ingestion_workflow: load the graph, restrict to the
+    subgraph reachable from ONE specific trigger node (a canvas may hold
+    more than one schedule_trigger, each on its own cadence, side by side
+    with an unrelated chat/ingestion tree), topological run, broadcast
+    progress. The only real difference is that a schedule_trigger carries
+    no payload of its own to inject — whatever's wired after it (typically
+    an "mcp"/"tool" node like gmail_list_messages) is what actually fetches
+    something fresh on each firing, and a "logic" node further downstream
+    with the "changed_since_last_run" operator is what decides whether this
+    firing is actually worth acting on (see _run_logic_node).
+    """
+    from app.db.database import SessionLocal
+    from app.db.models import Workflow as WorkflowModel
+
+    with SessionLocal() as db:
+        row = db.query(WorkflowModel).filter(WorkflowModel.id == workflow_id).first()
+        if not row:
+            raise WorkflowError(f"Workflow {workflow_id} no longer exists.")
+        graph = json.loads(row.graph_json)
+
+    run_id = uuid.uuid4().hex[:8]
+    await anyio.to_thread.run_sync(_record_run_start, run_id, workflow_id, "schedule")
+    node_outputs: Dict[str, Any] = {}
+    try:
+        await _run_schedule_workflow_body(workflow_id, trigger_node_id, graph, run_id, node_outputs)
+    except Exception as e:
+        await anyio.to_thread.run_sync(_record_run_finish, run_id, "failed", node_outputs, None, str(e))
+        raise
+    await anyio.to_thread.run_sync(_record_run_finish, run_id, "completed", node_outputs)
+
+
+async def _run_schedule_workflow_body(
+    workflow_id: int, trigger_node_id: str, graph: Dict, run_id: str, node_outputs: Dict[str, Any],
+) -> None:
+    nodes = {n["id"]: n for n in graph.get("nodes", [])}
+    edges = graph.get("edges", [])
+
+    if trigger_node_id not in nodes:
+        raise WorkflowError(f"Schedule trigger node '{trigger_node_id}' no longer exists on this workflow.")
+
+    nodes, edges = _reachable_subgraph(nodes, edges, trigger_node_id)
+    node_outputs[trigger_node_id] = {"fired_at": datetime.utcnow().isoformat()}
+
+    chat_agent = ChatAgent(f"schedule_run_{run_id}")
+    executor = ExecutorAgent(chat_agent.llm_manager)
+    order = _topological_order(list(nodes.values()), edges)
+
+    loop_body_ids = {
+        step_id
+        for nid, n in nodes.items()
+        if n.get("data", {}).get("kind") == "loop"
+        for step_id in _trace_loop_body_chain(nid, edges)
+    }
+    logic_gated_chains = {
+        nid: _downstream_gated_by(nid, edges)
+        for nid, n in nodes.items()
+        if n.get("data", {}).get("kind") == "logic"
+    }
+    gated_closed: set = set()
+
+    for node_id in order:
+        if node_id == trigger_node_id or node_id in loop_body_ids:
+            continue
+        if node_id in gated_closed:
+            node_outputs[node_id] = None
+            continue
+
+        node = nodes[node_id]
+        kind = node.get("data", {}).get("kind")
+        label = node.get("data", {}).get("label") or node_id
+
+        await manager.broadcast_json({
+            "type": "workflow_node_progress", "workflow_id": workflow_id, "run_id": run_id,
+            "node_id": node_id, "status": "running", "message": f"Running '{label}'…",
+        })
+        try:
+            result = await _execute_node_with_retry(node_id, nodes, edges, node_outputs, chat_agent, executor, workflow_id=workflow_id)
+        except WorkflowError:
+            raise
+        except Exception as e:
+            raise WorkflowError(f"'{label}' failed: {e}")
+        node_outputs[node_id] = result
+        if kind == "logic" and result is None:
+            gated_closed.update(logic_gated_chains.get(node_id, []))
+        await manager.broadcast_json({
+            "type": "workflow_node_progress", "workflow_id": workflow_id, "run_id": run_id,
+            "node_id": node_id, "status": "completed", "message": f"'{label}' completed.",
+        })
+
+    await manager.broadcast_json({"type": "workflow_run_complete", "workflow_id": workflow_id, "run_id": run_id, "outputs": {}})
 
 
 async def run_workflow(workflow_id: int, run_id: str, graph: Dict) -> None:
@@ -1961,7 +2267,7 @@ async def run_workflow(workflow_id: int, run_id: str, graph: Dict) -> None:
         # will fail on its own missing input if it genuinely needs live
         # trigger data, same as any other node with missing config —
         # everything NOT dependent on the trigger still gets to run.
-        if kind in ("chat_trigger", "document_upload_trigger"):
+        if kind in ("chat_trigger", "document_upload_trigger", "schedule_trigger"):
             node_outputs[node_id] = None
             await broadcast(node_id, "completed", f"'{label}' skipped — only runs live (connect it from the toolbar, or trigger it for real, to exercise this node).", output=None)
             continue
@@ -1969,7 +2275,7 @@ async def run_workflow(workflow_id: int, run_id: str, graph: Dict) -> None:
         await broadcast(node_id, "running", f"Running '{label}'…")
 
         try:
-            result = await _execute_node_with_retry(node_id, nodes, edges, node_outputs, chat_agent, executor)
+            result = await _execute_node_with_retry(node_id, nodes, edges, node_outputs, chat_agent, executor, workflow_id=workflow_id)
             node_outputs[node_id] = result
             if kind == "logic" and result is None:
                 gated_closed.update(logic_gated_chains.get(node_id, []))

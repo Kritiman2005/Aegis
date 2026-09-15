@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Text, Boolean, BigInteger, DateTime, ForeignKey, Float, Float
+from sqlalchemy import Column, Integer, String, Text, Boolean, BigInteger, DateTime, ForeignKey, Float, Float, UniqueConstraint
 from sqlalchemy.orm import relationship
 from app.db.database import Base
 
@@ -73,6 +73,29 @@ class MCPServer(Base):
     # Relationships
     user = relationship("User", back_populates="mcp_servers")
     tools = relationship("MCPTool", back_populates="server", cascade="all, delete-orphan")
+
+
+class OAuthAppCredential(Base):
+    """
+    A user's own OAuth app (client_id/client_secret) for one connector.
+
+    Aegis has no hosted OAuth broker — there is no Aegis-owned app shared
+    across every install. Each user registers their own OAuth client with
+    the provider (Google Cloud Console, Slack API, etc.) and pastes the two
+    values in here via the Connectors panel before the "Connect" button can
+    start a login. Google's four catalog entries (mail/drive/docs/sheets)
+    share one row under service_name "google", since Google issues one
+    client covering however many scopes are requested — no reason to make
+    the user register four separate apps for one GCP project.
+    """
+    __tablename__ = "oauth_app_credentials"
+
+    id = Column(Integer, primary_key=True, index=True)
+    service_name = Column(String, unique=True, nullable=False, index=True)
+    client_id = Column(String, nullable=False)
+    client_secret = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class MCPTool(Base):
@@ -157,19 +180,30 @@ class Workflow(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
     graph_json = Column(Text, nullable=False)  # JSON: {"nodes": [...], "edges": [...]}
-    # At most one workflow may have this set — it becomes the live handler
-    # for real chat messages (see app.core.workflows.engine.run_chat_workflow
-    # and the /set-chat-handler, /unset-chat-handler endpoints in
-    # app.api.workflows). False for every workflow = chat uses the built-in
-    # ChatAgent pipeline exactly as before this feature existed.
+    # True = this workflow is connected as A live chat handler — either the
+    # one GLOBAL handler (chat_handler_conversation_id NULL, applies to
+    # every conversation with no more specific match) or scoped to ONE
+    # conversation (chat_handler_conversation_id set, from the chat_trigger
+    # node's own data.conversationId — see app.api.workflows's
+    # /set-chat-handler). At most one row may be the global handler, and at
+    # most one row may be scoped to any given conversation_id, but a global
+    # handler and any number of differently-scoped handlers may all be
+    # active at once — app.db.crud.get_active_chat_workflow does the
+    # scoped-first-then-global lookup for one incoming message. False for
+    # every workflow = chat uses the built-in ChatAgent pipeline exactly as
+    # before this feature existed.
     is_chat_handler = Column(Boolean, default=False, nullable=False)
-    # Same idea as is_chat_handler, but for document uploads — at most one
-    # workflow may have this set; it becomes the live handler run by
+    chat_handler_conversation_id = Column(String, nullable=True, index=True)
+    # Same idea as is_chat_handler/chat_handler_conversation_id, but for
+    # document uploads — the live handler run by
     # app.core.workflows.engine.run_ingestion_workflow in place of the
-    # built-in app.core.rag.processor.ingest_document for every future
-    # upload (see app.api.documents's upload handler and the
-    # /set-ingestion-handler, /unset-ingestion-handler endpoints).
+    # built-in app.core.rag.processor.ingest_document, either globally or
+    # scoped to uploads made within one conversation (from the
+    # document_upload_trigger node's data.conversationId — see
+    # app.api.documents's upload handler and the /set-ingestion-handler,
+    # /unset-ingestion-handler endpoints in app.api.workflows).
     is_ingestion_handler = Column(Boolean, default=False, nullable=False)
+    ingestion_handler_conversation_id = Column(String, nullable=True, index=True)
     # Null for a user-authored workflow. Set to app.core.workflows.seed's
     # SEED_VERSION for the built-in "Aegis Default Chat Pipeline" — lets
     # startup detect an old copy of that seed still sitting in an existing
@@ -189,6 +223,33 @@ class Workflow(Base):
     # this already caused on an existing install.
     seed_key = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class WorkflowNodeState(Base):
+    """
+    Small persisted key-value slot scoped to one (workflow, node) pair —
+    state a node needs to remember BETWEEN separate runs, which node_outputs
+    (rebuilt fresh every run) can't hold. Two current uses:
+      - A "schedule_trigger" node's own bookkeeping: key="next_run_at",
+        value=an ISO timestamp, read/written by
+        app.core.scheduler.SchedulerDaemon's workflow-trigger check.
+      - A "logic" node using operator=="changed_since_last_run": key=
+        "last_value", value=the stringified subject from the previous run
+        that held — lets a poll-driven trigger (e.g. gmail_list_messages on
+        a schedule) only let the rest of the chain run when something
+        actually changed, instead of re-summarizing the same latest email
+        every single firing. See engine.py's _run_logic_node.
+    (workflow_id, node_id, key) is unique — one row per fact.
+    """
+    __tablename__ = "workflow_node_state"
+    __table_args__ = (UniqueConstraint("workflow_id", "node_id", "key", name="uq_workflow_node_state"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    workflow_id = Column(Integer, ForeignKey("workflows.id"), nullable=False, index=True)
+    node_id = Column(String, nullable=False, index=True)
+    key = Column(String, nullable=False)
+    value = Column(Text, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 

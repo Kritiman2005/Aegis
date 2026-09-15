@@ -7,15 +7,17 @@ Single source of truth: anything gated on a flag here should ALWAYS check
 it from this module, not re-derive its own copy of the condition.
 """
 
-# Connecting MCP servers / OAuth services (Slack, Notion, GitHub, Google
-# Drive, etc.) currently requires the user to bring their own OAuth
-# client_id/client_secret — fine for testing, not something a non-coder can
-# do. This is paused while Aegis builds a hosted OAuth broker, gets each
-# provider's app verified, and ships the marketing site/demos for it.
-#
-# Flip back to True to restore: this single flag gates the connectors/oauth
+# Connecting OAuth-based connectors (Slack, Notion, GitHub, Google Drive,
+# etc.) requires each user to bring their own OAuth client_id/client_secret,
+# registered with the provider under their own account, and paste it into
+# the Connectors panel before the first Connect click — see
+# app.auth.oauth_service.save_client_credentials / app.auth.google_oauth
+# .save_google_credentials. Aegis has no hosted OAuth broker and never runs
+# a shared app on anyone's behalf; this flag just gates the connectors/oauth
 # routers in main.py, the startup auto-restore of saved connections, and the
-# chat-side "you'd need X connected" suggestions in agents/chat.py — nothing
-# else needs to change. Existing connected-server rows in SQLite are left
-# alone (not deleted), so re-enabling brings old test connections back too.
-CONNECTORS_ENABLED = False
+# chat-side "you'd need X connected" suggestions in agents/chat.py.
+#
+# Flip to False only to hide the whole OAuth connector category again (e.g.
+# while iterating on it) — existing connected-server rows in SQLite are left
+# alone either way, so re-enabling brings old connections back too.
+CONNECTORS_ENABLED = True

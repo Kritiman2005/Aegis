@@ -370,3 +370,27 @@ def list_downloaded_models(db: Session = Depends(get_db_session)):
         "mmproj_filename": m.mmproj_filename,
         "mmproj_status": m.mmproj_status,
     } for m in models]}
+
+
+@router.delete("/{model_id}")
+def delete_downloaded_model(model_id: int, db: Session = Depends(get_db_session)):
+    """
+    Deletes a downloaded model: removes its GGUF file (and paired mmproj
+    file, for a vision model) from disk, then the ModelRegistry row.
+    Refuses to delete the currently-active (loaded-in-RAM) model — llama.cpp
+    already has that file memory-mapped, and eject-then-delete is one clear
+    action instead of this endpoint silently ejecting on the user's behalf.
+    """
+    model = db.query(ModelRegistry).filter(ModelRegistry.id == model_id).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found.")
+    if model.is_active:
+        raise HTTPException(status_code=400, detail=f"'{model.display_name}' is loaded in RAM — eject it first, then delete.")
+
+    for path in (model.file_path, model.mmproj_path):
+        if path:
+            Path(path).unlink(missing_ok=True)
+
+    db.delete(model)
+    db.commit()
+    return {"message": f"Deleted '{model.display_name}'."}

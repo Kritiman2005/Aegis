@@ -1,9 +1,15 @@
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
+from pydantic import BaseModel
 import logging
 import anyio
 
-from app.auth.google_oauth import initiate_oauth_flow, get_google_flow
+from app.auth.google_oauth import (
+    initiate_oauth_flow,
+    get_google_flow,
+    save_google_credentials,
+    has_google_credentials,
+)
 from app.mcp.registry import mcp_registry
 from app.core.connection_manager import manager as ws_manager
 
@@ -12,6 +18,32 @@ logger = logging.getLogger(__name__)
 
 # Temporary in-memory state store (in production, use a secure session cookie or DB)
 AUTH_STATES = {}
+
+
+class ConfigureGoogleAppRequest(BaseModel):
+    client_id: str
+    client_secret: str
+    model_config = {"defer_build": True}
+
+
+@router.post("/google/configure")
+def google_configure(req: ConfigureGoogleAppRequest):
+    """Saves the user's own Google OAuth app credentials — shared across all
+    google_* catalog entries. Called by the Connectors panel before the
+    first Connect click on Google Mail/Drive/Docs/Sheets."""
+    client_id = req.client_id.strip()
+    client_secret = req.client_secret.strip()
+    if not client_id or not client_secret:
+        return JSONResponse(status_code=400, content={"error": "Both client_id and client_secret are required."})
+    save_google_credentials(client_id, client_secret)
+    return {"configured": True}
+
+
+@router.get("/google/configured")
+def google_configured():
+    """Whether the user has already saved a Google OAuth app."""
+    return {"configured": has_google_credentials()}
+
 
 @router.get("/google/login")
 def google_login(service: str = "google_workspace"):
@@ -83,6 +115,7 @@ async def google_callback(request: Request):
         tool_names = ", ".join(t["name"] for t in tools)
         await ws_manager.broadcast_json({
             "type": "auth_ready",
+            "service": service_name,
             "content": f"✅ Google authentication successful! {len(tools)} tools are now available: {tool_names}\n\nYou can now type your request below."
         })
         

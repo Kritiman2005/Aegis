@@ -2,7 +2,6 @@
 
 import { useEffect, useRef, useState } from 'react';
 import {
-  Link2,
   Plug,
   Cpu,
   Database,
@@ -45,7 +44,7 @@ function highlightSnippet(snippet: string): string {
   return escaped.replace(/\*\*(.+?)\*\*/g, '<mark>$1</mark>');
 }
 
-export type TabType = 'chat' | 'connectors' | 'mcp_servers' | 'workflows' | 'llms' | 'discover' | 'history' | 'sync_detail' | 'model_hub' | 'context' | 'analytics' | 'marketplace';
+export type TabType = 'chat' | 'mcp_servers' | 'workflows' | 'llms' | 'discover' | 'history' | 'model_hub' | 'context' | 'analytics' | 'marketplace';
 
 export interface AccountStatus {
   logged_in: boolean;
@@ -61,26 +60,16 @@ interface SidebarProps {
   onSelectSession?: (id: string) => void;
   onDeleteSession?: (id: string, e: React.MouseEvent) => void;
   activeSessionId?: string;
-  // Connectors is paused product-side (see backend/app/core/feature_flags.py)
-  // until Aegis has its own hosted OAuth — hides the nav entry so there's no
-  // dead end into a feature the backend won't serve.
-  connectorsEnabled?: boolean;
   account?: AccountStatus | null;
   onLogout?: () => void;
 }
 
 const NAV_ITEMS = [
   { id: 'workflows'    as TabType, label: 'Workflows', icon: Workflow },
-  // 'connectors' is the hidden OAuth-broker feature (ConnectorsView.tsx) —
-  // stays disabled behind connectorsEnabled until a hosted broker exists.
-  // The user-facing "Connectors" name belongs to the MCP feature below
-  // (renamed from "MCP Servers"); this one keeps a distinct label so the
-  // two don't collide if the flag is ever flipped on.
-  { id: 'connectors'   as TabType, label: 'OAuth Connectors', icon: Link2 },
   { id: 'mcp_servers'  as TabType, label: 'Connectors', icon: Plug },
   { id: 'marketplace' as TabType, label: 'Marketplace', icon: Store },
   { id: 'llms'        as TabType, label: 'LLMs',        icon: Cpu },
-  { id: 'context'     as TabType, label: 'Context & Memory', icon: Database },
+  { id: 'context'     as TabType, label: 'Memory Hub', icon: Database },
   { id: 'analytics'   as TabType, label: 'Analytics',   icon: BarChart3 },
 ];
 
@@ -92,12 +81,10 @@ export default function Sidebar({
   onSelectSession,
   onDeleteSession,
   activeSessionId,
-  connectorsEnabled = false,
   account = null,
   onLogout,
 }: SidebarProps) {
   const [recentsOpen, setRecentsOpen] = useState(true);
-  const navItems = NAV_ITEMS.filter(item => item.id !== 'connectors' || connectorsEnabled);
 
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
@@ -185,7 +172,7 @@ export default function Sidebar({
 
       {/* ── Nav Items ──────────────────────────────────────────────────── */}
       <nav className="flex-1 pt-3 px-2 space-y-0.5 overflow-y-auto">
-        {navItems.map(({ id, label, icon: Icon }) => {
+        {NAV_ITEMS.map(({ id, label, icon: Icon }) => {
           const isActive = activeTab === id;
           return (
             <button

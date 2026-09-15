@@ -4,7 +4,6 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import Sidebar, { TabType, AccountStatus } from '@/components/Sidebar';
 import ChatView from '@/components/ChatView';
 import ContextMemoryHub from '@/components/ContextMemoryHub';
-import ConnectorsView from '@/components/ConnectorsView';
 import MCPServersPanel from '@/components/MCPServersPanel';
 import WorkflowsView from '@/components/WorkflowsView';
 import ModelHub from '@/components/ModelHub';
@@ -18,8 +17,6 @@ import { useAppSelector } from '@/hooks/useStore';
 import { selectSessionId } from '@/store/sessionSlice';
 
 export default function Home() {
-  // Connectors is temporarily disabled (see backend/app/core/feature_flags.py)
-  // — 'connectors' is no longer a valid landing tab while it's hidden.
   const [activeTab, setActiveTab] = useState<TabType>('chat');
   const [isBackendReady, setIsBackendReady] = useState(false);
   // Fires much earlier than isBackendReady — as soon as the backend answers
@@ -27,14 +24,6 @@ export default function Home() {
   // (and so the account row) is already up by then, so this is what gates
   // the account check now, instead of waiting for full readiness.
   const [backendReachable, setBackendReachable] = useState(false);
-  const [connectorsEnabled, setConnectorsEnabled] = useState(false);
-
-  useEffect(() => {
-    fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/feature-flags`)
-      .then(res => res.json())
-      .then(data => setConnectorsEnabled(!!data.connectors_enabled))
-      .catch(() => {});
-  }, []);
 
   const [account, setAccount] = useState<AccountStatus | null>(null);
   const [accountChecked, setAccountChecked] = useState(false);
@@ -242,7 +231,6 @@ export default function Home() {
         onSelectSession={handleSelectSession}
         onDeleteSession={handleDeleteSession}
         activeSessionId={currentSessionId ?? undefined}
-        connectorsEnabled={connectorsEnabled}
         account={account}
         onLogout={handleLogout}
       />
@@ -275,9 +263,6 @@ export default function Home() {
             onOpenMarketplace={() => setActiveTab('marketplace')}
           />
         </div>
-        {(activeTab === 'connectors' || activeTab === 'sync_detail') && (
-          <ConnectorsView />
-        )}
         {activeTab === 'mcp_servers' && (
           <MCPServersPanel />
         )}
