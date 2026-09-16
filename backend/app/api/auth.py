@@ -77,82 +77,104 @@ async def google_callback(request: Request):
     # Clean up state
     del AUTH_STATES[state]
     
+    # The OAuthLib fetch_token is synchronous and makes network requests.
+    # To avoid blocking the FastAPI async event loop, run it in a thread.
+    def fetch():
+        # Normalize the redirect URL: Google may return localhost but our
+        # registered URI is 127.0.0.1. Replacing here prevents a mismatch.
+        auth_response = str(request.url).replace(
+            "localhost:8000", "127.0.0.1:8000"
+        )
+        flow.fetch_token(authorization_response=auth_response)
+        return flow.credentials
+
     try:
-        
-        # The OAuthLib fetch_token is synchronous and makes network requests.
-        # To avoid blocking the FastAPI async event loop, run it in a thread.
-        def fetch():
-            # Normalize the redirect URL: Google may return localhost but our
-            # registered URI is 127.0.0.1. Replacing here prevents a mismatch.
-            auth_response = str(request.url).replace(
-                "localhost:8000", "127.0.0.1:8000"
-            )
-            flow.fetch_token(authorization_response=auth_response)
-            return flow.credentials
-            
         credentials = await anyio.to_thread.run_sync(fetch)
-        
-        # Initialize the Google Workspace stdio MCP server via registry
-        def init_apis_and_db():
-            from app.db.database import SessionLocal
-            from app.db.crud import save_google_user_and_credentials
-            with SessionLocal() as db:
-                save_google_user_and_credentials(
-                    db=db,
-                    credentials=credentials,
-                    service_name=service_name
-                )
-                tools = mcp_registry.connect_google_service(
-                    service_name=service_name,
-                    credentials_json_str=credentials.to_json(),
-                    db=db
-                )
-                return tools
-
-        tools = await anyio.to_thread.run_sync(init_apis_and_db)
-
-        # Notify all connected WebSocket clients that auth is complete
-        tool_names = ", ".join(t["name"] for t in tools)
-        await ws_manager.broadcast_json({
-            "type": "auth_ready",
-            "service": service_name,
-            "content": f"✅ Google authentication successful! {len(tools)} tools are now available: {tool_names}\n\nYou can now type your request below."
-        })
-        
-        # Return a friendly HTML response so the user can close the browser tab
-        return HTMLResponse(
-            content="""
-            <html>
-                <head><title>Authentication Successful</title></head>
-                <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
-                    <h1>Authentication Successful!</h1>
-                    <p>You can safely close this tab and return to Aegis.</p>
-                    <button onclick="window.close()" style="padding: 10px 20px; font-size: 16px; cursor: pointer; border-radius: 8px; background: #000; color: #fff; border: none; margin-top: 20px;">Close Window</button>
-                    <script>
-                        if (window.opener) { window.opener.postMessage('auth_success', '*'); }
-                        window.close();
-                    </script>
-                </body>
-            </html>
-            """
-        )
     except Exception as e:
-        logger.error(f"Error during token exchange or MCP initialization: {e}")
-        return HTMLResponse(
-            status_code=500,
-            content=f"""
-            <html>
-                <head><title>Authentication Failed</title></head>
-                <body style="font-family: sans-serif; text-align: center; padding-top: 50px; color: #c00;">
-                    <h1>Authentication Failed</h1>
-                    <p style="color:#333">An error occurred while connecting to Google.</p>
-                    <pre style="text-align:left;display:inline-block;background:#f4f4f4;padding:16px;border-radius:8px;font-size:12px;color:#333;max-width:600px;white-space:pre-wrap;">{str(e)}</pre>
-                    <br/>
-                    <p style="color:#555;font-size:13px;">Please close this tab and try again from Aegis.<br/>
-                    Make sure <strong>http://127.0.0.1:8000/auth/google/callback</strong> is listed as an authorized redirect URI in your Google Cloud Console.</p>
-                    <button onclick="window.close()" style="padding:10px 20px;margin-top:20px;border-radius:8px;background:#555;color:#fff;border:none;cursor:pointer;font-size:15px;">Close</button>
-                </body>
-            </html>
-            """
-        )
+        # A redirect-URI/client-secret mismatch, an expired code, etc. —
+        # genuinely GCP-config-shaped failures, so the redirect URI hint
+        # actually applies here.
+        logger.error(f"Error during Google token exchange: {e}")
+        return _auth_failed_page(str(e), show_gcp_hint=True)
+
+    # Initialize the Google Workspace stdio MCP server via registry
+    def init_apis_and_db():
+        from app.db.database import SessionLocal
+        from app.db.crud import save_google_user_and_credentials
+        with SessionLocal() as db:
+            save_google_user_and_credentials(
+                db=db,
+                credentials=credentials,
+                service_name=service_name
+            )
+            tools = mcp_registry.connect_google_service(
+                service_name=service_name,
+                credentials_json_str=credentials.to_json(),
+                db=db
+            )
+            return tools
+
+    try:
+        tools = await anyio.to_thread.run_sync(init_apis_and_db)
+    except Exception as e:
+        # The token exchange above already succeeded — Google accepted our
+        # redirect URI and client credentials — so whatever broke here is a
+        # local problem (the bundled MCP server subprocess, SQLite, etc.),
+        # not a GCP Console setting. Telling the user to go check their
+        # redirect URI for a failure that has nothing to do with it just
+        # sends them down the wrong path.
+        logger.error(f"Error during MCP server initialization: {e}")
+        return _auth_failed_page(str(e), show_gcp_hint=False)
+
+    # Notify all connected WebSocket clients that auth is complete
+    tool_names = ", ".join(t["name"] for t in tools)
+    await ws_manager.broadcast_json({
+        "type": "auth_ready",
+        "service": service_name,
+        "content": f"✅ Google authentication successful! {len(tools)} tools are now available: {tool_names}\n\nYou can now type your request below."
+    })
+
+    # Return a friendly HTML response so the user can close the browser tab
+    return HTMLResponse(
+        content="""
+        <html>
+            <head><title>Authentication Successful</title></head>
+            <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
+                <h1>Authentication Successful!</h1>
+                <p>You can safely close this tab and return to Aegis.</p>
+                <button onclick="window.close()" style="padding: 10px 20px; font-size: 16px; cursor: pointer; border-radius: 8px; background: #000; color: #fff; border: none; margin-top: 20px;">Close Window</button>
+                <script>
+                    if (window.opener) { window.opener.postMessage('auth_success', '*'); }
+                    window.close();
+                </script>
+            </body>
+        </html>
+        """
+    )
+
+
+def _auth_failed_page(error_text: str, show_gcp_hint: bool) -> HTMLResponse:
+    hint = (
+        """<p style="color:#555;font-size:13px;">Please close this tab and try again from Aegis.<br/>
+        Make sure <strong>http://127.0.0.1:8000/auth/google/callback</strong> is listed as an authorized redirect URI in your Google Cloud Console.</p>"""
+        if show_gcp_hint else
+        """<p style="color:#555;font-size:13px;">Please close this tab and try again from Aegis.<br/>
+        Google itself accepted the sign-in — this failure happened locally after that, so it isn't a Google Cloud Console setting.</p>"""
+    )
+    return HTMLResponse(
+        status_code=500,
+        content=f"""
+        <html>
+            <head><title>Authentication Failed</title></head>
+            <body style="font-family: sans-serif; text-align: center; padding-top: 50px; color: #c00;">
+                <h1>Authentication Failed</h1>
+                <p style="color:#333">An error occurred while connecting to Google.</p>
+                <pre style="text-align:left;display:inline-block;background:#f4f4f4;padding:16px;border-radius:8px;font-size:12px;color:#333;max-width:600px;white-space:pre-wrap;">{error_text}</pre>
+                <br/>
+                {hint}
+                <button onclick="window.close()" style="padding:10px 20px;margin-top:20px;border-radius:8px;background:#555;color:#fff;border:none;cursor:pointer;font-size:15px;">Close</button>
+            </body>
+        </html>
+        """
+    )
 

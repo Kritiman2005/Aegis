@@ -299,10 +299,17 @@ async def ensure_runtime(command: List[str], progress_cb: Optional[ProgressCallb
         raise RuntimeError(f"Failed to download the runtime {exe} needs: {e}") from e
 
     exe_name = Path(exe).name
-    resolved_exe = bin_dir / exe_name
-    if not resolved_exe.exists():
-        resolved_exe = bin_dir / f"{exe_name}.exe"
-    if not resolved_exe.exists():
+    # npx/npm on Windows are .cmd wrapper scripts, not .exe — only node.exe
+    # itself is a real PE binary (see _node_bin_dir's comment above). uv/uvx
+    # are Rust binaries on every platform, so .exe alone covers those.
+    candidates = [exe_name, f"{exe_name}.exe"] if requirement == "uv" else [exe_name, f"{exe_name}.exe", f"{exe_name}.cmd"]
+    resolved_exe = None
+    for candidate in candidates:
+        p = bin_dir / candidate
+        if p.exists():
+            resolved_exe = p
+            break
+    if resolved_exe is None:
         raise RuntimeError(f"Downloaded the {requirement} runtime, but couldn't find '{exe_name}' inside it.")
 
     return [str(resolved_exe)] + command[1:]

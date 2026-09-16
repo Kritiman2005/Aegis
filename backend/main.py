@@ -31,6 +31,25 @@ if not getattr(sys, 'frozen', False):
 os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "10")
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "10")
 
+# mcp_google dispatches here, before any of the app's own routers/RAG
+# stack/etc. get imported below — google_mcp_server.py is careful to keep
+# stdout clean for its JSON-RPC handshake (see its own module docstring:
+# "All output except MCP messages goes to stderr"), but that guarantee is
+# only as good as everything ELSE this process happens to import. A
+# frozen build re-invokes this exact executable as its MCP subprocess
+# (see mcp/registry.py's connect_google_service), so if the heavy import
+# chain below (uvicorn, every app.api.* router, the embedding/reranker/
+# RAG stack) ever prints so much as a blank line at import time on some
+# platform, it lands on stdout ahead of the real handshake response and
+# breaks the client's very first json.loads() with a cryptic "Expecting
+# value: line 1 column 1 (char 0)" that has nothing to do with the actual
+# cause. Dispatching before those imports even happen closes that off
+# entirely, and starts the subprocess faster besides.
+if len(sys.argv) > 1 and sys.argv[1] == "mcp_google":
+    from app.mcp.servers.google_mcp_server import run_server
+    run_server(sys.argv[2:])
+    sys.exit(0)
+
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -408,12 +427,6 @@ def on_shutdown():
     close_all_sessions()
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "mcp_google":
-        from app.mcp.servers.google_mcp_server import run_server
-        run_server(sys.argv[2:])
-        sys.exit(0)
-
     if len(sys.argv) > 2 and sys.argv[1] == "selftest_llama":
         # CI-only entry point: proves the packaged binary can actually load and run
         # a GGUF model through llama-cpp-python's compiled native library. The
@@ -424,19 +437,6 @@ if __name__ == "__main__":
         llm.create_completion("Hello", max_tokens=4)
         print("SELFTEST_LLAMA_OK")
         sys.exit(0)
-
-    if len(sys.argv) > 2 and sys.argv[1] == "selftest_scrape":
-        # CI-only entry point: proves the packaged binary can actually drive a
-        # real headless browser scrape end to end (Node driver spawn, page
-        # render, extraction) — the same class of check as selftest_llama
-        # above, for the same reason: a packaged native-subprocess dependency
-        # that /api/health never touches, so a broken build would otherwise
-        # only surface the first time a user tries to scrape a page.
-        import asyncio
-        from app.core.scraper import scrape_url
-        r = asyncio.run(scrape_url(sys.argv[2]))
-        print(f"SELFTEST_SCRAPE_RESULT success={r.success} title={r.title!r} warnings={r.warnings} error={r.error}")
-        sys.exit(0 if r.success else 1)
 
     if len(sys.argv) > 2 and sys.argv[1] == "selftest_scrape":
         # CI-only entry point: proves the packaged binary can actually drive a

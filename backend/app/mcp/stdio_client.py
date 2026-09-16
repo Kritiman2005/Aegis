@@ -62,6 +62,17 @@ class StdioMCPClient:
         """Spawn the MCP server subprocess."""
         merged_env = {**os.environ, **self.env}
 
+        # npx/npm — whether resolved from PATH or auto-downloaded by
+        # runtime_manager.ensure_runtime — are .cmd wrapper scripts on
+        # Windows, not real PE executables. CreateProcess can't launch one
+        # directly (fails with WinError 193, "%1 is not a valid Win32
+        # application"); it needs to go through cmd.exe. shell=True with a
+        # list of args is the documented way to do that on Windows —
+        # Python still converts the list into a properly quoted command
+        # line (subprocess.list2cmdline) rather than handing raw text to
+        # the shell, same as the shell=False path below.
+        use_shell = sys.platform == "win32" and self.command and self.command[0].lower().endswith((".cmd", ".bat"))
+
         self._process = subprocess.Popen(
             self.command,
             stdin=subprocess.PIPE,
@@ -70,6 +81,7 @@ class StdioMCPClient:
             env=merged_env,
             text=True,
             bufsize=1,                # Line-buffered
+            shell=use_shell,
         )
         logger.info(f"[MCP] Spawned: {' '.join(self.command)} (PID {self._process.pid})")
 

@@ -36,6 +36,17 @@ hidden_imports = (
     collect_submodules('faster_whisper') +
     collect_submodules('ctranslate2') +
     collect_submodules('tokenizers') +
+    # Google Workspace MCP server (app/mcp/servers/google_mcp_server.py) —
+    # lazy-imported inside a function, well past where main.py dispatches
+    # to it (see main.py's mcp_google branch), so PyInstaller's static
+    # analysis of the entry script alone won't necessarily walk into it.
+    collect_submodules('googleapiclient') +
+    collect_submodules('google_auth_httplib2') +
+    collect_submodules('google.auth') +
+    collect_submodules('google.oauth2') +
+    collect_submodules('google_auth_oauthlib') +
+    collect_submodules('httplib2') +
+    collect_submodules('uritemplate') +
     ['passlib.handlers.bcrypt', 'multipart']
 )
 
@@ -67,6 +78,15 @@ datas = (
     # empty results in a frozen build.
     collect_data_files('dateparser') +
     collect_data_files('babel') +
+    # googleapiclient.discovery.build() defaults to static_discovery=True
+    # (whenever discoveryServiceUrl isn't passed, which google_mcp_server.py
+    # never does) — it loads each API's discovery document (gmail.v1.json,
+    # drive.v3.json, etc.) straight from this package's own bundled JSON
+    # files rather than fetching them over the network. Without them
+    # collected here, build() raises in the frozen build the moment Gmail/
+    # Drive/Sheets/Docs auth completes and the MCP server tries to
+    # construct its service clients.
+    collect_data_files('googleapiclient') +
     # scraper_driver.js / browser_driver.js are plain data files (not .py
     # modules), so PyInstaller's import-graph analysis can't discover them
     # on its own — must be listed here explicitly. See
