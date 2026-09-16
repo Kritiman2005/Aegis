@@ -86,25 +86,63 @@ def delete_installed(model_row_id: int, db: Session = Depends(get_db)):
     return {"message": f"Deleted '{row.display_name}'."}
 
 
+# In-memory current-progress-by-row — see marketplace_embeddings.py's
+# _progress_by_row for why this rides on the existing polled list instead
+# of a websocket.
+_progress_by_row: Dict[int, Dict[str, Any]] = {}
+
+
 async def _download_task(row_id: int, model_id: str, cache_dir: str) -> None:
     async def broadcast(status: str, **kwargs) -> None:
+        if status == "running" and "downloaded_bytes" in kwargs:
+            _progress_by_row[row_id] = kwargs
+        else:
+            _progress_by_row.pop(row_id, None)
         await manager.broadcast_json({"type": "reranker_download_progress", "model_row_id": row_id, "status": status, **kwargs})
 
     await broadcast("running", message=f"Downloading {model_id}…")
     try:
+        import asyncio
         import anyio
         from sentence_transformers import CrossEncoder
+        from app.core.hf_download_progress import DownloadProgressPoller, get_expected_total_bytes
 
-        # sentence_transformers' own downloader has no granular progress
-        # callback to hook into, same as fastembed's — a single blocking
-        # step reported as running -> complete/failed, not a percentage bar.
-        await anyio.to_thread.run_sync(lambda: CrossEncoder(model_id, cache_folder=cache_dir))
+        loop = asyncio.get_running_loop()
+
+        async def on_progress(downloaded: int, total: int) -> None:
+            await broadcast("running", downloaded_bytes=downloaded, total_bytes=total, progress=round(downloaded / total * 100, 1))
+
+        # Real progress: huggingface_hub exposes no byte-level progress
+        # callback through its public API (see hf_download_progress.py's
+        # module docstring for why) — poll the cache dir on disk instead
+        # while CrossEncoder's own download runs (same approach as
+        # marketplace_embeddings.py's sentence_transformers backend).
+        #
+        # Prefer the catalog's own known size over summing every file HF
+        # lists for this repo — confirmed against a real repo
+        # (cross-encoder/ms-marco-MiniLM-L-6-v2) that a plain sum can
+        # overshoot the real download by 8x+ when a repo carries redundant
+        # alternate formats (TF/ONNX/multiple precisions) that
+        # CrossEncoder's loader never actually touches, which would make
+        # the percentage crawl and never approach 100% before completion.
+        entry = get_catalog_entry(model_id)
+        if entry and entry.get("size_gb"):
+            total = int(entry["size_gb"] * 1024 ** 3)
+        else:
+            total = await anyio.to_thread.run_sync(lambda: get_expected_total_bytes(model_id))
+        poller = DownloadProgressPoller(cache_dir, model_id, total, on_progress, loop)
+        poller.start()
+        try:
+            await anyio.to_thread.run_sync(lambda: CrossEncoder(model_id, cache_folder=cache_dir))
+        finally:
+            poller.stop()
 
         with SessionLocal() as db:
             row = db.query(RerankerModelRegistry).filter(RerankerModelRegistry.id == row_id).first()
             if row:
                 row.status = "downloaded"
                 db.commit()
+        _progress_by_row.pop(row_id, None)
         await manager.broadcast_json({"type": "reranker_download_complete", "model_row_id": row_id})
 
     except Exception as e:
@@ -115,6 +153,7 @@ async def _download_task(row_id: int, model_id: str, cache_dir: str) -> None:
                 row.status = "failed"
                 row.error_message = str(e)
                 db.commit()
+        _progress_by_row.pop(row_id, None)
         await manager.broadcast_json({"type": "reranker_download_failed", "model_row_id": row_id, "message": str(e)})
 
 
@@ -159,4 +198,8 @@ def _serialize(row: RerankerModelRegistry) -> Dict[str, Any]:
         "status": row.status,
         "error_message": row.error_message,
         "created_at": row.created_at.isoformat() if row.created_at else None,
+        # Real download progress, when this row is currently downloading —
+        # see _progress_by_row's own docstring for why this rides on the
+        # existing polled list instead of a websocket. Absent otherwise.
+        **_progress_by_row.get(row.id, {}),
     }

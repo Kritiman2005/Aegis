@@ -6,6 +6,12 @@ import { ServiceLogo } from '../lib/serviceIcons';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
 
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(0)} MB`;
+  return `${(bytes / 1024).toFixed(0)} KB`;
+}
+
 interface Tool {
   id: string;
   name: string;
@@ -60,6 +66,12 @@ interface InstalledEmbeddingModel {
   status: 'downloading' | 'downloaded' | 'failed';
   error_message?: string;
   created_at?: string;
+  // Present only mid-download (see backend's _progress_by_row) — picked up
+  // by the same "poll the list every 2.5s while anything's downloading"
+  // mechanism this component already had, no websocket needed.
+  progress?: number;
+  downloaded_bytes?: number;
+  total_bytes?: number;
 }
 
 // A connected MCP tool usable as a custom document-extraction engine — how
@@ -92,12 +104,23 @@ interface InstalledReranker {
   status: 'downloading' | 'downloaded' | 'failed';
   error_message?: string;
   created_at?: string;
+  progress?: number;
+  downloaded_bytes?: number;
+  total_bytes?: number;
 }
 
 type ToolStatus = 'not_installed' | 'installing' | 'ready' | 'failed';
 
 function ToolCard({ tool, onInstalled }: { tool: Tool; onInstalled: () => void }) {
   const [status, setStatus] = useState<ToolStatus>(tool.installed ? 'ready' : 'not_installed');
+  // Real per-component progress — playwright_scraper's /api/scrape/status
+  // (the only status_endpoint that currently returns these; others just
+  // omit them, which the rendering below already treats as "no number
+  // yet") reports Chromium/FFMPEG/Headless Shell's own 0-100% as
+  // Playwright's CLI actually prints it (see backend
+  // app/core/scraper.py's install_chromium).
+  const [component, setComponent] = useState<string | undefined>();
+  const [percent, setPercent] = useState<number | undefined>();
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -108,6 +131,8 @@ function ToolCard({ tool, onInstalled }: { tool: Tool; onInstalled: () => void }
 
   const handleInstall = async () => {
     setStatus('installing');
+    setComponent(undefined);
+    setPercent(undefined);
     try {
       await fetch(`${API_BASE}/api/marketplace/tools/${tool.id}/install`, { method: 'POST' });
     } catch {
@@ -125,6 +150,9 @@ function ToolCard({ tool, onInstalled }: { tool: Tool; onInstalled: () => void }
         } else if (json.status === 'failed') {
           if (pollRef.current) clearInterval(pollRef.current);
           setStatus('failed');
+        } else {
+          setComponent(json.component);
+          setPercent(json.percent);
         }
       } catch {
         // transient — keep polling
@@ -133,43 +161,53 @@ function ToolCard({ tool, onInstalled }: { tool: Tool; onInstalled: () => void }
   };
 
   return (
-    <div className="flex items-start gap-4 bg-aegis-raised border border-aegis-border rounded-xl px-5 py-4 hover:border-aegis-primary/40 transition-colors">
-      <ServiceLogo serviceKey={tool.format ? `extract_${tool.format}` : tool.id} />
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2">
-          <p className="text-[13px] font-semibold text-aegis-text-primary">{tool.name}</p>
-          <span className="text-[11px] text-aegis-text-muted">· {tool.size_estimate}</span>
+    <div className="bg-aegis-raised border border-aegis-border rounded-xl px-5 py-4 hover:border-aegis-primary/40 transition-colors">
+      <div className="flex items-start gap-4">
+        <ServiceLogo serviceKey={tool.format ? `extract_${tool.format}` : tool.id} />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <p className="text-[13px] font-semibold text-aegis-text-primary">{tool.name}</p>
+            <span className="text-[11px] text-aegis-text-muted">· {tool.size_estimate}</span>
+          </div>
+          <p className="text-[13px] text-aegis-text-secondary mt-0.5">
+            {status === 'installing' && component ? `Downloading ${component}…` : tool.description}
+          </p>
         </div>
-        <p className="text-[13px] text-aegis-text-secondary mt-0.5">{tool.description}</p>
+        <div className="flex-shrink-0">
+          {status === 'ready' && (
+            <span className="inline-flex items-center gap-1.5 text-[12px] font-medium text-aegis-success px-3 py-1.5">
+              <CheckCircle2 className="w-3.5 h-3.5" /> Installed
+            </span>
+          )}
+          {status === 'not_installed' && (
+            <button
+              onClick={handleInstall}
+              className="inline-flex items-center gap-1.5 text-[12px] font-medium text-white bg-aegis-primary hover:bg-aegis-primary-dark px-3.5 py-1.5 rounded-lg transition-colors"
+            >
+              <Download className="w-3.5 h-3.5" /> Install
+            </button>
+          )}
+          {status === 'installing' && (
+            <span className="inline-flex items-center gap-1.5 text-[12px] font-medium text-aegis-warning px-3 py-1.5">
+              {typeof percent === 'number' ? <span className="font-semibold tabular-nums">{Math.round(percent)}%</span> : <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+              {typeof percent !== 'number' && 'Installing...'}
+            </span>
+          )}
+          {status === 'failed' && (
+            <button
+              onClick={handleInstall}
+              className="inline-flex items-center gap-1.5 text-[12px] font-medium text-aegis-error px-3.5 py-1.5 rounded-lg border border-aegis-error/30 hover:bg-aegis-error/10 transition-colors"
+            >
+              <XCircle className="w-3.5 h-3.5" /> Retry
+            </button>
+          )}
+        </div>
       </div>
-      <div className="flex-shrink-0">
-        {status === 'ready' && (
-          <span className="inline-flex items-center gap-1.5 text-[12px] font-medium text-aegis-success px-3 py-1.5">
-            <CheckCircle2 className="w-3.5 h-3.5" /> Installed
-          </span>
-        )}
-        {status === 'not_installed' && (
-          <button
-            onClick={handleInstall}
-            className="inline-flex items-center gap-1.5 text-[12px] font-medium text-white bg-aegis-primary hover:bg-aegis-primary-dark px-3.5 py-1.5 rounded-lg transition-colors"
-          >
-            <Download className="w-3.5 h-3.5" /> Install
-          </button>
-        )}
-        {status === 'installing' && (
-          <span className="inline-flex items-center gap-1.5 text-[12px] font-medium text-aegis-warning px-3 py-1.5">
-            <Loader2 className="w-3.5 h-3.5 animate-spin" /> Installing...
-          </span>
-        )}
-        {status === 'failed' && (
-          <button
-            onClick={handleInstall}
-            className="inline-flex items-center gap-1.5 text-[12px] font-medium text-aegis-error px-3.5 py-1.5 rounded-lg border border-aegis-error/30 hover:bg-aegis-error/10 transition-colors"
-          >
-            <XCircle className="w-3.5 h-3.5" /> Retry
-          </button>
-        )}
-      </div>
+      {status === 'installing' && typeof percent === 'number' && (
+        <div className="mt-2.5 h-1 w-full rounded-full bg-aegis-border overflow-hidden">
+          <div className="h-full rounded-full bg-aegis-warning transition-[width] duration-300 ease-out" style={{ width: `${Math.min(100, Math.max(0, percent))}%` }} />
+        </div>
+      )}
     </div>
   );
 }
@@ -414,20 +452,36 @@ function InstalledEmbeddingModelRow({ model, onRemoved }: { model: InstalledEmbe
   };
 
   return (
-    <div className="flex items-center gap-4 bg-aegis-raised border border-aegis-border rounded-xl px-5 py-3">
-      <ServiceLogo serviceKey="embedding" size="sm" />
-      <div className="flex-1 min-w-0">
-        <p className="text-[13px] font-semibold text-aegis-text-primary truncate">{model.display_name}</p>
-        <p className="text-[11px] text-aegis-text-muted">{model.dim}d · {model.size_gb} GB{model.status === 'failed' && model.error_message ? ` · ${model.error_message}` : ''}</p>
+    <div className="bg-aegis-raised border border-aegis-border rounded-xl px-5 py-3">
+      <div className="flex items-center gap-4">
+        <ServiceLogo serviceKey="embedding" size="sm" />
+        <div className="flex-1 min-w-0">
+          <p className="text-[13px] font-semibold text-aegis-text-primary truncate">{model.display_name}</p>
+          <p className="text-[11px] text-aegis-text-muted">
+            {model.status === 'downloading' && model.total_bytes
+              ? `${formatBytes(model.downloaded_bytes || 0)} of ${formatBytes(model.total_bytes)}`
+              : `${model.dim}d · ${model.size_gb} GB${model.status === 'failed' && model.error_message ? ` · ${model.error_message}` : ''}`}
+          </p>
+        </div>
+        <div className="flex-shrink-0 flex items-center gap-2">
+          {model.status === 'downloaded' && <span className="inline-flex items-center gap-1 text-[11px] text-aegis-success"><CheckCircle2 className="w-3.5 h-3.5" /> Ready</span>}
+          {model.status === 'downloading' && (
+            <span className="inline-flex items-center gap-1 text-[11px] text-aegis-warning">
+              {typeof model.progress === 'number' ? <span className="font-semibold tabular-nums">{Math.round(model.progress)}%</span> : <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+              {typeof model.progress !== 'number' && 'Downloading…'}
+            </span>
+          )}
+          {model.status === 'failed' && <span className="inline-flex items-center gap-1 text-[11px] text-aegis-error"><XCircle className="w-3.5 h-3.5" /> Failed</span>}
+          <button onClick={handleDelete} disabled={busy} className="p-1.5 rounded-md hover:bg-aegis-error/10 text-aegis-text-muted hover:text-aegis-error disabled:opacity-40 transition-colors">
+            {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+          </button>
+        </div>
       </div>
-      <div className="flex-shrink-0 flex items-center gap-2">
-        {model.status === 'downloaded' && <span className="inline-flex items-center gap-1 text-[11px] text-aegis-success"><CheckCircle2 className="w-3.5 h-3.5" /> Ready</span>}
-        {model.status === 'downloading' && <span className="inline-flex items-center gap-1 text-[11px] text-aegis-warning"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Downloading…</span>}
-        {model.status === 'failed' && <span className="inline-flex items-center gap-1 text-[11px] text-aegis-error"><XCircle className="w-3.5 h-3.5" /> Failed</span>}
-        <button onClick={handleDelete} disabled={busy} className="p-1.5 rounded-md hover:bg-aegis-error/10 text-aegis-text-muted hover:text-aegis-error disabled:opacity-40 transition-colors">
-          {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
-        </button>
-      </div>
+      {model.status === 'downloading' && typeof model.progress === 'number' && (
+        <div className="mt-2 h-1 w-full rounded-full bg-aegis-border overflow-hidden">
+          <div className="h-full rounded-full bg-aegis-warning transition-[width] duration-300 ease-out" style={{ width: `${Math.min(100, Math.max(0, model.progress))}%` }} />
+        </div>
+      )}
     </div>
   );
 }
@@ -494,20 +548,36 @@ function InstalledRerankerRow({ model, onRemoved }: { model: InstalledReranker; 
   };
 
   return (
-    <div className="flex items-center gap-4 bg-aegis-raised border border-aegis-border rounded-xl px-5 py-3">
-      <ServiceLogo serviceKey="reranker" size="sm" />
-      <div className="flex-1 min-w-0">
-        <p className="text-[13px] font-semibold text-aegis-text-primary truncate">{model.display_name}</p>
-        <p className="text-[11px] text-aegis-text-muted">{model.size_gb} GB{model.status === 'failed' && model.error_message ? ` · ${model.error_message}` : ''}</p>
+    <div className="bg-aegis-raised border border-aegis-border rounded-xl px-5 py-3">
+      <div className="flex items-center gap-4">
+        <ServiceLogo serviceKey="reranker" size="sm" />
+        <div className="flex-1 min-w-0">
+          <p className="text-[13px] font-semibold text-aegis-text-primary truncate">{model.display_name}</p>
+          <p className="text-[11px] text-aegis-text-muted">
+            {model.status === 'downloading' && model.total_bytes
+              ? `${formatBytes(model.downloaded_bytes || 0)} of ${formatBytes(model.total_bytes)}`
+              : `${model.size_gb} GB${model.status === 'failed' && model.error_message ? ` · ${model.error_message}` : ''}`}
+          </p>
+        </div>
+        <div className="flex-shrink-0 flex items-center gap-2">
+          {model.status === 'downloaded' && <span className="inline-flex items-center gap-1 text-[11px] text-aegis-success"><CheckCircle2 className="w-3.5 h-3.5" /> Ready</span>}
+          {model.status === 'downloading' && (
+            <span className="inline-flex items-center gap-1 text-[11px] text-aegis-warning">
+              {typeof model.progress === 'number' ? <span className="font-semibold tabular-nums">{Math.round(model.progress)}%</span> : <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+              {typeof model.progress !== 'number' && 'Downloading…'}
+            </span>
+          )}
+          {model.status === 'failed' && <span className="inline-flex items-center gap-1 text-[11px] text-aegis-error"><XCircle className="w-3.5 h-3.5" /> Failed</span>}
+          <button onClick={handleDelete} disabled={busy} className="p-1.5 rounded-md hover:bg-aegis-error/10 text-aegis-text-muted hover:text-aegis-error disabled:opacity-40 transition-colors">
+            {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+          </button>
+        </div>
       </div>
-      <div className="flex-shrink-0 flex items-center gap-2">
-        {model.status === 'downloaded' && <span className="inline-flex items-center gap-1 text-[11px] text-aegis-success"><CheckCircle2 className="w-3.5 h-3.5" /> Ready</span>}
-        {model.status === 'downloading' && <span className="inline-flex items-center gap-1 text-[11px] text-aegis-warning"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Downloading…</span>}
-        {model.status === 'failed' && <span className="inline-flex items-center gap-1 text-[11px] text-aegis-error"><XCircle className="w-3.5 h-3.5" /> Failed</span>}
-        <button onClick={handleDelete} disabled={busy} className="p-1.5 rounded-md hover:bg-aegis-error/10 text-aegis-text-muted hover:text-aegis-error disabled:opacity-40 transition-colors">
-          {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
-        </button>
-      </div>
+      {model.status === 'downloading' && typeof model.progress === 'number' && (
+        <div className="mt-2 h-1 w-full rounded-full bg-aegis-border overflow-hidden">
+          <div className="h-full rounded-full bg-aegis-warning transition-[width] duration-300 ease-out" style={{ width: `${Math.min(100, Math.max(0, model.progress))}%` }} />
+        </div>
+      )}
     </div>
   );
 }

@@ -108,6 +108,22 @@ def update_workflow(workflow_id: int, payload: WorkflowPayload, db: Session = De
     if not w:
         raise HTTPException(status_code=404, detail="Workflow not found.")
 
+    if w.seed_key:
+        # Same "a seeded row stays intact" principle as delete_workflow's
+        # own seed_key check below — a fresh install ships with this exact
+        # node set and seed.py's self-healing (SEED_VERSION bumps, a
+        # separate code path that writes graph_json directly, not through
+        # this endpoint) expects to find and update it in place. Editing a
+        # node's own settings, rewiring edges, or adding new nodes is still
+        # fine — only removing one of the original nodes is blocked.
+        current_ids = {n.get("id") for n in json.loads(w.graph_json).get("nodes", [])}
+        incoming_ids = {n.get("id") for n in payload.graph.get("nodes", [])}
+        if not current_ids.issubset(incoming_ids):
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{w.name}' is a default workflow — its steps can be reconfigured but not deleted.",
+            )
+
     new_graph_json = json.dumps(payload.graph)
     if new_graph_json != w.graph_json:
         # Snapshot the OUTGOING graph, not the incoming one — a version

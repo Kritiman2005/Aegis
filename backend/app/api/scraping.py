@@ -36,14 +36,44 @@ _install_state = {"status": "not_installed"}
 def get_status():
     if is_chromium_installed():
         _install_state["status"] = "ready"
-    return {"status": _install_state["status"]}
+    return {
+        "status": _install_state["status"],
+        "component": _install_state.get("component"),
+        "percent": _install_state.get("percent"),
+    }
 
 
 async def _run_install():
     _install_state["status"] = "installing"
     await ws_manager.broadcast_json({"type": "browser_install_progress", "status": "installing"})
-    ok, err = await anyio.to_thread.run_sync(install_chromium)
+
+    def on_progress(component: str, percent: float) -> None:
+        # Fires from install_chromium's own worker thread (this whole
+        # function runs via anyio.to_thread.run_sync below) — updated here
+        # too (not just broadcast) so a client that only loads/polls
+        # /status after missing the websocket message still sees real
+        # progress, not just "installing" with no number.
+        _install_state["component"] = component
+        _install_state["percent"] = percent
+        anyio.from_thread.run(
+            ws_manager.broadcast_json,
+            {"type": "browser_install_progress", "status": "installing", "component": component, "percent": percent},
+        )
+
+    ok, err = await anyio.to_thread.run_sync(lambda: install_chromium(on_progress))
+    # `playwright install chromium` also fetches its paired FFMPEG and
+    # Headless Shell builds — extra components this app's scraper never
+    # actually uses (is_chromium_installed only ever checks for the real
+    # browser). A hiccup on either of those two (confirmed live: a disk-
+    # space error partway through Headless Shell) makes the CLI report
+    # overall failure even though the one thing that actually matters —
+    # the real Chromium browser web_scrape drives — downloaded fine and is
+    # fully usable. Don't block a working scraper on that.
+    if not ok and is_chromium_installed():
+        ok = True
     _install_state["status"] = "ready" if ok else "failed"
+    _install_state.pop("component", None)
+    _install_state.pop("percent", None)
     await ws_manager.broadcast_json({
         "type": "browser_install_progress",
         "status": _install_state["status"],
@@ -65,19 +95,18 @@ async def start_install(background_tasks: BackgroundTasks):
 class ScrapeRequest(BaseModel):
     url: str
     conversation_id: str
-    cookie: str = ""
 
 
 _PREVIEW_CHARS = 4000
 
 
-async def _run_scrape(url: str, conversation_id: str, cookie: str = ""):
+async def _run_scrape(url: str, conversation_id: str):
     await ws_manager.broadcast_json({
         "type": "document_progress",
         "content": f"Opening {url} in a headless browser...",
     })
 
-    result = await scrape_url(url, cookie=cookie)
+    result = await scrape_url(url)
 
     if not result.success:
         await ws_manager.broadcast_json({
@@ -121,5 +150,5 @@ async def scrape(req: ScrapeRequest, background_tasks: BackgroundTasks):
     if not (url.startswith("http://") or url.startswith("https://")):
         raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
 
-    background_tasks.add_task(_run_scrape, url, req.conversation_id, req.cookie)
+    background_tasks.add_task(_run_scrape, url, req.conversation_id)
     return {"status": "started"}

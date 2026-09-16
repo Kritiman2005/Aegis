@@ -687,6 +687,19 @@ export default function WorkflowsView() {
   const [connectingChat, setConnectingChat] = useState(false);
   const [isIngestionHandler, setIsIngestionHandler] = useState(false);
   const [connectingIngestion, setConnectingIngestion] = useState(false);
+  // True while editing the built-in seeded workflow (Workflow.seed_key on
+  // the backend) — its steps can still be reconfigured or added to, but
+  // not removed (see NodeConfigPanel's onDelete below and PUT
+  // /api/workflows/{id}'s own seed_key check, which rejects this same
+  // thing server-side too in case a stale/direct API call bypasses this).
+  const [isSeeded, setIsSeeded] = useState(false);
+  // The default pipeline's own node ids, captured once at load — a ref
+  // (not state) since onNodesChange below reads it inside a useCallback
+  // that must stay referentially stable, and it never needs to trigger a
+  // re-render on its own. Guards React Flow's own default Backspace/Delete
+  // key handling on a selected node, which bypasses NodeConfigPanel's
+  // delete button (and its canDelete check) entirely.
+  const seededNodeIdsRef = useRef<Set<string>>(new Set());
   const [historyOpen, setHistoryOpen] = useState(false);
   const [runs, setRuns] = useState<WorkflowRunSummary[]>([]);
   const [loadingRuns, setLoadingRuns] = useState(false);
@@ -876,15 +889,18 @@ export default function WorkflowsView() {
     dbIdRef.current = w.id;
     setActiveId(w.id);
     setName(w.name);
-    setNodes((w.graph.nodes || []).map((n: Node) => ({
+    const loadedNodes = (w.graph.nodes || []).map((n: Node) => ({
       ...n,
       type: 'workflowNode',
       data: { kind: 'tool', isAi: false, ...n.data, status: 'idle' },
-    })));
+    }));
+    setNodes(loadedNodes);
     setEdges(w.graph.edges || []);
     setSelectedNodeId(null);
     setIsChatHandler(!!w.is_chat_handler);
     setIsIngestionHandler(!!w.is_ingestion_handler);
+    setIsSeeded(!!w.seed_key);
+    seededNodeIdsRef.current = w.seed_key ? new Set(loadedNodes.map((n: Node) => n.id)) : new Set();
   };
 
   const deleteWorkflow = async (w: WorkflowSummary) => {
@@ -911,6 +927,8 @@ export default function WorkflowsView() {
     setSelectedNodeId(null);
     setIsChatHandler(false);
     setIsIngestionHandler(false);
+    setIsSeeded(false);
+    seededNodeIdsRef.current = new Set();
   };
 
   const backToList = () => {
@@ -1026,7 +1044,14 @@ export default function WorkflowsView() {
     placeNode({ label: 'Embedding', kind: 'embedding', isAi: false, status: 'idle' });
   };
 
-  const onNodesChange = useCallback((changes: NodeChange[]) => setNodes(nds => applyNodeChanges(changes, nds)), []);
+  const onNodesChange = useCallback((changes: NodeChange[]) => {
+    // React Flow's own default Backspace/Delete key handling fires a
+    // 'remove' change for whatever node is selected — bypasses
+    // NodeConfigPanel's delete button (and its canDelete prop) entirely,
+    // so the default pipeline's own nodes need blocking here too.
+    const filtered = changes.filter(c => !(c.type === 'remove' && seededNodeIdsRef.current.has(c.id)));
+    setNodes(nds => applyNodeChanges(filtered, nds));
+  }, []);
   const onEdgesChange = useCallback((changes: EdgeChange[]) => setEdges(eds => applyEdgeChanges(changes, eds)), []);
   const onConnect = useCallback((conn: Connection) => setEdges(eds => addEdge({ ...conn, data: {}, markerEnd: { type: MarkerType.ArrowClosed } }, eds)), []);
 
@@ -1560,7 +1585,9 @@ export default function WorkflowsView() {
                   onOpenAegisDbBrowser={() => setAegisDbBrowserOpen(true)}
                   selectedTool={selectedTool}
                   onChange={updateSelectedNode}
+                  canDelete={!isSeeded}
                   onDelete={() => {
+                    if (isSeeded) return;
                     setNodes(prev => prev.filter(n => n.id !== selectedNodeId));
                     setEdges(prev => prev.filter(e => e.source !== selectedNodeId && e.target !== selectedNodeId));
                     setSelectedNodeId(null);
@@ -2088,7 +2115,7 @@ function NodeOutputColumn({ node, edges, nodes }: { node: Node; edges: Edge[]; n
 }
 
 function NodeConfigPanel({
-  data, isReplyGenerator, upstreamFieldSuggestions, tools, models, databases, embeddingModels, rerankerModels, extractionEngines, mcpExtractionTools, chunkingStrategies, aegisDbTables, chatSessions, onOpenAegisDbBrowser, selectedTool, onChange, onDelete,
+  data, isReplyGenerator, upstreamFieldSuggestions, tools, models, databases, embeddingModels, rerankerModels, extractionEngines, mcpExtractionTools, chunkingStrategies, aegisDbTables, chatSessions, onOpenAegisDbBrowser, selectedTool, onChange, onDelete, canDelete,
 }: {
   data: NodeData;
   // Only meaningful for kind "llm" — true when THIS node is the one whose
@@ -2118,15 +2145,26 @@ function NodeConfigPanel({
   selectedTool?: ToolDef;
   onChange: (patch: Partial<NodeData>) => void;
   onDelete: () => void;
+  // False while editing the built-in seeded workflow (WorkflowsView's
+  // isSeeded) — its steps can still be reconfigured, just not removed
+  // (PUT /api/workflows/{id} rejects a save that drops one of its
+  // original nodes too, in case this gets bypassed some other way).
+  canDelete: boolean;
 }) {
   const relationalDatabases = databases.filter(d => d.category === 'relational').sort((a, b) => (b.is_builtin ? 1 : 0) - (a.is_builtin ? 1 : 0));
   const vectorDatabases = databases.filter(d => d.category === 'vector').sort((a, b) => (b.is_builtin ? 1 : 0) - (a.is_builtin ? 1 : 0));
   const header = (
     <div className="flex items-center justify-between">
       <h3 className="text-xs font-bold text-aegis-text-primary">Step settings</h3>
-      <button onClick={onDelete} className="p-1 rounded hover:bg-aegis-error/10 text-aegis-text-muted hover:text-aegis-error">
-        <Trash2 className="w-3.5 h-3.5" />
-      </button>
+      {canDelete ? (
+        <button onClick={onDelete} className="p-1 rounded hover:bg-aegis-error/10 text-aegis-text-muted hover:text-aegis-error">
+          <Trash2 className="w-3.5 h-3.5" />
+        </button>
+      ) : (
+        <span title="Part of the default pipeline — can be reconfigured, but not deleted." className="p-1 text-aegis-text-muted/40 cursor-not-allowed">
+          <Trash2 className="w-3.5 h-3.5" />
+        </span>
+      )}
     </div>
   );
 

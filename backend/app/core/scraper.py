@@ -25,7 +25,7 @@ import os
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -100,10 +100,36 @@ def is_chromium_installed() -> bool:
     return any(BROWSERS_DIR.glob("chromium*/**/chrome")) or any(BROWSERS_DIR.glob("chromium*/**/*.app"))
 
 
-def install_chromium() -> tuple[bool, str]:
+import re
+
+# Matches a line of Playwright CLI's own progress bar, e.g.
+# "|■■■■■■■■                            |  10% of 159.6 MiB" — confirmed
+# against the CLI's real output (playwright/driver/package/cli.js), not
+# guessed: percent and the component's total size, both as plain integers/
+# floats with no other formatting to strip.
+_PROGRESS_LINE_RE = re.compile(r"\|.*\|\s*(\d+)%\s+of\s+([\d.]+)\s*MiB")
+# Matches the header line Playwright prints once per component before its
+# own progress bar starts, e.g. "Downloading Chromium 143.0.7499.4
+# (playwright build v1200)\x1b[2m from https://...". `install chromium`
+# actually fetches THREE components in sequence (Chromium itself, its
+# paired FFMPEG build, and Chromium Headless Shell) — confirmed by running
+# a real install and capturing its raw stdout — so a caller sees this fire
+# up to three times, each restarting that component's own 0-100%.
+_DOWNLOADING_HEADER_RE = re.compile(r"^Downloading ([^\x1b(]+)")
+
+
+def install_chromium(on_progress: Optional[Callable[[str, float], None]] = None) -> tuple[bool, str]:
     """
-    Blocking — downloads the Chromium browser binary. Callers must run this
-    off the event loop (e.g. via anyio.to_thread.run_sync).
+    Blocking — downloads the Chromium browser binary (plus its paired FFMPEG
+    and Headless Shell builds, both required alongside it). Callers must run
+    this off the event loop (e.g. via anyio.to_thread.run_sync).
+
+    on_progress(component_name, percent), if given, is called for every
+    progress-bar line Playwright's CLI prints on its own stdout — see
+    _PROGRESS_LINE_RE/_DOWNLOADING_HEADER_RE's docstrings for the exact
+    format this was verified against. Purely additive: install_chromium's
+    success/failure behavior is identical whether or not a callback is
+    passed.
 
     Deliberately does NOT shell out to `sys.executable -m playwright install`:
     inside a PyInstaller-frozen app, sys.executable is the frozen app binary
@@ -118,15 +144,28 @@ def install_chromium() -> tuple[bool, str]:
     try:
         from playwright._impl._driver import compute_driver_executable, get_driver_env
         node_path, cli_path = compute_driver_executable()
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [node_path, cli_path, "install", "chromium"],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=900,
+            bufsize=1,
             env={**get_driver_env(), "PLAYWRIGHT_BROWSERS_PATH": str(BROWSERS_DIR)},
         )
+        output_lines: List[str] = []
+        current_component = "Chromium"
+        for line in proc.stdout:
+            output_lines.append(line)
+            header_match = _DOWNLOADING_HEADER_RE.match(line)
+            if header_match:
+                current_component = header_match.group(1).strip()
+                continue
+            progress_match = _PROGRESS_LINE_RE.search(line)
+            if progress_match and on_progress:
+                on_progress(current_component, float(progress_match.group(1)))
+        proc.wait(timeout=900)
         if proc.returncode != 0:
-            return False, (proc.stderr or proc.stdout)[-2000:]
+            return False, "".join(output_lines)[-2000:]
         return True, ""
     except Exception as e:
         return False, str(e)

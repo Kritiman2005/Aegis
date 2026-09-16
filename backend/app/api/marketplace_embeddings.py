@@ -84,29 +84,86 @@ def delete_installed(model_row_id: int, db: Session = Depends(get_db)):
     return {"message": f"Deleted '{row.display_name}'."}
 
 
+# In-memory current-progress-by-row, read by list_installed below so
+# MarketplaceView's existing "poll the list every 2.5s while anything is
+# downloading" mechanism (no websocket wiring in that component at all)
+# picks up real numbers for free, with no frontend plumbing beyond reading
+# a couple of extra fields. Cleared once a row leaves "downloading" either
+# way — a stale leftover here would otherwise silently reappear if the
+# same row id were ever reused.
+_progress_by_row: Dict[int, Dict[str, Any]] = {}
+
+
 async def _download_task(row_id: int, model_id: str, cache_dir: str, backend: str = "fastembed") -> None:
     async def broadcast(status: str, **kwargs) -> None:
+        if status == "running" and "downloaded_bytes" in kwargs:
+            _progress_by_row[row_id] = kwargs
+        else:
+            _progress_by_row.pop(row_id, None)
         await manager.broadcast_json({"type": "embedding_download_progress", "model_row_id": row_id, "status": status, **kwargs})
 
     await broadcast("running", message=f"Downloading {model_id}…")
     try:
+        import asyncio
         import anyio
+        from app.core.hf_download_progress import DownloadProgressPoller, get_expected_total_bytes
+
+        loop = asyncio.get_running_loop()
+
+        async def on_progress(downloaded: int, total: int) -> None:
+            await broadcast("running", downloaded_bytes=downloaded, total_bytes=total, progress=round(downloaded / total * 100, 1))
 
         real_dim: Optional[int] = None
         if backend == "sentence_transformers":
             from sentence_transformers import SentenceTransformer
-            # A custom repo's true embedding dimension isn't known until the
-            # model's actually loaded — the row started with a 0 placeholder
-            # (see download_model below), filled in here.
-            st_model = await anyio.to_thread.run_sync(lambda: SentenceTransformer(model_id, cache_folder=cache_dir))
+
+            # Real progress: huggingface_hub exposes no byte-level progress
+            # callback through its public API (see hf_download_progress.py's
+            # module docstring for why) — poll the cache dir on disk instead
+            # while SentenceTransformer's own download runs. This path is a
+            # fully custom repo (no catalog entry, hence no known real
+            # size to fall back on like marketplace_rerankers.py does) — a
+            # repo carrying redundant alternate formats (TF/ONNX/multiple
+            # precisions) SentenceTransformer's loader never touches can
+            # make this an overestimate, same risk documented there.
+            total = await anyio.to_thread.run_sync(lambda: get_expected_total_bytes(model_id))
+            poller = DownloadProgressPoller(cache_dir, model_id, total, on_progress, loop)
+            poller.start()
+            try:
+                # A custom repo's true embedding dimension isn't known until
+                # the model's actually loaded — the row started with a 0
+                # placeholder (see download_model below), filled in here.
+                st_model = await anyio.to_thread.run_sync(lambda: SentenceTransformer(model_id, cache_folder=cache_dir))
+            finally:
+                poller.stop()
             real_dim = st_model.get_sentence_embedding_dimension()
         else:
             from fastembed import TextEmbedding
 
-            # fastembed's own downloader has no granular progress callback to
-            # hook into (unlike models_hub.py's GGUF downloader) — this is a
-            # single blocking step reported as running -> complete/failed,
-            # not a percentage bar.
+            # Same polling approach, sized to fastembed's OWN file selection
+            # (config/tokenizer files + this model's specific model_file/
+            # additional_files — not the whole repo, which can also contain
+            # quantizations fastembed never touches) so the percentage
+            # tracks exactly what's actually being downloaded, not more.
+            catalog_entry = next(
+                (m for m in TextEmbedding.list_supported_models() if m["model"] == model_id), None
+            )
+            if catalog_entry:
+                hf_source = catalog_entry["sources"]["hf"]
+                allow_filenames = [
+                    "config.json", "tokenizer.json", "tokenizer_config.json",
+                    "special_tokens_map.json", "preprocessor_config.json",
+                    catalog_entry["model_file"], *catalog_entry["additional_files"],
+                ]
+                total = await anyio.to_thread.run_sync(lambda: get_expected_total_bytes(hf_source, allow_filenames))
+                poller = DownloadProgressPoller(cache_dir, hf_source, total, on_progress, loop)
+                poller.start()
+                try:
+                    await anyio.to_thread.run_sync(lambda: TextEmbedding.download_files_from_huggingface(
+                        hf_source, cache_dir=cache_dir, extra_patterns=[catalog_entry["model_file"], *catalog_entry["additional_files"]],
+                    ))
+                finally:
+                    poller.stop()
             await anyio.to_thread.run_sync(lambda: TextEmbedding(model_name=model_id, cache_dir=cache_dir))
 
         with SessionLocal() as db:
@@ -116,6 +173,7 @@ async def _download_task(row_id: int, model_id: str, cache_dir: str, backend: st
                 if real_dim:
                     row.dim = real_dim
                 db.commit()
+        _progress_by_row.pop(row_id, None)
         await manager.broadcast_json({"type": "embedding_download_complete", "model_row_id": row_id})
 
     except Exception as e:
@@ -126,6 +184,7 @@ async def _download_task(row_id: int, model_id: str, cache_dir: str, backend: st
                 row.status = "failed"
                 row.error_message = str(e)
                 db.commit()
+        _progress_by_row.pop(row_id, None)
         await manager.broadcast_json({"type": "embedding_download_failed", "model_row_id": row_id, "message": str(e)})
 
 
@@ -175,4 +234,8 @@ def _serialize(row: EmbeddingModelRegistry) -> Dict[str, Any]:
         "status": row.status,
         "error_message": row.error_message,
         "created_at": row.created_at.isoformat() if row.created_at else None,
+        # Real download progress, when this row is currently downloading —
+        # see _progress_by_row's own docstring for why this rides on the
+        # existing polled list instead of a websocket. Absent otherwise.
+        **_progress_by_row.get(row.id, {}),
     }

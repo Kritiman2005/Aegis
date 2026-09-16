@@ -19,6 +19,7 @@ import {
   Mic,
   Square,
   Download,
+  Globe,
 } from 'lucide-react';
 import { type ChatMessage, type ConnectionStatus, type Attachment } from '@/hooks/useSocket';
 import { useAppSelector } from '@/hooks/useStore';
@@ -272,6 +273,16 @@ export default function ChatView({
   const [scrapeBarOpen, setScrapeBarOpen] = useState(false);
   const [scrapeUrl, setScrapeUrl] = useState('');
   const [isScraping, setIsScraping] = useState(false);
+  // First scrape ever needs a one-time Chromium download (~250MB) — off by
+  // default (see backend app/api/documents.py's upload endpoint for the
+  // equivalent image-upload gate) so a fresh install doesn't eat that cost
+  // for a user who never scrapes. Real per-component progress (Chromium
+  // itself, then its paired FFMPEG and Headless Shell builds) parsed
+  // straight from Playwright's own CLI output — see backend
+  // app/core/scraper.py's install_chromium.
+  const [browserInstall, setBrowserInstall] = useState<{ status: 'installing' | 'failed'; component?: string; percent?: number; error?: string } | null>(null);
+  const installSocketRef = useRef<WebSocket | null>(null);
+  useEffect(() => () => { installSocketRef.current?.close(); }, []);
 
   // "+" > Export: picks the format up front instead of relying on the
   // agent to guess export intent from free text. Chat Mode only — Agent
@@ -326,26 +337,76 @@ export default function ChatView({
     const url = scrapeUrl.trim();
     if (!url || !sessionId) return;
     setIsScraping(true);
+    setBrowserInstall(null);
+
+    let res: Response;
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/scrape`, {
+      res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/scrape`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url, conversation_id: sessionId }),
       });
-      if (!res.ok) {
-        onSendMessage('[System] Failed to start scraping that page.', 'toast');
-      }
-      // Same deal as document upload: the backend broadcasts real progress
-      // ("Opening..." -> "✅ Scraped..." / "❌ ...") over the websocket, so we
-      // don't post an assumed-success message here.
     } catch (err) {
       console.error(err);
       onSendMessage('[System] Failed to connect to the scraping endpoint.', 'toast');
-    } finally {
       setIsScraping(false);
       setScrapeUrl('');
       setScrapeBarOpen(false);
+      return;
     }
+
+    // 409 = the headless browser this needs has never been installed (see
+    // backend app/api/documents.py's upload endpoint for the equivalent
+    // gate on images) — this used to just be a dead end (a generic
+    // "failed" toast, no way to actually install it from the UI at all).
+    // Install it now, with real progress, then automatically retry this
+    // exact scrape the moment it's ready — a one-time ~250MB cost, not
+    // something the user should have to notice or retry by hand.
+    if (res.status === 409) {
+      installBrowserThenRetry();
+      return;
+    }
+
+    if (!res.ok) {
+      onSendMessage('[System] Failed to start scraping that page.', 'toast');
+    }
+    // Same deal as document upload: the backend broadcasts real progress
+    // ("Opening..." -> "✅ Scraped..." / "❌ ...") over the websocket, so we
+    // don't post an assumed-success message here.
+    setIsScraping(false);
+    setScrapeUrl('');
+    setScrapeBarOpen(false);
+  };
+
+  const installBrowserThenRetry = () => {
+    setBrowserInstall({ status: 'installing' });
+    const wsUrl = (process.env.NEXT_PUBLIC_WS_URL || 'ws://127.0.0.1:8000/ws') + `?client_id=scrape-install-${Date.now()}`;
+    const ws = new WebSocket(wsUrl);
+    installSocketRef.current = ws;
+    ws.onmessage = (event) => {
+      let msg: any;
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (msg.type !== 'browser_install_progress') return;
+      if (msg.status === 'installing') {
+        setBrowserInstall({ status: 'installing', component: msg.component, percent: msg.percent });
+      } else if (msg.status === 'ready') {
+        ws.close();
+        setBrowserInstall(null);
+        handleScrapeSubmit();
+      } else if (msg.status === 'failed') {
+        ws.close();
+        setIsScraping(false);
+        setBrowserInstall({ status: 'failed', error: msg.error || 'Could not set up the browser for scraping.' });
+      }
+    };
+    fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/scrape/install`, { method: 'POST' }).catch(() => {
+      setIsScraping(false);
+      setBrowserInstall({ status: 'failed', error: 'Could not reach the backend.' });
+    });
   };
 
   // Voice input (mic button) — local speech-to-text via faster-whisper.
@@ -780,6 +841,68 @@ export default function ChatView({
           </div>
         )}
 
+        {scrapeBarOpen && (
+          <div className="mb-2 bg-aegis-raised border border-aegis-border rounded-xl px-3 py-2.5">
+            {browserInstall ? (
+              browserInstall.status === 'installing' ? (
+                <div>
+                  <div className="flex items-center gap-2 text-[12px] text-aegis-text-secondary">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-aegis-primary-light flex-shrink-0" />
+                    <span className="truncate">
+                      Setting up the browser for scraping (one-time, ~250MB)
+                      {browserInstall.component ? ` — ${browserInstall.component}` : ''}
+                    </span>
+                    {typeof browserInstall.percent === 'number' && (
+                      <span className="ml-auto flex-shrink-0 font-semibold tabular-nums text-aegis-primary-light">{Math.round(browserInstall.percent)}%</span>
+                    )}
+                  </div>
+                  {typeof browserInstall.percent === 'number' && (
+                    <div className="mt-2 h-1 w-full rounded-full bg-aegis-border overflow-hidden">
+                      <div
+                        className="h-full rounded-full bg-aegis-primary transition-[width] duration-300 ease-out"
+                        style={{ width: `${Math.min(100, Math.max(0, browserInstall.percent))}%` }}
+                      />
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-[12px] text-aegis-error truncate">{browserInstall.error}</p>
+                  <div className="flex-shrink-0 flex items-center gap-2">
+                    <button onClick={handleScrapeSubmit} className="text-[11px] font-semibold text-aegis-primary-light hover:underline">Retry</button>
+                    <button onClick={() => { setBrowserInstall(null); setScrapeBarOpen(false); }} className="text-aegis-text-muted hover:text-aegis-error p-0.5">
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              )
+            ) : (
+              <div className="flex items-center gap-2">
+                <Globe className="w-3.5 h-3.5 text-aegis-primary-light flex-shrink-0" />
+                <input
+                  autoFocus
+                  value={scrapeUrl}
+                  onChange={(e) => setScrapeUrl(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter' && !isScraping) { e.preventDefault(); handleScrapeSubmit(); } if (e.key === 'Escape') setScrapeBarOpen(false); }}
+                  placeholder="Paste a URL to scrape…"
+                  disabled={isScraping}
+                  className="flex-1 min-w-0 bg-transparent text-[13px] text-aegis-text-primary placeholder:text-aegis-text-muted focus:outline-none disabled:opacity-50"
+                />
+                <button
+                  onClick={handleScrapeSubmit}
+                  disabled={isScraping || !scrapeUrl.trim()}
+                  className="flex-shrink-0 text-[12px] font-semibold text-white bg-aegis-primary hover:bg-aegis-primary-dark disabled:opacity-40 px-2.5 py-1 rounded-lg transition-colors"
+                >
+                  {isScraping ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : 'Scrape'}
+                </button>
+                <button onClick={() => setScrapeBarOpen(false)} disabled={isScraping} className="flex-shrink-0 text-aegis-text-muted hover:text-aegis-error p-0.5 disabled:opacity-40">
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
         <div className="relative bg-aegis-raised border border-aegis-border rounded-2xl shadow-sm focus-within:ring-1 focus-within:border-aegis-primary focus-within:ring-aegis-primary transition-all">
           <textarea
             ref={textareaRef}
@@ -827,6 +950,14 @@ export default function ChatView({
                     >
                       <Paperclip className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
                       <span className="whitespace-nowrap">Upload Document</span>
+                    </button>
+
+                    <button
+                      onClick={() => { setAttachMenuOpen(false); setScrapeBarOpen(true); }}
+                      className="w-full flex items-center gap-2.5 px-3.5 py-2 text-[13px] text-aegis-text-primary hover:bg-aegis-overlay transition-colors"
+                    >
+                      <Globe className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
+                      <span className="whitespace-nowrap">Scrape a Webpage</span>
                     </button>
 
                     {/* Export — one "Export" row expands to the PDF/DOCX/XLSX

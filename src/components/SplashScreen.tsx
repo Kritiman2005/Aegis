@@ -39,12 +39,20 @@ interface SplashScreenProps {
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
 
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(0)} MB`;
+  return `${(bytes / 1024).toFixed(0)} KB`;
+}
+
 export default function SplashScreen({ onReady, onGoToLLMPanel, onBackendReachable }: SplashScreenProps) {
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [backendReachable, setBackendReachable] = useState(false);
   const [recommendation, setRecommendation] = useState<Recommendation | null>(null);
   const [downloadState, setDownloadState] = useState<'idle' | 'downloading' | 'failed'>('idle');
+  const [downloadProgress, setDownloadProgress] = useState<{ percent: number; downloadedBytes: number; totalBytes: number } | null>(null);
   const downloadPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const downloadSocketRef = useRef<WebSocket | null>(null);
 
   // Dedicated logo-build moment before anything else on the splash screen
   // appears — the mark's 8 blocks pop in one by one (see AegisMark's
@@ -140,12 +148,16 @@ export default function SplashScreen({ onReady, onGoToLLMPanel, onBackendReachab
       .catch(() => {});
   }, [noModel, recommendation]);
 
-  useEffect(() => () => { if (downloadPollRef.current) clearInterval(downloadPollRef.current); }, []);
+  useEffect(() => () => {
+    if (downloadPollRef.current) clearInterval(downloadPollRef.current);
+    downloadSocketRef.current?.close();
+  }, []);
 
   const handleDownloadRecommended = useCallback(() => {
     if (!recommendation) return;
     const { repo_id, filename } = recommendation.model;
     setDownloadState('downloading');
+    setDownloadProgress(null);
 
     fetch(`${API_BASE}/api/hub/download`, {
       method: 'POST',
@@ -153,9 +165,44 @@ export default function SplashScreen({ onReady, onGoToLLMPanel, onBackendReachab
       body: JSON.stringify({ repo_id, filename }),
     }).catch(() => {});
 
-    // No websocket connection exists yet at this point in the boot sequence —
-    // poll the same downloaded-models list the rest of the app uses instead of
-    // wiring in useSocket just for this one screen.
+    // Real progress — the backend already broadcasts download_progress
+    // (percent + byte counts) over the same WebSocket every chat connection
+    // uses; a plain throwaway client_id here (not useSocket, which also
+    // pulls in a Redux session and would mint a real chat session this
+    // early in boot) is enough to receive it. One reconnect attempt if it
+    // drops mid-download — the point of showing this at all is a slow/flaky
+    // connection, exactly where a socket is likeliest to hiccup — but the
+    // poll below is the actual source of truth for completion either way,
+    // so a permanently-dead socket just means the percentage stops moving,
+    // never a stuck screen.
+    let reconnected = false;
+    const connect = () => {
+      const wsUrl = (process.env.NEXT_PUBLIC_WS_URL || 'ws://127.0.0.1:8000/ws') + `?client_id=splash-${Date.now()}`;
+      const ws = new WebSocket(wsUrl);
+      downloadSocketRef.current = ws;
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.repo_id !== repo_id || msg.filename !== filename) return;
+          if (msg.type === 'download_progress') {
+            setDownloadProgress({ percent: msg.progress ?? 0, downloadedBytes: msg.downloaded_bytes ?? 0, totalBytes: msg.total_bytes ?? 0 });
+          } else if (msg.type === 'download_complete') {
+            setDownloadProgress(p => p ? { ...p, percent: 100 } : p);
+          }
+        } catch {
+          // not JSON, or not a shape we care about — ignore
+        }
+      };
+      ws.onclose = () => {
+        if (!reconnected && downloadPollRef.current) {
+          reconnected = true;
+          setTimeout(connect, 2000);
+        }
+      };
+    };
+    connect();
+
+    // Source of truth for completion/failure — unchanged from before.
     downloadPollRef.current = setInterval(async () => {
       try {
         const res = await fetch(`${API_BASE}/api/hub/downloaded`, { cache: 'no-store' });
@@ -165,9 +212,11 @@ export default function SplashScreen({ onReady, onGoToLLMPanel, onBackendReachab
         );
         if (match?.status === 'downloaded') {
           if (downloadPollRef.current) clearInterval(downloadPollRef.current);
+          downloadSocketRef.current?.close();
           onReady();
         } else if (match?.status === 'failed') {
           if (downloadPollRef.current) clearInterval(downloadPollRef.current);
+          downloadSocketRef.current?.close();
           setDownloadState('failed');
         }
       } catch {
@@ -262,12 +311,32 @@ export default function SplashScreen({ onReady, onGoToLLMPanel, onBackendReachab
 
             <div className="bg-aegis-raised rounded-2xl border border-aegis-border overflow-hidden mb-4">
               {downloadState === 'downloading' ? (
-                <div className="flex items-center gap-3 px-4 py-4">
-                  <Loader2 className="w-4 h-4 animate-spin text-aegis-primary-light flex-shrink-0" />
-                  <div className="min-w-0">
-                    <p className="text-sm font-semibold text-aegis-text-primary truncate">{recommendation?.model.display_name}</p>
-                    <p className="text-xs text-aegis-text-muted mt-0.5">This can take a few minutes depending on your connection.</p>
+                <div className="px-4 py-4">
+                  <div className="flex items-center gap-3">
+                    {downloadProgress ? (
+                      <span className="text-xs font-bold text-aegis-primary-light flex-shrink-0 w-9 text-right tabular-nums">
+                        {Math.round(downloadProgress.percent)}%
+                      </span>
+                    ) : (
+                      <Loader2 className="w-4 h-4 animate-spin text-aegis-primary-light flex-shrink-0" />
+                    )}
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-semibold text-aegis-text-primary truncate">{recommendation?.model.display_name}</p>
+                      <p className="text-xs text-aegis-text-muted mt-0.5">
+                        {downloadProgress && downloadProgress.totalBytes > 0
+                          ? `${formatBytes(downloadProgress.downloadedBytes)} of ${formatBytes(downloadProgress.totalBytes)}`
+                          : 'This can take a few minutes depending on your connection.'}
+                      </p>
+                    </div>
                   </div>
+                  {downloadProgress && (
+                    <div className="mt-3 h-1.5 w-full rounded-full bg-aegis-border overflow-hidden">
+                      <div
+                        className="h-full rounded-full bg-aegis-primary transition-[width] duration-300 ease-out"
+                        style={{ width: `${Math.min(100, Math.max(0, downloadProgress.percent))}%` }}
+                      />
+                    </div>
+                  )}
                 </div>
               ) : recommendation ? (
                 <div className="px-4 py-4 space-y-1.5">
