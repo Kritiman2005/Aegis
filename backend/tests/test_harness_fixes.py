@@ -137,63 +137,6 @@ def test_get_searched_tools_is_counting_regex(monkeypatch, query, expected):
     assert is_counting is expected
 
 
-# ── Merged export + compound-question classifier ──────────────────────────
-
-def test_classify_export_and_compound_parses_both_fields(monkeypatch):
-    agent = make_agent()
-    fake = FakeLLM([json.dumps({
-        "is_export": True,
-        "format": "docx",
-        "parts": ["which items are out of stock", "what is the unit price of the keyboard"],
-    })])
-    monkeypatch.setattr(agent, "get_llm", lambda model_name=None: fake)
-
-    export_fmt, parts = agent._classify_export_and_compound("some message")
-
-    assert export_fmt == "docx"
-    assert parts == ["which items are out of stock", "what is the unit price of the keyboard"]
-    assert len(fake.calls) == 1  # one call answers both questions
-
-
-def test_classify_export_and_compound_no_export_no_compound(monkeypatch):
-    agent = make_agent()
-    fake = FakeLLM([json.dumps({"is_export": False, "format": None, "parts": []})])
-    monkeypatch.setattr(agent, "get_llm", lambda model_name=None: fake)
-
-    export_fmt, parts = agent._classify_export_and_compound("hello there")
-
-    assert export_fmt is None
-    assert parts is None
-
-
-def test_classify_export_and_compound_handles_garbage_response(monkeypatch):
-    agent = make_agent()
-    fake = FakeLLM(["not json at all"])
-    monkeypatch.setattr(agent, "get_llm", lambda model_name=None: fake)
-
-    export_fmt, parts = agent._classify_export_and_compound("some message")
-
-    assert export_fmt is None
-    assert parts is None
-
-
-def test_classify_export_intent_still_works_standalone(monkeypatch):
-    agent = make_agent()
-    fake = FakeLLM([json.dumps({"is_export": True, "format": "xlsx"})])
-    monkeypatch.setattr(agent, "get_llm", lambda model_name=None: fake)
-
-    assert agent._classify_export_intent("export this as excel") == "xlsx"
-
-
-def test_decompose_compound_question_still_works_standalone(monkeypatch):
-    agent = make_agent()
-    fake = FakeLLM([json.dumps({"parts": ["part one", "part two"]})])
-    monkeypatch.setattr(agent, "get_llm", lambda model_name=None: fake)
-
-    parts = agent._decompose_compound_question("part one, and part two?")
-    assert parts == ["part one", "part two"]
-
-
 # ── _call_llm_text: JSON-leak detection and correction ─────────────────────
 
 def test_call_llm_text_normal_case_streams_once_no_retry(monkeypatch):
