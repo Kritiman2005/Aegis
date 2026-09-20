@@ -54,6 +54,7 @@
         "zip"
       ],
       "hardenedRuntime": true,
+      "notarize": true,
       "entitlements": "packaging/mac/entitlements.mac.plist",
       "entitlementsInherit": "packaging/mac/entitlements.mac.plist",
       "gatekeeperAssess": false
