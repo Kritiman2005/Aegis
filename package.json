@@ -54,7 +54,9 @@
         "zip"
       ],
       "hardenedRuntime": true,
-      "notarize": true,
+      "notarize": {
+        "teamId": "2BVGWQPJ6S"
+      },
       "entitlements": "packaging/mac/entitlements.mac.plist",
       "entitlementsInherit": "packaging/mac/entitlements.mac.plist",
       "gatekeeperAssess": false
