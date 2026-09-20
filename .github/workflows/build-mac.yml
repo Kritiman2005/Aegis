@@ -1,0 +1,171 @@
+name: Build macOS App
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-mac:
+    # Apple Silicon runner — matches this app's arm64 target (same arch the
+    # local dev builds have been producing). If Intel Mac support is ever
+    # needed, that's a second job with runs-on: macos-13 (last Intel image)
+    # and its own upload, not a flag on this one.
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Node.js ──────────────────────────────────────────────────────────────
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install NPM Dependencies
+        run: npm install
+
+      # ── Python ───────────────────────────────────────────────────────────────
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python Dependencies
+        working-directory: backend
+        run: |
+          pip install --upgrade pip
+          pip install -r ../requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pyinstaller
+
+      # ── Backend test suite ──────────────────────────────────────────────────
+      # Same reasoning as build-windows.yml's matching step: fail fast on a
+      # real regression before paying for the much slower PyInstaller build
+      # below. SKIP_LIVE_LLM_TESTS skips the real-model tests in
+      # tests/test_harness_fixes_live.py — no model is downloaded in this job.
+      - name: Install Test Dependencies
+        working-directory: backend
+        run: pip install pytest pytest-asyncio
+
+      - name: Run Backend Tests
+        working-directory: backend
+        env:
+          SKIP_LIVE_LLM_TESTS: "1"
+        run: python -m pytest tests/ -v
+
+      # ── Bundle the Whisper model into the app itself (see
+      # app/core/transcription.py) — main.spec's Analysis step fails loudly
+      # if this hasn't run, so it must happen before pyinstaller.
+      - name: Download bundled Whisper model
+        working-directory: backend
+        run: python scripts/download_whisper_model.py
+
+      # ── Build Python sidecar — run from backend/ where main.spec lives ────────
+      - name: Build Python Sidecar
+        working-directory: backend
+        run: pyinstaller main.spec
+
+      # ── Smoke test ────────────────────────────────────────────────────────────
+      - name: Smoke Test Python Binary
+        run: |
+          export AEGIS_DATA_DIR="$PWD/test_data"
+          mkdir -p "$AEGIS_DATA_DIR"
+
+          ./backend/dist/main/main > backend_stdout.log 2> backend_stderr.log &
+          PID=$!
+
+          success=0
+          for i in $(seq 1 15); do
+            if ! kill -0 $PID 2>/dev/null; then
+              echo "=== BACKEND STDERR ==="; cat backend_stderr.log
+              echo "=== BACKEND STDOUT ==="; cat backend_stdout.log
+              echo "Backend exited prematurely" >&2
+              exit 1
+            fi
+            if curl -sf http://127.0.0.1:8000/api/health -o /dev/null; then
+              echo "Backend healthy after $((i * 2))s"
+              success=1
+              break
+            fi
+            echo "Waiting... attempt $i"
+            sleep 2
+          done
+
+          kill $PID 2>/dev/null || true
+
+          if [ "$success" -ne 1 ]; then
+            echo "=== BACKEND STDERR ==="; cat backend_stderr.log
+            echo "=== BACKEND STDOUT ==="; cat backend_stdout.log
+            echo "Backend did not respond in 30 seconds" >&2
+            exit 1
+          fi
+
+      # ── Smoke test: actually load a model through llama-cpp-python ────────────
+      # Same reasoning as build-windows.yml's matching step: proves a real
+      # model load + inference call works in the packaged binary, not just
+      # that the process starts — using the same ~1MB public test GGUF
+      # llama.cpp's own CI uses.
+      - name: Download tiny GGUF test model
+        run: |
+          mkdir -p test_data
+          curl -sL "https://huggingface.co/ggml-org/models-moved/resolve/main/tinyllamas/stories260K.gguf" -o test_data/stories260K.gguf
+
+      - name: Smoke Test llama_cpp Model Load
+        run: |
+          export AEGIS_DATA_DIR="$PWD/test_data"
+          output=$(./backend/dist/main/main selftest_llama test_data/stories260K.gguf 2>&1)
+          exit_code=$?
+          echo "$output"
+          if [ "$exit_code" -ne 0 ] || ! echo "$output" | grep -q "SELFTEST_LLAMA_OK"; then
+            echo "llama_cpp failed to load a model inside the packaged binary — the native library likely wasn't bundled correctly by PyInstaller." >&2
+            exit 1
+          fi
+
+      # ── Build frontend + electron ─────────────────────────────────────────────
+      - name: Build Next.js static export
+        run: npx next build
+        env:
+          NODE_ENV: production
+
+      - name: Compile Electron main process
+        run: npx tsc -p electron/tsconfig.json
+
+      # ── Package, code-sign (hardened runtime + entitlements — already
+      # configured in package.json's build.mac block) and notarize ──────────
+      # CSC_LINK here is the base64-encoded .p12 itself (electron-builder
+      # accepts base64 directly, not just a file path/URL) — set via
+      # `gh secret set CSC_LINK < cert_base64.txt`. electron-builder creates
+      # its own temporary keychain and imports it automatically; nothing
+      # else in this job touches the certificate. Notarization runs
+      # automatically (built into electron-builder 24.x via @electron/notarize)
+      # once APPLE_ID/APPLE_APP_SPECIFIC_PASSWORD/APPLE_TEAM_ID are present —
+      # no separate notarize step needed.
+      - name: Package, sign & notarize macOS app
+        run: npx electron-builder --mac
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      # Short retention this time — a signed .dmg/.zip here is only for
+      # pulling down and testing/releasing manually; it isn't meant to sit
+      # in Actions storage for months. See the "Aegis-Windows-Exe" cleanup
+      # this same lesson came from: 9 stale ~800MB artifacts silently filled
+      # the account's entire 2GB Actions storage quota. 5 days is enough
+      # time to grab a build after a push without letting it accumulate.
+      - name: Upload macOS Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aegis-macOS-arm64
+          path: |
+            release/*.dmg
+            release/*.zip
+          retention-days: 5
