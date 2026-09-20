@@ -1,41 +1,29 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Cpu, Zap, BrainCircuit, ShieldAlert, AlertTriangle, Play, RefreshCw, HardDrive, Database, CircleSlash, Check, LogOut, Trash2 } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Cpu, AlertTriangle, RefreshCw, HardDrive, Database, CircleSlash, Check, LogOut, Trash2 } from 'lucide-react';
 import toast from 'react-hot-toast';
+
+interface OtherLoadedModel {
+  name: string;
+  display_name: string;
+  max_context: number;
+  used_by_workflows: string[];
+}
 
 interface HardwareStatus {
   active_model: string;
   active_model_display?: string;
   max_context: number;
+  other_loaded_models?: OtherLoadedModel[];
   ram_total_gb: number;
   ram_used_gb: number;
   ram_percent: number;
 }
 
-// One shared config for both Chat and the Agent — same underlying LLM, so
-// there's no reason to make the user tune identical knobs twice. Chat's
-// backend schema still carries `max_rag_chunks` (Agent's doesn't use RAG),
-// which this UI has no control for — it's just carried through unedited on
-// save so persisting the shared values never fails Chat's validation.
-interface UnifiedConfig {
-  max_history_messages: number;
-  max_msg_chars: number;
-  max_output_tokens: number;
-  max_result_snippet: number;
-  max_rag_chunks: number;
-}
-
 export default function ContextMemoryHub() {
   const [hardware, setHardware] = useState<HardwareStatus | null>(null);
-  const [config, setConfig] = useState<UnifiedConfig>({
-    max_history_messages: 20,
-    max_msg_chars: 4000,
-    max_output_tokens: 5120,
-    max_result_snippet: 2000,
-    max_rag_chunks: 5,
-  });
 
   const [downloadedModels, setDownloadedModels] = useState<any[]>([]);
-  const [unloading, setUnloading] = useState(false);
+  const [unloadingModelId, setUnloadingModelId] = useState<number | null>(null);
   const [loadingModelId, setLoadingModelId] = useState<number | null>(null);
   const [deletingModelId, setDeletingModelId] = useState<number | null>(null);
   // Deleting a model is consequential (re-downloading can mean gigabytes
@@ -46,7 +34,6 @@ export default function ContextMemoryHub() {
 
   useEffect(() => {
     fetchHardware();
-    fetchConfig();
     fetchDownloadedModels();
     const interval = setInterval(fetchHardware, 10000);
     return () => clearInterval(interval);
@@ -59,7 +46,7 @@ export default function ContextMemoryHub() {
         const data = await res.json();
         setDownloadedModels(data.models || []);
       }
-    } catch (e) {}
+    } catch (e) { toast.error('Could not load downloaded models.'); }
   };
 
   const fetchHardware = async () => {
@@ -73,38 +60,21 @@ export default function ContextMemoryHub() {
     }
   };
 
-  // Read-only here now — Max Response Length feeds the RAM/latency estimate
-  // below, but editing it (along with the rest of the Memory & Context
-  // settings) moved to the reply-generation "llm" node's own config panel
-  // (WorkflowsView.tsx's MemorySettingsPanel), which posts to this same
-  // /api/context-config endpoint.
-  const fetchConfig = async () => {
+  const handleUnloadModel = async (modelId: number, displayName: string) => {
+    setUnloadingModelId(modelId);
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/context-config`);
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hardware/unload/${modelId}`, { method: 'POST' });
       if (res.ok) {
-        const data = await res.json();
-        if (data.chat) setConfig(c => ({ ...c, ...data.chat }));
-      }
-    } catch (e) {
-      console.error(e);
-    }
-  };
-
-  const handleUnloadModel = async () => {
-    setUnloading(true);
-    try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hardware/unload`, { method: 'POST' });
-      if (res.ok) {
-        toast.success("Model ejected from RAM.");
+        toast.success(`Ejected '${displayName}' from RAM.`);
         fetchHardware();
         fetchDownloadedModels();
       } else {
-        toast.error("Failed to eject model.");
+        toast.error('Failed to eject model.');
       }
     } catch (e) {
-      toast.error("Network error.");
+      toast.error('Network error.');
     } finally {
-      setUnloading(false);
+      setUnloadingModelId(null);
     }
   };
 
@@ -155,22 +125,26 @@ export default function ContextMemoryHub() {
 
   // === Dynamic RAM & Latency Estimation ===
   const modelMaxContext = hardware?.max_context || 4096;
+  const isModelActive = !!(hardware && hardware.active_model !== 'None');
 
-  // KV cache: each token costs ~0.5 MB for a typical 3B model (2 layers * 2 (K+V) * hidden_dim * bytes)
-  // Scale it by ratio of requested context vs model max context
-  const contextRatio = config.max_output_tokens / modelMaxContext;
-  const baseKvGb = modelMaxContext * 0.000125;  // approx at model max
-  const extraKvGb = baseKvGb * contextRatio;     // scales proportionally
+  // KV cache: each token costs ~0.5 MB for a typical 3B model (2 layers * 2
+  // (K+V) * hidden_dim * bytes). Estimated at the model's full context
+  // window (worst case) rather than scaled by a configured response
+  // length — that per-turn tuning now lives in the Workflow's memory node
+  // (WorkflowsView.tsx's MemorySettingsPanel), out of scope for this page.
+  const extraKvGb = isModelActive ? modelMaxContext * 0.000125 : 0;
 
   const otherAppsGb = hardware ? (hardware.ram_used_gb > 2 ? hardware.ram_used_gb - 2 : hardware.ram_used_gb) : 0;
-  const modelBaseGb = (hardware && hardware.active_model !== 'None') ? 2.0 : 0; // approx weights only
+  const modelBaseGb = isModelActive ? 2.0 : 0; // approx weights only
   const modelEstimatedGb = modelBaseGb + extraKvGb;
   const availableGb = hardware ? Math.max(0, hardware.ram_total_gb - hardware.ram_used_gb - extraKvGb) : 0;
   const isLowMemory = availableGb < 2;
 
-  // Latency tier based on context ratio
-  const latencyLabel = contextRatio > 0.75 ? 'High' : contextRatio > 0.4 ? 'Medium' : 'Low';
-  const latencyColor = contextRatio > 0.75 ? 'text-aegis-error' : contextRatio > 0.4 ? 'text-aegis-warning' : 'text-aegis-success';
+  // Latency tier based on free RAM headroom, not context/token usage —
+  // matches how little free memory drives real slowdowns (swapping,
+  // memory pressure) regardless of what a workflow does with context.
+  const latencyLabel = availableGb < 1 ? 'High' : availableGb < 3 ? 'Medium' : 'Low';
+  const latencyColor = availableGb < 1 ? 'text-aegis-error' : availableGb < 3 ? 'text-aegis-warning' : 'text-aegis-success';
 
   // RAM breakdown as a compact horizontal stacked bar (replaces the donut —
   // same information, a fraction of the vertical space).
@@ -179,7 +153,7 @@ export default function ContextMemoryHub() {
   const modelPct = Math.max(0, Math.min(100 - otherPct, (modelEstimatedGb / ramTotal) * 100));
   const freePct = Math.max(0, 100 - otherPct - modelPct);
 
-  const activeModelName = hardware?.active_model && hardware.active_model !== 'None' ? hardware.active_model : null;
+  const activeModelName = isModelActive ? hardware!.active_model : null;
   const activeModelShort = activeModelName
     ? (hardware?.active_model_display && hardware.active_model_display !== 'None'
         ? hardware.active_model_display.replace(/\s*\([^)]*\)\s*$/, '').trim()
@@ -229,7 +203,7 @@ export default function ContextMemoryHub() {
           <div className="bg-aegis-raised rounded-xl border border-aegis-border p-3.5">
             <div className="text-[9px] font-bold text-aegis-text-muted tracking-wider uppercase mb-1">Latency Est.</div>
             <div className={`text-lg font-bold ${latencyColor}`}>{latencyLabel}</div>
-            <div className="text-[10px] text-aegis-text-muted mt-0.5">at current context</div>
+            <div className="text-[10px] text-aegis-text-muted mt-0.5">from free RAM</div>
           </div>
         </div>
 
@@ -263,19 +237,9 @@ export default function ContextMemoryHub() {
             <span className="text-[11px] font-semibold text-aegis-text-secondary flex items-center gap-1.5">
               <HardDrive className="w-3.5 h-3.5 text-aegis-primary-light" /> Downloaded Models
             </span>
-            {activeModelName && (
-              <button
-                onClick={handleUnloadModel}
-                disabled={unloading}
-                className="flex items-center gap-1.5 text-xs font-semibold text-aegis-error hover:underline disabled:opacity-50 transition-all"
-              >
-                {unloading ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <LogOut className="w-3.5 h-3.5" />}
-                Eject
-              </button>
-            )}
           </div>
 
-          <div className="max-h-48 overflow-y-auto">
+          <div className="max-h-[28rem] overflow-y-auto">
             {downloadedModels.filter(m => m.status === 'downloaded').length === 0 ? (
               <p className="px-4 py-5 text-center text-xs text-aegis-text-muted">
                 No downloaded models yet — visit the LLMs tab to download one.
@@ -287,45 +251,97 @@ export default function ContextMemoryHub() {
                 const isLoadingThis = loadingModelId === m.id;
                 const isDeletingThis = deletingModelId === m.id;
                 const isArmed = armedDeleteId === m.id;
+                // A workflow node can load a different model than whichever
+                // one is explicitly "active" here — surface that it's
+                // sitting in RAM too, not just silently invisible.
+                const loadedByWorkflow = hardware?.other_loaded_models?.find(o => o.name === m.name);
+                // Ground truth for "is this genuinely sitting in RAM right
+                // now" — m.is_active (from GET /api/hub/downloaded) is a
+                // DB preference for which model to preload on next launch,
+                // NOT live state: it's only ever set by this panel's own
+                // "Set Active" click, so a model loaded any other way (most
+                // commonly, a Workflow "llm" node with its own model
+                // picked) is really loaded but m.is_active stays false for
+                // it — hiding its Eject button and leaving it stuck in RAM
+                // with no way to free it from here. hardware.active_model/
+                // other_loaded_models come straight from
+                // LLMManager.loaded_models, so they can't drift the same way.
+                const isGenuinelyLoaded = hardware?.active_model === m.name || !!loadedByWorkflow;
+                const rowDisabled = isGenuinelyLoaded || loadingModelId !== null;
+                const isCapped = m.effective_context_length && m.context_length && m.effective_context_length < m.context_length;
                 return (
-                  <div
-                    key={m.id}
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => !m.is_active && handleLoadModel(m.id)}
-                    onKeyDown={e => { if (e.key === 'Enter' && !m.is_active) handleLoadModel(m.id); }}
-                    aria-disabled={m.is_active || loadingModelId !== null}
-                    className={`w-full flex items-center justify-between gap-3 px-4 py-2.5 text-left transition-colors border-b border-aegis-border last:border-b-0 cursor-pointer ${
-                      m.is_active ? 'bg-aegis-primary/5' : 'hover:bg-aegis-overlay'
-                    } ${loadingModelId !== null && !isLoadingThis ? 'opacity-50 pointer-events-none' : ''}`}
-                  >
-                    <div className="min-w-0">
-                      <p className="text-sm font-medium text-aegis-text-primary truncate">{cleanName}</p>
-                      {m.context_length && (
-                        <p className="text-[11px] text-aegis-text-muted mt-0.5">{m.context_length.toLocaleString()}-token context</p>
-                      )}
+                  <div key={m.id} className={`border-b border-aegis-border last:border-b-0 ${isGenuinelyLoaded ? 'bg-aegis-primary/5' : ''}`}>
+                    <div
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => !rowDisabled && handleLoadModel(m.id)}
+                      onKeyDown={e => { if (e.key === 'Enter' && !rowDisabled) handleLoadModel(m.id); }}
+                      aria-disabled={rowDisabled}
+                      className={`w-full flex items-center justify-between gap-3 px-4 py-2.5 text-left transition-colors cursor-pointer ${
+                        m.is_active ? '' : 'hover:bg-aegis-overlay'
+                      } ${loadingModelId !== null && !isLoadingThis ? 'opacity-50 pointer-events-none' : ''}`}
+                    >
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium text-aegis-text-primary truncate">{cleanName}</p>
+                        {(m.effective_context_length || m.context_length) && (
+                          <p className="text-[11px] text-aegis-text-muted mt-0.5">
+                            {(m.effective_context_length ?? m.context_length).toLocaleString()}-token context
+                            {isCapped && ` (${m.context_length.toLocaleString()} native, capped)`}
+                          </p>
+                        )}
+                        {m.used_by_workflows?.length > 0 && (
+                          <p className="text-[11px] text-aegis-primary-light mt-0.5 truncate">
+                            Used by: {m.used_by_workflows.join(', ')}
+                          </p>
+                        )}
+                      </div>
+                      <div className="flex-shrink-0 flex items-center gap-2">
+                        {isLoadingThis ? (
+                          <RefreshCw className="w-4 h-4 text-aegis-primary-light animate-spin flex-shrink-0" />
+                        ) : hardware?.active_model === m.name ? (
+                          <Check className="w-4 h-4 text-aegis-primary flex-shrink-0" />
+                        ) : loadedByWorkflow ? (
+                          <span
+                            title={`Loaded in RAM by: ${loadedByWorkflow.used_by_workflows.join(', ') || 'a workflow'}`}
+                            className="text-[9px] font-semibold text-aegis-primary-light bg-aegis-primary/10 border border-aegis-primary/30 px-1.5 py-0.5 rounded-full flex-shrink-0"
+                          >
+                            Loaded (workflow)
+                          </span>
+                        ) : null}
+                        {/* Per-model eject — shown for any row actually
+                            resident in RAM right now (isGenuinelyLoaded —
+                            live state, not the DB's is_active preference),
+                            whether it's the explicit "active" one or one a
+                            workflow loaded on its own. Ejects only this
+                            model, never the others (see POST
+                            /api/hardware/unload/{id}). */}
+                        {isGenuinelyLoaded && (
+                          <button
+                            onClick={e => { e.stopPropagation(); handleUnloadModel(m.id, cleanName); }}
+                            disabled={unloadingModelId === m.id}
+                            title={`Eject ${cleanName} from RAM`}
+                            className="p-1 rounded-md text-aegis-text-muted hover:bg-aegis-error/10 hover:text-aegis-error transition-colors disabled:opacity-50"
+                          >
+                            {unloadingModelId === m.id ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <LogOut className="w-3.5 h-3.5" />}
+                          </button>
+                        )}
+                        {/* Can't delete the model currently loaded in RAM —
+                            eject it first (same rule the backend enforces). */}
+                        {!isGenuinelyLoaded && (
+                          <button
+                            onClick={e => { e.stopPropagation(); handleDeleteModel(m.id, cleanName); }}
+                            disabled={isDeletingThis}
+                            title={isArmed ? 'Click again to delete' : `Delete ${cleanName}`}
+                            className={`p-1 rounded-md transition-colors disabled:opacity-50 ${
+                              isArmed ? 'bg-aegis-error/10 text-aegis-error' : 'text-aegis-text-muted hover:bg-aegis-error/10 hover:text-aegis-error'
+                            }`}
+                          >
+                            {isDeletingThis ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+                          </button>
+                        )}
+                      </div>
                     </div>
-                    <div className="flex-shrink-0 flex items-center gap-2">
-                      {isLoadingThis ? (
-                        <RefreshCw className="w-4 h-4 text-aegis-primary-light animate-spin flex-shrink-0" />
-                      ) : m.is_active ? (
-                        <Check className="w-4 h-4 text-aegis-primary flex-shrink-0" />
-                      ) : null}
-                      {/* Can't delete the model currently loaded in RAM —
-                          eject it first (same rule the backend enforces). */}
-                      {!m.is_active && (
-                        <button
-                          onClick={e => { e.stopPropagation(); handleDeleteModel(m.id, cleanName); }}
-                          disabled={isDeletingThis}
-                          title={isArmed ? 'Click again to delete' : `Delete ${cleanName}`}
-                          className={`p-1 rounded-md transition-colors disabled:opacity-50 ${
-                            isArmed ? 'bg-aegis-error/10 text-aegis-error' : 'text-aegis-text-muted hover:bg-aegis-error/10 hover:text-aegis-error'
-                          }`}
-                        >
-                          {isDeletingThis ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
-                        </button>
-                      )}
-                    </div>
+                    <ModelContextCapControl model={m} onSaved={() => { fetchDownloadedModels(); fetchHardware(); }} />
                   </div>
                 );
               })
@@ -333,6 +349,89 @@ export default function ContextMemoryHub() {
           </div>
         </div>
 
+      </div>
+    </div>
+  );
+}
+
+// One per downloaded model, not a single app-wide value — different
+// models legitimately want different caps (see backend
+// llm_manager.resolve_effective_n_ctx and POST /api/hub/{id}/context-cap).
+// Lives outside the row's own onClick-to-load handler (stops propagation
+// throughout) so dragging the slider or hitting Apply never triggers
+// loading the model.
+function ModelContextCapControl({ model, onSaved }: { model: any; onSaved: () => void }) {
+  const DEFAULT_N_CTX = 8192;
+  const nativeMax = model.context_length || DEFAULT_N_CTX;
+  const ceiling = Math.max(nativeMax, 2048);
+  const effective = model.effective_context_length || Math.min(DEFAULT_N_CTX, ceiling);
+  const [draft, setDraft] = useState<number>(effective);
+  const [saving, setSaving] = useState(false);
+
+  // Re-sync whenever the backend's own effective value changes (after a
+  // save, or a fresh fetch) rather than freezing on whatever was true when
+  // this row first mounted.
+  useEffect(() => {
+    setDraft(effective);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [model.id, effective]);
+
+  const ramDeltaGb = ((draft - DEFAULT_N_CTX) / 1024) * 0.20;
+  const hasChanges = draft !== effective;
+
+  const handleApply = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setSaving(true);
+    try {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hub/${model.id}/context-cap`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ n_ctx: draft }),
+      });
+      if (res.ok) {
+        toast.success(`Context cap set to ${draft.toLocaleString()} tokens — applies next time this model loads.`);
+        onSaved();
+      } else if (res.status === 409) {
+        toast.error('Cannot change the context cap while a generation is in progress.');
+      } else {
+        const data = await res.json().catch(() => ({}));
+        toast.error(data.detail || 'Failed to save context cap.');
+      }
+    } catch (e) {
+      toast.error('Network error.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="px-4 pb-3 pt-1" onClick={e => e.stopPropagation()}>
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-[10px] font-semibold text-aegis-text-muted uppercase">Context Cap</span>
+        <span className="text-[11px] font-bold text-aegis-primary-light">{draft.toLocaleString()} tokens</span>
+      </div>
+      <input
+        type="range"
+        min={2048}
+        max={ceiling}
+        step={512}
+        value={draft}
+        onChange={e => setDraft(parseInt(e.target.value))}
+        className="w-full h-1 bg-aegis-overlay rounded-lg appearance-none cursor-pointer accent-aegis-primary focus:outline-none"
+      />
+      <div className="flex items-center justify-between mt-2">
+        <span className={`text-[10px] ${ramDeltaGb > 0 ? 'text-aegis-warning' : 'text-aegis-text-muted'}`}>
+          {ramDeltaGb > 0
+            ? `≈ +${ramDeltaGb.toFixed(1)} GB vs. default · native max ${nativeMax.toLocaleString()}`
+            : `Native max: ${nativeMax.toLocaleString()}`}
+        </span>
+        <button
+          onClick={handleApply}
+          disabled={saving || !hasChanges}
+          className="px-2.5 py-1 rounded-md text-[10px] font-semibold bg-aegis-primary text-white hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+        >
+          {saving ? 'Saving…' : 'Apply'}
+        </button>
       </div>
     </div>
   );

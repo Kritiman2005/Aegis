@@ -2,17 +2,16 @@
 Aegis — Serves files Chat Mode's export flow generates (/api/export)
 
 The user asks in chat ("give me this as a PDF", "convert that to docx") and
-app/core/agents/chat.py's deterministic export-intent regex in _handle_idle
-(mode == "chat" branch — no planner/tool-call involved) calls
-_execute_export_document, which converts the relevant content via
-app/core/exporter.py, stores the bytes here under a short-lived ID, and
-returns a download link that appears directly in the chat message. Agent
-Mode used to have this as a planner-driven tool too; removed because the
-planner proved unreliable at it on small local models (see
-ChatAgent._get_local_tools' docstring). This module just serves that
-link — there used to also be a POST /api/export for a manual per-message
-"Export ▾" button (ExportMenu.tsx), removed along with that button once
-the chat flow covered the same need conversationally.
+a classifier "llm" node's structured is_export/format output feeds a
+connected workflow's "export_document" node
+(app.core.workflows.engine's _run_export_document_node), which calls
+ChatAgent._execute_export_document — converting the relevant content via
+app/core/exporter.py, storing the bytes here under a short-lived ID, and
+returning a download link that appears directly in the chat message. This
+module just serves that link — there used to also be a POST /api/export
+for a manual per-message "Export ▾" button (ExportMenu.tsx), removed
+along with that button once the chat flow covered the same need
+conversationally.
 """
 
 import re

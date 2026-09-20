@@ -81,10 +81,21 @@ def init_db():
             ("mmproj_filename", "ALTER TABLE models ADD COLUMN mmproj_filename TEXT"),
             ("mmproj_path", "ALTER TABLE models ADD COLUMN mmproj_path TEXT"),
             ("mmproj_status", "ALTER TABLE models ADD COLUMN mmproj_status TEXT"),
+            ("context_cap", "ALTER TABLE models ADD COLUMN context_cap INTEGER"),
         ):
             if col not in existing_model_cols:
                 conn.execute(text(ddl))
                 conn.commit()
+
+        # An existing install's system_settings row predates the per-format
+        # extraction-engine install state (see app.core.extraction_engines).
+        existing_settings_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(system_settings)"))}
+        if "extraction_engines_json" not in existing_settings_cols:
+            conn.execute(text("ALTER TABLE system_settings ADD COLUMN extraction_engines_json TEXT DEFAULT '{}'"))
+            conn.commit()
+        if "voice_json" not in existing_settings_cols:
+            conn.execute(text("ALTER TABLE system_settings ADD COLUMN voice_json TEXT DEFAULT '{}'"))
+            conn.commit()
 
         existing_workflow_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(workflows)"))}
         if "is_chat_handler" not in existing_workflow_cols:
@@ -118,6 +129,14 @@ def init_db():
         existing_embedding_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(embedding_models)"))}
         if "backend" not in existing_embedding_cols:
             conn.execute(text("ALTER TABLE embedding_models ADD COLUMN backend TEXT DEFAULT 'fastembed'"))
+            conn.commit()
+
+        # aegis_account existed before RemoteConnector syncing was added —
+        # an install from before this column would otherwise fail the
+        # staleness check in account_auth.py's /status endpoint.
+        existing_account_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(aegis_account)"))}
+        if existing_account_cols and "connectors_synced_at" not in existing_account_cols:
+            conn.execute(text("ALTER TABLE aegis_account ADD COLUMN connectors_synced_at DATETIME"))
             conn.commit()
 
 

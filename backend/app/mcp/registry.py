@@ -36,6 +36,13 @@ class MCPServerRegistry:
         self._tool_to_server: Dict[str, str] = {}
         # Per-server metadata (e.g. authenticated username, org, etc.)
         self._server_metadata: Dict[str, Dict[str, str]] = {}
+        # Cached resources/prompts catalogs per server (the MCP list
+        # entries — uri/name/description, not the content itself; that's
+        # fetched on demand via read_resource/get_prompt). Most servers
+        # expose neither, so these are usually empty lists, not missing
+        # keys — see _finish_connect.
+        self._resources: Dict[str, List[dict]] = {}
+        self._prompts: Dict[str, List[dict]] = {}
 
     def set_server_metadata(self, server_name: str, metadata: Dict[str, str]) -> None:
         """Stores arbitrary key/value metadata for a connected server."""
@@ -80,6 +87,21 @@ class MCPServerRegistry:
             tool_name = t.get("name")
             if tool_name:
                 self._tool_to_server[tool_name] = server_name
+
+        # Best-effort — most servers declare neither capability, and a
+        # server that DOES declare "resources"/"prompts" but still errors
+        # on the actual list call (seen in the wild on a few early
+        # implementations) shouldn't take the whole connection down over it.
+        try:
+            self._resources[server_name] = client.list_resources()
+        except Exception as e:
+            logger.warning(f"resources/list failed for '{server_name}', treating as none: {e}")
+            self._resources[server_name] = []
+        try:
+            self._prompts[server_name] = client.list_prompts()
+        except Exception as e:
+            logger.warning(f"prompts/list failed for '{server_name}', treating as none: {e}")
+            self._prompts[server_name] = []
 
         if db:
             from app.db.crud import sync_mcp_server_and_tools
@@ -159,6 +181,9 @@ class MCPServerRegistry:
         tools_to_remove = [t for t, s in self._tool_to_server.items() if s == server_name]
         for t in tools_to_remove:
             del self._tool_to_server[t]
+
+        self._resources.pop(server_name, None)
+        self._prompts.pop(server_name, None)
 
         if db:
             from app.db.crud import set_mcp_server_status
@@ -241,6 +266,32 @@ class MCPServerRegistry:
 
         return client.call_tool(tool_name, arguments)
 
+    def list_resources(self, server_name: str) -> List[dict]:
+        """Cached resources/list catalog for one connected server (empty if
+        it doesn't declare the resources capability, or isn't connected)."""
+        return self._resources.get(server_name, [])
+
+    def list_prompts(self, server_name: str) -> List[dict]:
+        """Cached prompts/list catalog for one connected server (empty if
+        it doesn't declare the prompts capability, or isn't connected)."""
+        return self._prompts.get(server_name, [])
+
+    def read_resource(self, server_name: str, uri: str) -> dict:
+        """Fetches one resource's actual content, live — unlike tools/
+        prompts, resource content isn't cached (it can be arbitrarily large
+        or change on every read, e.g. a file's current contents)."""
+        client = self._clients.get(server_name)
+        if not client or not client.is_running:
+            raise RuntimeError(f"MCP server '{server_name}' is not running.")
+        return client.read_resource(uri)
+
+    def get_prompt(self, server_name: str, name: str, arguments: Optional[Dict[str, str]] = None) -> dict:
+        """Fetches a filled prompt template, live."""
+        client = self._clients.get(server_name)
+        if not client or not client.is_running:
+            raise RuntimeError(f"MCP server '{server_name}' is not running.")
+        return client.get_prompt(name, arguments)
+
     def get_status(self) -> Dict[str, dict]:
         """Returns health status of all registered servers."""
         status = {}
@@ -248,7 +299,9 @@ class MCPServerRegistry:
             status[name] = {
                 "running": client.is_running,
                 "server_info": client.server_info,
-                "tools_count": len(client.cached_tools)
+                "tools_count": len(client.cached_tools),
+                "resources_count": len(self._resources.get(name, [])),
+                "prompts_count": len(self._prompts.get(name, [])),
             }
         return status
 

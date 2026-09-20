@@ -2,7 +2,7 @@
 Aegis — Executor Prompt
 
 Generates exact JSON arguments for a single tool step — an MCP-connected tool
-or one of Aegis's own built-in local tools (e.g. web_scrape).
+or one of Aegis's own built-in local tools (e.g. read_file).
 """
 
 def build_executor_prompt(
@@ -27,7 +27,7 @@ def build_executor_prompt(
     entity_section = f"\n\nKNOWN ENTITIES:\n{entity_context}\n" if entity_context.strip() else ""
     prior_results_section = f"\n\nRESULTS FROM PREVIOUS STEPS (structured JSON — read IDs literally from here):\n{prior_results}\n" if prior_results.strip() else ""
 
-    return f"""You are Aegis Executor, an intelligent agent that formats exact tool arguments for Aegis's tools — whether connected via MCP or built in locally (e.g. web_scrape).
+    return f"""You are Aegis Executor, an intelligent agent that formats exact tool arguments for Aegis's tools — whether connected via MCP or built in locally (e.g. read_file).
 
 YOUR TASK:
 You must generate the strict JSON "arguments" payload to execute the `{tool_name}` tool.

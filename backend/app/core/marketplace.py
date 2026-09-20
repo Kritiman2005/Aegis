@@ -2,58 +2,28 @@
 Aegis — Marketplace
 
 Lets the user browse and explicitly choose what to install, rather than
-features silently downloading on first use (e.g. web scraping used to
-download a ~95MB headless Chromium the first time someone clicked "Scrape a
-Web Page" — now that install only happens when the user picks it here).
+features silently downloading on first use.
 
-Automation Tools: capabilities that need a native download (currently just
-Playwright-based web scraping — voice transcription used to be here too,
-but its model is small and universal enough that it now ships inside the
-app bundle itself instead, see app/core/transcription.py's module
-docstring). Install/status is delegated to whatever module actually owns
-that capability (app.core.scraper) rather than duplicated here.
+Automation Tools: capabilities that need a native download. Voice
+transcription used to be here too, but its model is small and universal
+enough that it now ships inside the app bundle itself instead, see
+app/core/transcription.py's module docstring.
 """
 
-from pathlib import Path
-from typing import List, Dict
-
-from app.core.scraper import is_chromium_installed
+from typing import Dict, List, Optional
 
 TOOLS_CATALOG = [
-    {
-        "id": "playwright_scraper",
-        "name": "Web Scraping",
-        "description": (
-            "Lets Aegis open a real headless browser to scrape any web page — "
-            "including JavaScript-heavy sites — and add its content to your "
-            "chat as a searchable document."
-        ),
-        "category": "Automation",
-        "size_estimate": "~95 MB, downloaded once",
-        "status_endpoint": "/api/scrape/status",
-    },
     {
         "id": "document_extraction",
         "name": "Document Extraction",
         "description": (
             "Pulls plain text out of PDF, DOCX, PPTX, Markdown, TXT/CSV, and "
             "XLSX files — the same extractor Aegis's own document upload and "
-            "the Workflows canvas's Extract node already use."
+            "the Workflows canvas's Extract node already use. PDF/DOCX work "
+            "out of the box; everything else installs on demand below."
         ),
         "category": "Extraction",
-        "size_estimate": "Built in",
-        "status_endpoint": None,
-    },
-    {
-        "id": "web_extraction",
-        "name": "Web Page Extraction",
-        "description": (
-            "Fetches a static web page and pulls out its main readable text — "
-            "no headless browser, so it's fast, but can't render "
-            "JavaScript-built pages (the Web Scraping tool above handles those)."
-        ),
-        "category": "Extraction",
-        "size_estimate": "Built in",
+        "size_estimate": "Install-on-demand",
         "status_endpoint": None,
     },
     {
@@ -61,11 +31,11 @@ TOOLS_CATALOG = [
         "name": "Audio/Video Transcription",
         "description": (
             "Transcribes speech in a local audio or video file to text, "
-            "entirely on-device — the same bundled model the chat composer's "
-            "mic button already uses."
+            "entirely on-device — a Workflow's own Media tool node, or the "
+            "same bundled model the chat composer's mic button already uses."
         ),
         "category": "Extraction",
-        "size_estimate": "Built in",
+        "size_estimate": "See Media Extraction below",
         "status_endpoint": None,
     },
     {
@@ -73,18 +43,16 @@ TOOLS_CATALOG = [
         "name": "Image OCR",
         "description": (
             "Pulls printed or on-screen text out of an image — a scanned "
-            "page, a screenshot, a photo of a document — using a small "
-            "bundled OCR model."
+            "page, a screenshot, a photo of a document. Install an engine "
+            "from the Media Extraction category below to use it."
         ),
         "category": "Extraction",
-        "size_estimate": "~15 MB, bundled",
+        "size_estimate": "See Media Extraction below",
         "status_endpoint": None,
     },
 ]
 
 _STATUS_CHECKS = {
-    "playwright_scraper": is_chromium_installed,
-    "web_extraction": lambda: True,
     "media_transcription": lambda: True,
     "ocr_extraction": lambda: True,
 }
@@ -102,9 +70,9 @@ def _document_extraction_catalog() -> List[Dict]:
     "document_extraction" entry in TOOLS_CATALOG above only exists as the
     Marketplace page's own single summary card for the capability as a
     whole, it carries neither field. id is prefixed "extract_" so
-    list_tools's installed-status fallback (every one of these ships
-    bundled, nothing to download) applies with no per-entry
-    _STATUS_CHECKS bookkeeping needed.
+    list_tools's install/uninstall routing (app.api.marketplace) can tell
+    these apart from the plain TOOLS_CATALOG entries above without
+    string-parsing engine_id, which can itself contain underscores.
     """
     from app.core.extraction_engines import ENGINES
 
@@ -119,7 +87,8 @@ def _document_extraction_catalog() -> List[Dict]:
                 "format": fmt,
                 "engine_id": engine["id"],
                 "default": engine.get("default", False),
-                "size_estimate": "Built in",
+                "pip_package": engine.get("pip_package"),
+                "size_estimate": "Built in" if engine.get("pip_package") is None else "Install-on-demand",
                 "status_endpoint": None,
             })
     return out
@@ -128,13 +97,32 @@ def _document_extraction_catalog() -> List[Dict]:
 def list_tools() -> List[Dict]:
     """Merges TOOLS_CATALOG with each tool's live install status. Every
     extraction engine (id prefixed "extract_", generated by
-    _document_extraction_catalog) is bundled at build time same as the
-    other Extraction-category tools, so it's always "installed" — there's
-    no per-engine entry to keep in sync with _STATUS_CHECKS by hand."""
+    _document_extraction_catalog) reflects a real, per-format opt-in
+    preference (app.core.extraction_engines.is_engine_enabled) — a
+    format's own default is always installed; every other engine starts
+    NOT installed until the user opts in from here, which (for anything
+    needing a real pip package) also triggers a real install — see
+    app.api.marketplace's install_tool."""
+    from app.core.extraction_engines import is_engine_enabled
+
     out = []
     for tool in TOOLS_CATALOG + _document_extraction_catalog():
         entry = dict(tool)
         check = _STATUS_CHECKS.get(tool["id"])
-        entry["installed"] = check() if check else tool["id"].startswith("extract_")
+        if check:
+            entry["installed"] = check()
+        elif "format" in tool and "engine_id" in tool:
+            entry["installed"] = is_engine_enabled(tool["format"], tool["engine_id"])
+        else:
+            entry["installed"] = tool["id"].startswith("extract_")
         out.append(entry)
     return out
+
+
+def find_extraction_entry(tool_id: str) -> Optional[Dict]:
+    """Looks up one _document_extraction_catalog() entry by its composite
+    id (e.g. "extract_pdf_pdfplumber") — used by the generic Marketplace
+    install/uninstall routes to recover the real (format, engine_id) pair
+    without string-parsing the id, since an engine_id can itself contain
+    underscores (e.g. "pdfminer_six")."""
+    return next((e for e in _document_extraction_catalog() if e["id"] == tool_id), None)

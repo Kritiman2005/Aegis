@@ -10,9 +10,14 @@ cross-encoder from. Nothing downloads until the user picks one from the
 Marketplace's Rerankers category (app.api.marketplace_rerankers) —
 consistent with every other Marketplace category (see
 app.core.marketplace's module docstring). Left unset on the node, it falls
-back to the app's own bundled default (app.core.rag.processor.get_reranker,
+back to the app's own default (app.core.rag.processor.get_reranker,
 unchanged — every direct, non-workflow caller of hybrid_search keeps using
-that exact same bundled model too).
+that exact same default model too) — NOT bundled, needs
+sentence-transformers installed from the Dependencies panel first (see
+main.spec's excludes list); a workflow reranker node raises a real,
+actionable error if it isn't, rather than silently degrading the way
+hybrid_search's own automatic rerank pass does (app.core.rag.processor.
+rerank_chunks).
 """
 
 import logging
@@ -25,7 +30,7 @@ CATALOG: List[Dict[str, Any]] = [
         "id": "BAAI/bge-reranker-base",
         "display_name": "BAAI bge-reranker-base",
         "size_gb": 1.1,
-        "description": "Aegis's own bundled default — a small, fast cross-encoder good for most document sets.",
+        "description": "Aegis's own default — a small, fast cross-encoder good for most document sets. Not bundled: needs sentence-transformers installed first, even as the default.",
     },
     {
         "id": "BAAI/bge-reranker-v2-m3",

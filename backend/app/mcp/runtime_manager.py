@@ -29,7 +29,6 @@ import zipfile
 from pathlib import Path
 from typing import Awaitable, Callable, List, Optional
 
-import certifi
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -99,7 +98,10 @@ def _uv_target(version: str) -> tuple[str, str]:
 # ─── Version resolution ─────────────────────────────────────────────────────
 
 async def _latest_node_lts_version() -> str:
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, verify=certifi.where()) as client:
+    # No explicit verify= on any httpx client in this file — main.py's
+    # truststore.inject_into_ssl() already makes every SSL connection use
+    # the OS's own native trust evaluation instead of a bundled CA file.
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
         resp = await client.get("https://nodejs.org/dist/index.json")
         resp.raise_for_status()
         releases = resp.json()
@@ -110,7 +112,7 @@ async def _latest_node_lts_version() -> str:
 
 
 async def _latest_uv_version() -> str:
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, verify=certifi.where()) as client:
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
         resp = await client.get("https://api.github.com/repos/astral-sh/uv/releases/latest")
         resp.raise_for_status()
         return resp.json()["tag_name"]  # e.g. "0.12.10"
@@ -121,7 +123,7 @@ async def _latest_uv_version() -> str:
 async def _download(url: str, dest: Path, progress_cb: ProgressCallback, label: str) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     downloaded = 0
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, verify=certifi.where()) as client:
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
         async with client.stream("GET", url, follow_redirects=True) as response:
             response.raise_for_status()
             total = int(response.headers.get("Content-Length", 0))

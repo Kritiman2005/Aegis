@@ -1,9 +1,16 @@
 """
 context_config.py — SQLite-backed context window configuration store.
 
-All 4 agents (Chat, Planner, Executor, Extractor) read their tunable
-parameters from this module at request time, so frontend changes take
-effect immediately without restarting the backend.
+app.core.workflows.engine's chat-generation node reads the "chat" section's
+tunable parameters at request time, so frontend changes take effect
+immediately without restarting the backend. "hardware" (n_gpu_layers,
+n_threads) is likewise read live by llm_manager. "planner" is still
+written by WorkflowsView.tsx's per-node memory-settings panel (as
+AgentConfig, via POST /api/context-config's `agent` field) but nothing
+reads it back anymore — it was the old built-in Agent Mode pipeline's
+config before that pipeline was replaced by user-designed workflows.
+"executor" and "advanced" hold no real tunables (informational/placeholder
+only).
 """
 
 import json

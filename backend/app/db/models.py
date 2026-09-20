@@ -53,6 +53,15 @@ class ModelRegistry(Base):
     mmproj_path = Column(String, nullable=True)
     mmproj_status = Column(String, nullable=True)  # 'downloading', 'downloaded', 'failed'
 
+    # Per-model context window cap override, in tokens — None = fall back to
+    # the app-wide default (see llm_manager.resolve_effective_n_ctx). Each
+    # model has its own real native context_length above, so one global cap
+    # either wastes headroom on a small-context model or (before this
+    # column existed) got silently applied to every model regardless of
+    # what it could actually support — this makes the cap a per-model
+    # choice, set from Memory Hub's per-model card.
+    context_cap = Column(Integer, nullable=True)
+
 
 class MCPServer(Base):
     """Tracks connected and disconnected MCP servers per user."""
@@ -145,18 +154,12 @@ class UserDocument(Base):
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     # True when upload-time OCR was skipped because a vision model was
-    # active then (see api/documents.py's skip_ocr) — lets
-    # ChatAgent._get_document_context (chat.py) notice, at send time, that
-    # this image has NO searchable content at all if the active model is no
-    # longer vision-capable by the time the message is actually sent, rather
-    # than silently answering as if the image were never attached.
-    ocr_skipped_for_vision = Column(Boolean, default=False)
-    # True when upload-time OCR was skipped because a vision model was
-    # active then (see api/documents.py's skip_ocr) — lets
-    # ChatAgent._get_document_context (chat.py) notice, at send time, that
-    # this image has NO searchable content at all if the active model is no
-    # longer vision-capable by the time the message is actually sent, rather
-    # than silently answering as if the image were never attached.
+    # active then (see api/documents.py's upload handler). Not currently
+    # read back anywhere — the workflow-based chat path
+    # (_attach_workflow_vision_image) just silently skips an image its
+    # node's picked model can't read, rather than surfacing an explicit
+    # "this image changed vision-availability since upload" note the way
+    # the old built-in chat pipeline used to.
     ocr_skipped_for_vision = Column(Boolean, default=False)
     # SHA-256 of the raw uploaded bytes — lets a re-upload of the exact same
     # file within the same conversation reuse the existing row/embeddings
@@ -190,18 +193,20 @@ class Workflow(Base):
     # handler and any number of differently-scoped handlers may all be
     # active at once — app.db.crud.get_active_chat_workflow does the
     # scoped-first-then-global lookup for one incoming message. False for
-    # every workflow = chat uses the built-in ChatAgent pipeline exactly as
-    # before this feature existed.
+    # every workflow = chat is off for that scope; there's no built-in
+    # fallback pipeline anymore (see app.api.websocket).
     is_chat_handler = Column(Boolean, default=False, nullable=False)
     chat_handler_conversation_id = Column(String, nullable=True, index=True)
     # Same idea as is_chat_handler/chat_handler_conversation_id, but for
     # document uploads — the live handler run by
-    # app.core.workflows.engine.run_ingestion_workflow in place of the
-    # built-in app.core.rag.processor.ingest_document, either globally or
+    # app.core.workflows.engine.run_ingestion_workflow, either globally or
     # scoped to uploads made within one conversation (from the
     # document_upload_trigger node's data.conversationId — see
     # app.api.documents's upload handler and the /set-ingestion-handler,
-    # /unset-ingestion-handler endpoints in app.api.workflows).
+    # /unset-ingestion-handler endpoints in app.api.workflows). Unlike
+    # is_chat_handler, there's no built-in fallback when this is false —
+    # ingestion is workflow-only, so an upload with nothing connected is
+    # rejected outright rather than falling back to any default pipeline.
     is_ingestion_handler = Column(Boolean, default=False, nullable=False)
     ingestion_handler_conversation_id = Column(String, nullable=True, index=True)
     # Null for a user-authored workflow. Set to app.core.workflows.seed's
@@ -213,7 +218,7 @@ class Workflow(Base):
     seed_version = Column(Integer, nullable=True)
     # Null for a user-authored workflow. A stable, never-shown identifier
     # for one of seed.py's built-in demo workflows (e.g.
-    # "default_chat_pipeline") — distinct from `name`, which is a plain
+    # "default_pipeline") — distinct from `name`, which is a plain
     # editable text field on the canvas toolbar. Looking a seed row up by
     # `name` alone breaks the moment a user renames it (even temporarily,
     # then back): the next startup's by-name lookup misses the renamed row
@@ -422,23 +427,37 @@ class ChatMessage(Base):
     # attachment chip in the transcript instead of living only in the
     # separate Files page. Null/empty for ordinary text messages.
     attachments_json = Column(Text, nullable=True)
-    # JSON array of {document_id, filename, file_type} — set when this message
-    # represents (or includes) an uploaded document, so it renders as an
-    # attachment chip in the transcript instead of living only in the
-    # separate Files page. Null/empty for ordinary text messages.
-    attachments_json = Column(Text, nullable=True)
     # 'tool_call' marks internal-only entries (e.g. execution-result summaries
     # kept for LLM memory) that should replay into the collapsed "Agent is
     # working" card on reload instead of a normal top-level chat bubble.
     # Null for ordinary user-visible messages.
     msg_type = Column(String, nullable=True)
     # JSON array of {id, content, filename, document_id} — the RAG chunks
-    # actually used to answer THIS assistant turn (null when none were
-    # used). Lets a later turn's empty/weak search backfill from these
-    # instead of leaving a vague follow-up ("what about the other part?")
-    # with no grounding at all — see ChatAgent._backfill_sources_from_history.
+    # actually used to answer THIS assistant turn. add_chat_message still
+    # accepts rag_sources to populate this, but nothing in
+    # app.core.workflows.engine's chat path passes one, so this is
+    # effectively always null now — the old built-in pipeline's
+    # empty-search backfill-from-recent-turns behavior isn't modeled as a
+    # workflow node and doesn't currently run.
     rag_sources_json = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ConversationMeta(Base):
+    """
+    Per-conversation metadata that isn't itself a chat message — currently
+    just a user-set custom title (Sidebar's rename option). No row means no
+    custom title yet: get_all_sessions falls back to its own auto-derived
+    "first message" preview, exactly as it always has. Kept as its own
+    table rather than a column on ChatMessage since a title belongs to the
+    conversation as a whole, not to any one message in it.
+    """
+    __tablename__ = "conversation_meta"
+
+    conversation_id = Column(String, primary_key=True)
+    title = Column(String, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 
 class TokenUsage(Base):
     """
@@ -485,6 +504,19 @@ class SystemSettings(Base):
     planner_json = Column(Text, nullable=False, default="{}")
     advanced_json = Column(Text, nullable=False, default="{}")
     hardware_json = Column(Text, nullable=False, default="{}")
+    # {format: [engine_id, ...]} of NON-default extraction engines the user
+    # has opted into (see app.core.extraction_engines) — each format's own
+    # default engine is always enabled and never stored here, so an empty
+    # "{}" here correctly means "only the defaults are installed" out of
+    # the box, matching every other Marketplace category's own default.
+    extraction_engines_json = Column(Text, nullable=False, default="{}")
+    # {"transcription_engine": <id>} — which app.core.media_engines
+    # TRANSCRIPTION_ENGINES id the chat composer's mic button uses (see
+    # app.api.voice). Unset/missing key = "whisper-small" (the bundled
+    # default, unchanged behavior from before this setting existed) — same
+    # fallback contract app.core.media_engines.resolve_engine_id already
+    # gives every other caller, so an old row with no key here just works.
+    voice_json = Column(Text, nullable=False, default="{}")
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 class SettingsHistory(Base):
@@ -524,7 +556,49 @@ class AegisAccount(Base):
     refresh_token = Column(Text, nullable=False)
     cached_plan = Column(String, default="free")
     plan_synced_at = Column(DateTime, default=datetime.utcnow)
+    connectors_synced_at = Column(DateTime, nullable=True)  # last successful RemoteConnector resync; see account_auth.py
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class RemoteConnector(Base):
+    """
+    Local mirror of the full public connector catalog on
+    aegisaistudio.online — every row, not just ones this account picked
+    (there's no per-connector selection; one subscription unlocks the whole
+    catalog, gated at render time by AegisAccount.cached_plan — see
+    catalog.py's remote_entry_to_catalog_dict). Distinct from the free,
+    built-in ones in app/mcp/catalog.py's CONNECTORS_CATALOG. Synced via
+    get_full_catalog() in app/auth/supabase_client.py, on the same
+    schedule/trigger points AegisAccount.cached_plan already uses (see
+    _resync_catalog_in_background in account_auth.py).
+
+    Field shape mirrors a CONNECTORS_CATALOG entry so catalog.py can convert
+    a row here straight into the same dict shape the frontend already
+    renders — command/env_schema/input_schema are stored as JSON text for
+    the same reason MCPServer.config_json is.
+
+    `version` is compared against the incoming row on every sync — a bump
+    means the connector's definition changed upstream. If it's currently
+    connected (a matching MCPServer.status == "connected" row exists),
+    needs_reconnect is set instead of silently rewriting a live server's
+    config out from under it; otherwise the cached row updates in place.
+    """
+    __tablename__ = "remote_connectors"
+
+    id = Column(String, primary_key=True)  # matches the website's connectors.id slug
+    display_name = Column(String, nullable=False)
+    category = Column(String, nullable=False)
+    description = Column(Text, nullable=False)
+    icon = Column(String, nullable=False)
+    auth_type = Column(String, nullable=False)
+    command_json = Column(Text, nullable=True)
+    env_schema_json = Column(Text, nullable=False, default="[]")
+    input_schema_json = Column(Text, nullable=False, default="[]")
+    oauth_service = Column(String, nullable=True)
+    setup_guide = Column(Text, nullable=False, default="")
+    version = Column(Integer, nullable=False, default=1)
+    needs_reconnect = Column(Boolean, nullable=False, default=False)
+    synced_at = Column(DateTime, default=datetime.utcnow)
 
 
 class OnboardingState(Base):

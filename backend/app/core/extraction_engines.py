@@ -10,8 +10,19 @@ into (app.core.workflows.engine._run_extract_node) — purely additive,
 mirroring the shape of app.core.embeddings' model catalog (several
 choices per capability, one marked as the default).
 
-On top of this fixed, bundled list, a user can also point the Extract node
-at a connected MCP tool (Connectors) — the app's own way for a user to
+Install-on-demand, not bundled — same story as the reranker/embeddings.
+pymupdf (PDF) and python-docx (DOCX) are the two exceptions: both ship
+regardless, for app.core.exporter's own PDF/DOCX export (an unrelated
+write-out feature), so their formats' defaults work with zero extra
+install. Every other engine here — pdfplumber/pypdf/pdfminer.six (PDF),
+docx2txt/mammoth (DOCX), python-pptx (PPTX's only engine, including its
+own default), openpyxl/pandas (XLSX) — needs its pip package installed
+first (app.core.optional_deps.require_available raises a clear,
+actionable error otherwise); the Marketplace's Document Extraction
+category is where a user installs one.
+
+On top of this list, a user can also point the Extract node at a
+connected MCP tool (Connectors) — the app's own way for a user to
 integrate an extraction tool Aegis doesn't ship itself, without Aegis
 running arbitrary third-party Python. An MCP-backed choice is addressed by
 a synthetic engine_id of the form "mcp:<server_name>:<tool_name>" rather
@@ -22,6 +33,7 @@ candidates in the first place.
 """
 
 import logging
+import os
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -41,6 +53,8 @@ def _default(file_path: str, ext: str) -> str:
 # ── PDF ──────────────────────────────────────────────────────────────────────
 
 def _pdf_pdfplumber(file_path: str, ext: str) -> str:
+    from app.core.optional_deps import require_available
+    require_available("pdfplumber", "This PDF extractor")
     import pdfplumber
     parts: List[str] = []
     with pdfplumber.open(file_path) as pdf:
@@ -57,6 +71,8 @@ def _pdf_pdfplumber(file_path: str, ext: str) -> str:
 
 
 def _pdf_pypdf(file_path: str, ext: str) -> str:
+    from app.core.optional_deps import require_available
+    require_available("pypdf", "This PDF extractor")
     from pypdf import PdfReader
     reader = PdfReader(file_path)
     if reader.is_encrypted:
@@ -65,29 +81,47 @@ def _pdf_pypdf(file_path: str, ext: str) -> str:
 
 
 def _pdf_pdfminer(file_path: str, ext: str) -> str:
+    from app.core.optional_deps import require_available
+    require_available("pdfminer.six", "This PDF extractor")
     from pdfminer.high_level import extract_text as pdfminer_extract_text
     return pdfminer_extract_text(file_path)
 
 
 def _pdf_ocr(file_path: str, ext: str) -> str:
-    """Renders each page to an image via PyMuPDF (already a dependency) and
-    runs it through the same bundled OCR engine as the extract_image_text
-    tool (app.core.agents.chat._get_ocr_engine) — for scanned PDFs with no
-    real text layer, where every other PDF engine here returns nothing."""
+    """Renders each page to an image via PyMuPDF (already a dependency,
+    unlike the OCR engine itself) and runs it through
+    app.core.media_engines.run_ocr — the bundled RapidOCR default, or
+    whatever engine a user has installed from Marketplace's Media
+    Extraction category (same install-on-demand story as everything else
+    in this file) — for scanned PDFs with no real text layer, where every
+    other PDF engine here returns nothing."""
     import fitz
-    from app.core.agents.chat import _get_ocr_engine
+    import tempfile
+    from app.core.media_engines import run_ocr
 
     doc = fitz.open(file_path)
     try:
         if doc.needs_pass:
             raise ValueError("This PDF is password-protected — remove the password and re-upload.")
-        engine = _get_ocr_engine()
         parts: List[str] = []
         for page in doc:
             pix = page.get_pixmap(dpi=200)
-            result, _ = engine(pix.tobytes("png"))
-            if result:
-                parts.append("\n".join(line[1] for line in result))
+            # run_ocr takes a file path (RapidOCR/EasyOCR's own APIs both
+            # expect one) — each rendered page is a real image in its own
+            # right, not something already on disk, so it's written to a
+            # throwaway temp file just for this one OCR call. delete=False
+            # + a manual unlink in `finally`, not a `with` block — a
+            # delete=True handle can't be reopened by run_ocr on Windows
+            # (its own file lock blocks a second open of the same path).
+            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            tmp.close()
+            try:
+                pix.save(tmp.name)
+                text = run_ocr(tmp.name)
+            finally:
+                os.unlink(tmp.name)
+            if text:
+                parts.append(text)
         return "\n\n".join(parts)
     finally:
         doc.close()
@@ -96,11 +130,15 @@ def _pdf_ocr(file_path: str, ext: str) -> str:
 # ── DOCX ─────────────────────────────────────────────────────────────────────
 
 def _docx_docx2txt(file_path: str, ext: str) -> str:
+    from app.core.optional_deps import require_available
+    require_available("docx2txt", "This DOCX extractor")
     import docx2txt
     return docx2txt.process(file_path) or ""
 
 
 def _docx_mammoth(file_path: str, ext: str) -> str:
+    from app.core.optional_deps import require_available
+    require_available("mammoth", "This DOCX extractor")
     import mammoth
     with open(file_path, "rb") as f:
         result = mammoth.extract_raw_text(f)
@@ -110,6 +148,8 @@ def _docx_mammoth(file_path: str, ext: str) -> str:
 # ── XLSX ─────────────────────────────────────────────────────────────────────
 
 def _xlsx_pandas(file_path: str, ext: str) -> str:
+    from app.core.optional_deps import require_available
+    require_available("pandas", "This XLSX extractor")
     import pandas as pd
     sheets = pd.read_excel(file_path, sheet_name=None, header=None)
     parts: List[str] = []
@@ -121,28 +161,34 @@ def _xlsx_pandas(file_path: str, ext: str) -> str:
 
 # ── Registry ─────────────────────────────────────────────────────────────────
 
+# pip_package is None for an engine that's always available (bundled
+# regardless — pymupdf/python-docx, for app.core.exporter's own PDF/DOCX
+# export — or stdlib-only), and for "ocr" (special-cased through
+# app.core.media_engines' own install state, not a plain pip package
+# check). Every other entry needs pip_package installed (see
+# app.api.marketplace's is_engine_available) before it can actually run.
 ENGINES: Dict[str, List[Dict[str, Any]]] = {
     "pdf": [
-        {"id": "pymupdf", "name": "PyMuPDF", "description": "Fast, general-purpose PDF extraction — handles most PDFs well.", "default": True, "fn": _default},
-        {"id": "pdfplumber", "name": "pdfplumber", "description": "Slower but much better at tables and layout-heavy PDFs.", "default": False, "fn": _pdf_pdfplumber},
-        {"id": "pypdf", "name": "pypdf", "description": "Lightweight, pure-Python alternative — good for simple text-only PDFs.", "default": False, "fn": _pdf_pypdf},
-        {"id": "pdfminer_six", "name": "pdfminer.six", "description": "Low-level raw text extraction — sometimes recovers text the others miss.", "default": False, "fn": _pdf_pdfminer},
-        {"id": "ocr", "name": "OCR (scanned PDFs)", "description": "Renders each page as an image and runs OCR — for scanned PDFs with no real text layer.", "default": False, "fn": _pdf_ocr},
+        {"id": "pymupdf", "name": "PyMuPDF", "description": "Fast, general-purpose PDF extraction — handles most PDFs well.", "default": True, "fn": _default, "pip_package": None},
+        {"id": "pdfplumber", "name": "pdfplumber", "description": "Slower but much better at tables and layout-heavy PDFs.", "default": False, "fn": _pdf_pdfplumber, "pip_package": "pdfplumber"},
+        {"id": "pypdf", "name": "pypdf", "description": "Lightweight, pure-Python alternative — good for simple text-only PDFs.", "default": False, "fn": _pdf_pypdf, "pip_package": "pypdf"},
+        {"id": "pdfminer_six", "name": "pdfminer.six", "description": "Low-level raw text extraction — sometimes recovers text the others miss.", "default": False, "fn": _pdf_pdfminer, "pip_package": "pdfminer.six"},
+        {"id": "ocr", "name": "OCR (scanned PDFs)", "description": "Renders each page as an image and runs OCR — for scanned PDFs with no real text layer.", "default": False, "fn": _pdf_ocr, "pip_package": None},
     ],
     "docx": [
-        {"id": "python_docx", "name": "python-docx", "description": "Preserves headings and tables when extracting Word documents.", "default": True, "fn": _default},
-        {"id": "docx2txt", "name": "docx2txt", "description": "Simpler, faster plain-paragraph extraction.", "default": False, "fn": _docx_docx2txt},
-        {"id": "mammoth", "name": "mammoth", "description": "Converts via its HTML pipeline — good structure preservation.", "default": False, "fn": _docx_mammoth},
+        {"id": "python_docx", "name": "python-docx", "description": "Preserves headings and tables when extracting Word documents.", "default": True, "fn": _default, "pip_package": None},
+        {"id": "docx2txt", "name": "docx2txt", "description": "Simpler, faster plain-paragraph extraction.", "default": False, "fn": _docx_docx2txt, "pip_package": "docx2txt"},
+        {"id": "mammoth", "name": "mammoth", "description": "Converts via its HTML pipeline — good structure preservation.", "default": False, "fn": _docx_mammoth, "pip_package": "mammoth"},
     ],
     "pptx": [
-        {"id": "python_pptx", "name": "python-pptx", "description": "Extracts text from PowerPoint slide decks.", "default": True, "fn": _default},
+        {"id": "python_pptx", "name": "python-pptx", "description": "Extracts text from PowerPoint slide decks.", "default": True, "fn": _default, "pip_package": "python-pptx"},
     ],
     "xlsx": [
-        {"id": "openpyxl", "name": "openpyxl", "description": "Cell-by-cell exact values from Excel spreadsheets.", "default": True, "fn": _default},
-        {"id": "pandas", "name": "pandas", "description": "Renders each sheet as a formatted table — often better for numeric/tabular data.", "default": False, "fn": _xlsx_pandas},
+        {"id": "openpyxl", "name": "openpyxl", "description": "Cell-by-cell exact values from Excel spreadsheets.", "default": True, "fn": _default, "pip_package": "openpyxl"},
+        {"id": "pandas", "name": "pandas", "description": "Renders each sheet as a formatted table — often better for numeric/tabular data.", "default": False, "fn": _xlsx_pandas, "pip_package": "pandas"},
     ],
     "text": [
-        {"id": "plain", "name": "Plain text read", "description": "Markdown/TXT/CSV — a direct read, nothing to swap.", "default": True, "fn": _default},
+        {"id": "plain", "name": "Plain text read", "description": "Markdown/TXT/CSV — a direct read, nothing to swap.", "default": True, "fn": _default, "pip_package": None},
     ],
 }
 
@@ -159,6 +205,55 @@ def format_for_ext(ext: str) -> Optional[str]:
 def list_engines(fmt: str) -> List[Dict[str, Any]]:
     """Engine metadata only (no callables) — what the Marketplace/UI needs."""
     return [{k: v for k, v in e.items() if k != "fn"} for e in ENGINES.get(fmt, [])]
+
+
+def _load_enabled_map() -> Dict[str, List[str]]:
+    import json
+    from app.db.database import SessionLocal
+    from app.db.crud import get_system_settings
+    with SessionLocal() as db:
+        settings = get_system_settings(db)
+        try:
+            return json.loads(settings.extraction_engines_json or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
+
+def is_engine_enabled(fmt: str, engine_id: str) -> bool:
+    """A format's own default engine is always enabled (see ENGINES'
+    "default" flag) and never stored in extraction_engines_json — every
+    other engine needs an explicit opt-in row there. Package availability
+    (app.core.optional_deps.is_available) is a SEPARATE concern from this
+    preference: an engine can be "enabled" here (the user wants it) while
+    its pip package still isn't installed yet — see app.api.marketplace's
+    is_engine_available, which checks both."""
+    entry = next((e for e in ENGINES.get(fmt, []) if e["id"] == engine_id), None)
+    if entry and entry.get("default"):
+        return True
+    return engine_id in _load_enabled_map().get(fmt, [])
+
+
+def set_engine_enabled(fmt: str, engine_id: str, enabled: bool) -> None:
+    """Toggles a non-default engine's opt-in preference — see
+    is_engine_enabled's own docstring. A format's own default engine is
+    always enabled and can't be toggled off (nothing calls this for one;
+    see app.api.marketplace's install/uninstall routes, which never treat
+    a default entry as installable/removable in the first place)."""
+    import json
+    from app.db.database import SessionLocal
+    from app.db.crud import get_system_settings
+
+    with SessionLocal() as db:
+        settings = get_system_settings(db)
+        current = _load_enabled_map()
+        engines_for_fmt = set(current.get(fmt, []))
+        if enabled:
+            engines_for_fmt.add(engine_id)
+        else:
+            engines_for_fmt.discard(engine_id)
+        current[fmt] = sorted(engines_for_fmt)
+        settings.extraction_engines_json = json.dumps(current)
+        db.commit()
 
 
 def _guess_file_arg_name(tool_def: Optional[Dict[str, Any]]) -> Optional[str]:

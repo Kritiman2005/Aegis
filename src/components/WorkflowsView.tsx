@@ -20,16 +20,20 @@ import {
   Workflow as WorkflowIcon, Plus, Play, Save, Trash2, ArrowLeft, Loader2,
   CheckCircle2, XCircle, Sparkles, Wrench, Brain, Plug, Repeat,
   Database as DatabaseIcon, Search, X, FileText, Scissors,
-  MessageCircle, ScanText, AudioLines, Globe, FolderOpen, FileDown,
+  MessageCircle, ScanText, AudioLines, FolderOpen, FileDown,
   FileSpreadsheet, Presentation, FileType2, Link2,
   Layers, Upload,
   Boxes, FileOutput, MessageSquareText, GitBranch, ArrowDownUp,
   History as HistoryIcon, Clock, AlertTriangle, Send,
+  Globe, PencilLine, GitMerge, Split, HelpCircle,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { useSocket } from '../hooks/useSocket';
 import AegisDatabaseBrowser from './AegisDatabaseBrowser';
 import { ServiceLogo, getServiceIcon } from '@/lib/serviceIcons';
+import { toolNeedsStructuredInput } from '@/lib/toolSchema';
+import { Select } from './ui/Select';
+import { Disclosure } from './ui/Disclosure';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
 
@@ -39,6 +43,7 @@ interface ToolDef {
   inputSchema?: { properties?: Record<string, any>; required?: string[] };
   server?: string | null; // owning MCP server name, or null for a local tool
 }
+
 
 interface ModelDef {
   id: number;
@@ -53,6 +58,14 @@ interface ModelDef {
   // (see NodeData.includeImages and engine.py's _attach_workflow_vision_image).
   is_vision?: boolean;
   mmproj_status?: string | null;
+  // context_length is this model's NATIVE/trained max (from its own GGUF
+  // metadata) — NOT what it actually loads with. effective_context_length
+  // is the real ceiling (see llm_manager.resolve_effective_n_ctx: capped
+  // at 8192 unless the user set a hardware.n_ctx override), used to show
+  // the "llm" node's actual token-context ceiling for whichever model IT
+  // calls, instead of whatever model happens to be globally active.
+  context_length?: number;
+  effective_context_length?: number;
 }
 
 interface InstalledDB {
@@ -87,6 +100,16 @@ interface ExtractionEngineDef {
   default: boolean;
 }
 
+// An installed OCR/transcription engine (app.core.media_engines) a Media
+// tool node (transcribe_media, extract_image_text) can pick instead of
+// Aegis's bundled default — see NodeData.mediaEngine.
+interface MediaEngineDef {
+  id: string;
+  display_name: string;
+  description: string;
+  default: boolean;
+}
+
 interface ChunkingStrategyDef {
   id: string;
   name: string;
@@ -102,19 +125,6 @@ interface ChatSessionDef {
   preview: string;
   message_count: number;
   created_at: string | null;
-}
-
-// A connected MCP tool an Extract node can pick as a custom extractor —
-// how a user integrates an extraction tool Aegis doesn't bundle itself,
-// without Aegis running arbitrary third-party code (see Connectors). Not
-// scoped to one format (see list_mcp_candidates' own docstring), so the
-// same list is offered under every format in the Extract node's picker.
-interface McpExtractionToolDef {
-  engine_id: string;
-  name: string;
-  description: string;
-  server: string;
-  tool: string;
 }
 
 interface WorkflowSummary {
@@ -177,10 +187,12 @@ type NodeStatus = 'idle' | 'running' | 'completed' | 'failed';
 // (engine.py's module docstring) — a small, generic, n8n-style set:
 // configure a plain node differently per use rather than reaching for a new
 // dedicated kind, unless a task is genuinely mechanical/unique enough to
-// need one (Extract, Chunk — real distinct operations, not judgment calls).
-// "tool" covers both an MCP node (data.server set) and a local tool node
-// (data.server null) — the engine treats them identically, only the
-// palette/config panel distinguish them for the user. "llm" is a pure
+// need one (Chunk — a real distinct operation, not a judgment call).
+// "tool" covers both an MCP node (data.server set to a real server name)
+// and a local tool node (data.server === LOCAL_TOOLS_SERVER, or null on a
+// node saved before that sentinel existed) — the engine only ever reads
+// data.toolName, never data.server (see _dispatch_tool), so this is purely
+// a frontend palette/config-panel distinction. "llm" is a pure
 // reasoning step — freeform text by default, or a structured JSON judgment
 // call (needs_search, is_export, or anything else) when data.outputFields
 // is set — see PromptNodeFields/its Output-format section below. "logic" is
@@ -226,7 +238,16 @@ type NodeStatus = 'idle' | 'running' | 'completed' | 'failed';
 type NodeKind =
   | 'tool' | 'llm' | 'logic' | 'loop' | 'database' | 'vector' | 'reranker' | 'embedding' | 'extract' | 'chunk' | 'chat_trigger'
   | 'document_upload_trigger' | 'schedule_trigger'
-  | 'chat_reply' | 'export_document' | 'send_to_chat';
+  | 'chat_reply' | 'export_document' | 'send_to_chat'
+  | 'http_request' | 'set_fields' | 'merge' | 'switch';
+
+// An edge's own data — everything here is set from the canvas (clicking
+// the edge, or a node's own Input/Output column), never inferred.
+// outputField/inputField: a plain field-to-field mapping (see
+// _resolve_named_arguments's own docstring for why this is deliberately
+// not free-form templating). caseValue: only meaningful when the edge's
+// SOURCE is a "switch" node — see app.core.workflows.engine._run_switch_node.
+type EdgeMapping = { outputField?: string; inputField?: string; caseValue?: string };
 
 interface NodeData {
   label: string;
@@ -237,6 +258,11 @@ interface NodeData {
   isAi: boolean;
   instruction?: string;
   staticInputs?: Record<string, string>;
+  // Only meaningful when toolName is transcribe_media or extract_image_text
+  // (app.core.media_engines) — which installed OCR/transcription engine
+  // this node calls instead of Aegis's bundled default. Unset = bundled
+  // default, same fallback contract as enginePerFormat for an Extract node.
+  mediaEngine?: string;
   // "llm" kind — a pure reasoning step bound to one explicitly-picked
   // downloaded model, no tool schema involved. Freeform text by default;
   // set outputFields to grammar-constrain the call to a JSON shape and get
@@ -301,6 +327,38 @@ interface NodeData {
   // vision input (app.core.workflows.engine._attach_workflow_vision_image),
   // independent of whatever model happens to be active for chat.
   includeImages?: boolean;
+  // "chat_trigger" kind — accepted by default (undefined/true both mean
+  // "on"); only an explicit `false` (unchecking "Also accept voice input")
+  // makes THIS workflow's trigger reject a voice-sourced message. A normal
+  // typed message (including a manually-reviewed, then-sent voice
+  // transcript) is never affected by this either way — see
+  // app.core.workflows.engine's own run_chat_workflow docstring on
+  // message_source resolution.
+  acceptsVoice?: boolean;
+  // "chat_trigger" kind, only shown/meaningful when acceptsVoice isn't
+  // explicitly false — the mic
+  // button itself always lives in the chat composer (it's the only place
+  // you're actually talking during a live conversation), but every OTHER
+  // mic setting lives here instead of a global chat preference, since
+  // different connected workflows may reasonably want different behavior.
+  // Stopping the mic sends the transcript as a real chat message
+  // immediately (through this workflow) rather than leaving it in the
+  // composer for review. See backend app.api.voice._get_active_voice_config,
+  // which the composer calls before every recording to resolve all of this.
+  voiceAutoSend?: boolean;
+  // Which engine actually turns the recorded clip into text. "local" uses
+  // Aegis's own faster-whisper catalog (voiceEngineId, an
+  // app.core.media_engines id — blank means the bundled "whisper-small"
+  // default). "mcp" instead calls a connected MCP server's tool
+  // (voiceMcpTool, a fully-qualified tool name from GET /api/workflows/tools)
+  // — since there's no standard MCP convention for "this argument accepts
+  // audio", voiceMcpAudioField records which of that tool's own input
+  // properties the base64-encoded clip gets placed into (app.api.voice
+  // sends it as {[voiceMcpAudioField]: <base64 audio>}).
+  voiceBackend?: 'local' | 'mcp';
+  voiceEngineId?: string;
+  voiceMcpTool?: string;
+  voiceMcpAudioField?: string;
   // "database" and "vector" kinds — an installed database (see
   // app.db.models.InstalledDatabase), referenced by id rather than a raw
   // file path so any engine in the catalog works the same way. For
@@ -329,8 +387,9 @@ interface NodeData {
   searchMode?: 'hybrid' | 'semantic' | 'bm25';
   // "reranker" kind — re-scores an upstream "vector" search's candidates
   // with a cross-encoder. rerankerModel is a Marketplace-downloaded model
-  // id, or unset for Aegis's own bundled default
-  // (app.core.workflows.engine._run_reranker_node).
+  // id, or unset for Aegis's own default cross-encoder — NOT bundled,
+  // needs sentence-transformers installed from the Dependencies panel
+  // first (app.core.workflows.engine._run_reranker_node).
   rerankerModel?: string;
   // "extract" kind — pulls text out of a document file. extractorFormat is
   // a cosmetic-only hint (which palette row placed this node) — the engine
@@ -355,6 +414,29 @@ interface NodeData {
   chunkSize?: number;
   overlap?: number;
   strategy?: string;
+  // "http_request" kind — a raw outbound HTTP call
+  // (app.core.workflows.engine._run_http_request_node). url/method are
+  // overridable per-run via an edge mapped to inputField "url"/"method"/
+  // "body" (staticInputs + the edge-mapping fields below cover that, same
+  // convention a "tool" node's Fixed values already use). headers is
+  // always static — a value that needs to vary per-run belongs in the URL
+  // or body instead.
+  url?: string;
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+  headers?: Record<string, string>;
+  body?: string;
+  // "set_fields" kind — deterministic dict reshaping
+  // (app.core.workflows.engine._run_set_fields_node). staticInputs (shared
+  // with "tool"/"database" nodes' own Fixed values / Query parameters) is
+  // the name->literal map; "merge" additionally starts from a shallow copy
+  // of the upstream dict, "replace" starts from nothing but this node's
+  // own fields.
+  mode?: 'merge' | 'replace';
+  // "merge" kind — explicitly combines every upstream node's output
+  // (app.core.workflows.engine._run_merge_node). "list"/"concat"/"first";
+  // separator only applies to "concat" (default: two newlines).
+  mergeMode?: 'list' | 'concat' | 'first';
+  separator?: string;
   status?: NodeStatus;
   // Derived at render time from the current edges (see decoratedNodes in
   // WorkflowsView) — never set by hand, never persisted. True when at
@@ -370,15 +452,13 @@ interface NodeData {
 // (nodeIcon below) and for each row in the tool palette.
 function toolIconByName(name?: string, server?: string | null) {
   const cls = "w-3 h-3 flex-shrink-0";
-  if (name === 'web_scrape' || name === 'extract_webpage_text' || name?.startsWith('browser_')) {
-    return <Globe className={`${cls} text-aegis-primary-light`} />;
-  }
   if (name === 'transcribe_media') return <AudioLines className={`${cls} text-aegis-primary-light`} />;
   if (name === 'extract_image_text') return <ScanText className={`${cls} text-aegis-primary-light`} />;
   if (name === 'export_file') return <FileDown className={`${cls} text-aegis-text-muted`} />;
   if (name && ['search_local_files', 'list_folder', 'read_file', 'write_file', 'copy_file', 'move_file', 'delete_file'].includes(name)) {
     return <FolderOpen className={`${cls} text-aegis-text-muted`} />;
   }
+  if (server === LOCAL_TOOLS_SERVER) return <FolderOpen className={`${cls} text-aegis-text-muted`} />;
   if (server) {
     // The server's own real brand icon (serviceIcons.tsx, keyed by the
     // same name the backend registers it under) — a generic Plug for
@@ -423,6 +503,10 @@ function nodeIcon(data: NodeData) {
   if (data.kind === 'reranker') return <ArrowDownUp className="w-3 h-3 text-aegis-primary-light flex-shrink-0" />;
   if (data.kind === 'extract') return extractFormatIcon(data.extractorFormat);
   if (data.kind === 'chunk') return <Scissors className="w-3 h-3 text-aegis-primary-light flex-shrink-0" />;
+  if (data.kind === 'http_request') return <Globe className="w-3 h-3 text-aegis-primary-light flex-shrink-0" />;
+  if (data.kind === 'set_fields') return <PencilLine className="w-3 h-3 text-aegis-primary-light flex-shrink-0" />;
+  if (data.kind === 'merge') return <GitMerge className="w-3 h-3 text-aegis-primary-light flex-shrink-0" />;
+  if (data.kind === 'switch') return <Split className="w-3 h-3 text-aegis-primary-light flex-shrink-0" />;
   if (data.isAi) return <Sparkles className="w-3 h-3 text-aegis-primary-light flex-shrink-0" />;
   return toolIconByName(data.toolName, data.server);
 }
@@ -459,11 +543,21 @@ function nodeSubtitle(data: NodeData): string {
     case 'vector':
       return data.databaseId ? `${data.operation === 'upsert' ? 'Store' : 'Search'} vectors` : 'No vector store selected';
     case 'reranker':
-      return `Rerank top ${data.topK ?? 5} with ${data.rerankerModel || 'Aegis\'s bundled cross-encoder'}`;
+      return `Rerank top ${data.topK ?? 5} with ${data.rerankerModel || 'Aegis\'s default cross-encoder'}`;
     case 'extract':
       return data.filePath || 'No file path set — or wired in from upstream';
     case 'chunk':
       return `${data.chunkSize || 300} words, ${data.overlap || 50} overlap`;
+    case 'http_request':
+      return data.url ? `${data.method || 'GET'} ${data.url}` : 'No URL set — or wired in from upstream';
+    case 'set_fields':
+      return Object.keys(data.staticInputs || {}).length > 0
+        ? `Sets ${Object.keys(data.staticInputs || {}).join(', ')}`
+        : 'No fields set yet';
+    case 'merge':
+      return `Combine as ${data.mergeMode || 'list'}`;
+    case 'switch':
+      return data.field ? `Route by "${data.field}"` : 'Set a field, then a case value per outgoing edge';
     default:
       return data.toolName || (data.isAi ? 'AI step — no tool' : 'No tool selected');
   }
@@ -492,6 +586,13 @@ const PORT_TYPE_LABEL: Record<PortType, string> = {
   any: 'anything',
 };
 
+// Node kinds whose backend executor only ever reads
+// _upstream_node_ids(...)[0] — a second edge wired into one of these is
+// silently dropped with no error. Used by decoratedEdges to flag it in the
+// canvas instead. "merge" is deliberately not here — it's the one kind
+// built to read every incoming edge on purpose (see _run_merge_node).
+const SINGLE_INPUT_KINDS = new Set<NodeKind>(['chunk', 'vector', 'embedding', 'database', 'reranker']);
+
 function outputPortType(data: NodeData): PortType {
   switch (data.kind) {
     case 'chat_trigger':
@@ -511,6 +612,16 @@ function outputPortType(data: NodeData): PortType {
       return 'text';
     case 'chunk':
       return 'text[]';
+    case 'http_request':
+      // _run_http_request_node returns {status_code, headers, body}.
+      return 'record';
+    case 'set_fields':
+      // _run_set_fields_node always returns a dict.
+      return 'record';
+    case 'merge':
+      // Genuinely variable by data.mergeMode (list/concat/first each
+      // return a different shape) — 'any' rather than false-flagging.
+      return 'any';
     case 'export_document':
       // _run_export_document_node returns the (possibly export-augmented)
       // reply text — a real string, not a dead end; nothing happens to be
@@ -523,12 +634,13 @@ function outputPortType(data: NodeData): PortType {
     case 'chat_reply':
     case 'logic':
     case 'loop':
+    case 'switch':
       // Pass-through nodes — their real output type is whatever's upstream
       // of THEM, not a fixed shape (chat_reply carries its upstream "llm"
       // node's result forward unchanged — see engine.py's `elif kind ==
       // "chat_reply":` branch — so it's exactly as dynamic as that "llm"
-      // node's own output, same reasoning as logic/loop below). 'any'
-      // rather than tracing the chain back further, matching this
+      // node's own output, same reasoning as logic/loop/switch below).
+      // 'any' rather than tracing the chain back further, matching this
       // feature's bias toward not false-flagging.
       return 'any';
     default: // "tool"/"mcp" — StdioMCPClient/StreamableHTTPMCPClient.call_tool
@@ -576,9 +688,11 @@ function inputPortTypes(data: NodeData): PortType[] {
       // is checked against this whole list rather than the pair being
       // matched positionally, so either shape on either edge is accepted.
       return ['text', 'record'];
-    default: // tool/mcp, llm, logic, database, loop — all read a named
-      // field via per-edge mapping or fold the whole upstream into
-      // context/a prompt, so nothing about the upstream's shape is wrong.
+    default: // tool/mcp, llm, logic, switch, database, loop, http_request,
+      // set_fields, merge — all read a named field via per-edge mapping,
+      // fold the whole upstream into context/a prompt, or (merge) accept
+      // literally anything by design, so nothing about the upstream's
+      // shape is wrong.
       return ['any'];
   }
 }
@@ -646,15 +760,234 @@ function PaletteRow({ icon, title, description, onClick }: { icon: React.ReactNo
   );
 }
 
+// One row in the help guide's node reference — same {icon, title,
+// description} shape as PaletteRow, but not clickable and with room for a
+// longer description (the palette's own blurbs are truncated to 2 lines).
+function HelpNodeRow({ icon, title, description }: { icon: React.ReactNode; title: string; description: string }) {
+  return (
+    <div className="flex items-start gap-2.5 py-2 border-b border-aegis-border last:border-b-0">
+      <div className="mt-0.5">{icon}</div>
+      <div className="min-w-0 flex-1">
+        <div className="text-xs font-semibold text-aegis-text-primary">{title}</div>
+        <div className="text-[11px] text-aegis-text-muted leading-relaxed mt-0.5">{description}</div>
+      </div>
+    </div>
+  );
+}
+
+// Reference content for the Workflows "?" help guide — grouped the same
+// way the node palette itself is, so the two stay easy to keep in sync by
+// eye. Kept as data (not prose baked into JSX) so it's one place to update
+// if a node's behavior changes.
+const HELP_NODE_GROUPS: { category: string; nodes: { icon: React.ReactNode; title: string; description: string }[] }[] = [
+  {
+    category: 'Triggers — how a workflow starts',
+    nodes: [
+      { icon: <MessageCircle className="w-4 h-4 text-aegis-success flex-shrink-0" />, title: 'On chat message', description: 'Fires when you send a message, but only once this workflow is connected via the toolbar\'s "Connect to chat" button. Needs exactly one Send Reply node fed by exactly one "llm" node.' },
+      { icon: <Upload className="w-4 h-4 text-aegis-success flex-shrink-0" />, title: 'On document upload', description: 'Fires when you upload a document, once connected via "Connect to uploads" — alongside Aegis\'s own automatic extract-and-index pipeline, not instead of it.' },
+      { icon: <Clock className="w-4 h-4 text-aegis-success flex-shrink-0" />, title: 'On a schedule', description: 'Fires on its own timer in the background (checked every minute) — no chat connection needed. Good for polling something and posting updates with Post to Chat.' },
+    ],
+  },
+  {
+    category: 'Reply & delivery',
+    nodes: [
+      { icon: <MessageSquareText className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />, title: 'Send Reply', description: 'Marks where a chat reply gets sent — no config of its own. The "llm" node wired directly into it (with nothing else after it) does the real work: streaming, memory settings, structured output.' },
+      { icon: <FileOutput className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />, title: 'Export Reply', description: 'Turns the reply into a downloadable file, if a classifier "llm" node wired into it (outputFields is_export/format) decided one was requested. Use the "Add classifier node" button on this node to set that up.' },
+      { icon: <Send className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />, title: 'Post to Chat', description: 'Delivers text into a dedicated chat thread from outside a live chat turn — what a schedule-triggered chain uses to actually notify you.' },
+    ],
+  },
+  {
+    category: 'Logic & routing',
+    nodes: [
+      { icon: <GitBranch className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />, title: 'Logic', description: 'A gate: passes an upstream value through when a condition holds, otherwise skips everything wired after it for this run.' },
+      { icon: <Split className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />, title: 'Switch', description: 'Routes to exactly one of several outgoing branches by matching a value against a "Case value" set on each outgoing edge — cleaner than chaining several Logic gates for 3+ branches.' },
+      { icon: <Repeat className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />, title: 'Loop', description: 'Runs the whole chain of steps wired directly after it once per item in an upstream list (e.g. Extract → Chunk → Embedding → Vector, once per attachment).' },
+      { icon: <GitMerge className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />, title: 'Merge', description: 'Explicitly combines every upstream branch into one value (list, concatenated text, or first-non-empty). Wire more than one edge into this node on purpose — most other nodes here only ever read the first.' },
+      { icon: <PencilLine className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />, title: 'Set fields', description: 'Renames, picks, or adds fields on the upstream value — a deterministic reshape with no model call, for when the next node needs a different shape of data than the last one produced.' },
+    ],
+  },
+  {
+    category: 'AI',
+    nodes: [
+      { icon: <Brain className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />, title: 'LLM step', description: 'A reasoning step bound to one picked model — freeform text, or a structured JSON judgment call when configured with Output fields. Wire one directly into Send Reply (nothing else after it) to make it the reply generator.' },
+    ],
+  },
+  {
+    category: 'Documents & retrieval',
+    nodes: [
+      { icon: <FileText className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />, title: 'Extract', description: 'Pulls plain text out of a PDF/Word/PowerPoint/Excel file. PDF and Word work out of the box; other formats/engines install on demand from the Marketplace\'s Document Extraction category.' },
+      { icon: <Scissors className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />, title: 'Chunk text', description: 'Splits upstream text into overlapping pieces, ready for an Embedding node.' },
+      { icon: <Layers className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />, title: 'Embedding', description: 'Turns upstream text into vectors, using Aegis\'s own bundled model by default or one downloaded from the Marketplace.' },
+      { icon: <Boxes className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />, title: 'Vector store', description: 'Stores vectors from an Embedding node, or searches an installed vector store for matches to a query.' },
+      { icon: <ArrowDownUp className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />, title: 'Reranker', description: 'Re-scores a Vector search\'s candidates with a cross-encoder, keeping only the most relevant — needs sentence-transformers installed from the Dependencies panel, even for the default model.' },
+      { icon: <DatabaseIcon className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />, title: 'Database', description: 'Runs SQL against an installed relational database, or Aegis\'s own built-in SQLite store.' },
+    ],
+  },
+  {
+    category: 'Connecting to the outside world',
+    nodes: [
+      { icon: <Globe className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />, title: 'HTTP Request', description: 'Calls any REST API directly — for a service with no dedicated Connector, when a plain request is all you need.' },
+      { icon: <FolderOpen className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />, title: 'Local Files & Folders', description: 'Search, read, write, copy, move, delete, and export files on your own machine, confined to your home directory.' },
+      { icon: <AudioLines className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />, title: 'Transcribe / Extract Image Text', description: 'Media tools for audio/video transcription and image OCR — pick which installed engine each node uses in its own config panel.' },
+      { icon: <Plug className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />, title: 'MCP connector tools', description: 'Any tool from a connected server (Connectors panel) shows up here, one palette row per server, scoped to just that server\'s own tools.' },
+    ],
+  },
+];
+
+function WorkflowHelpModal({ onClose }: { onClose: () => void }) {
+  return (
+    <div className="fixed inset-0 z-40 bg-black/50 backdrop-blur-md flex items-center justify-center p-6" onClick={onClose}>
+      <div
+        className="bg-aegis-overlay border border-aegis-border rounded-xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-5 py-4 border-b border-aegis-border flex-shrink-0">
+          <div>
+            <h3 className="text-sm font-bold text-aegis-text-primary">Workflows guide</h3>
+            <p className="text-[11px] text-aegis-text-muted mt-0.5">What each node does, and how they fit together.</p>
+          </div>
+          <button onClick={onClose} className="p-1 rounded-md hover:bg-aegis-overlay text-aegis-text-muted hover:text-aegis-text-secondary">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+        <div className="workflow-popover-scroll overflow-y-auto px-5 py-4 flex flex-col gap-4">
+          <div>
+            <h4 className="text-[11px] font-bold text-aegis-text-muted uppercase tracking-wider mb-2">The basics</h4>
+            <ul className="text-[12px] text-aegis-text-secondary leading-relaxed list-disc pl-4 flex flex-col gap-1.5">
+              <li>A workflow is a directed graph: drag a node from the palette ("Add node"), then drag from one node's bottom dot to another's top dot to wire them together. Data flows along the arrows.</li>
+              <li>Every workflow needs exactly one trigger (or none, for something you'll only ever click "Run" on by hand) and exactly one final step with nothing wired after it.</li>
+              <li>Not connected yet doesn't mean not saved — a workflow saves independently of whether it's live. Use the toolbar's "Connect to chat"/"Connect to uploads" to make a trigger actually fire on real messages/uploads, and "Run" to test it manually any time.</li>
+              <li>Click a node to open its settings, its Input column (what's wired in, and any field mapping), and its Output column (what it produces, and what it feeds into).</li>
+              <li>A red dashed edge means a type mismatch — the node at the end can't use what's coming in unmapped. An amber dashed edge means "extra input ignored" — that node only reads its first wire; use a Merge node if you actually want to combine more than one.</li>
+              <li>New to this? "New Workflow" offers a few starting templates instead of a blank canvas — a real, runnable shape to read and modify.</li>
+            </ul>
+          </div>
+          {HELP_NODE_GROUPS.map(group => (
+            <Disclosure key={group.category} label={group.category}>
+              <div className="flex flex-col -mt-1">
+                {group.nodes.map(n => <HelpNodeRow key={n.title} {...n} />)}
+              </div>
+            </Disclosure>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const nodeTypes = { workflowNode: WorkflowNode };
 
 let nodeIdCounter = 0;
 const nextNodeId = () => `node_${Date.now()}_${nodeIdCounter++}`;
 
+const makeEdge = (source: string, target: string, fieldMapping?: EdgeMapping): Edge => ({
+  id: `edge_${source}_${target}`, source, target, data: fieldMapping || {}, markerEnd: { type: MarkerType.ArrowClosed },
+});
+
+// Starter workflows offered when creating a new one — each demonstrates one
+// of the three trigger kinds fully wired end to end, so a first-time user
+// sees a real, runnable shape instead of a blank canvas plus a 16-item
+// palette with no idea which of them to pick first. build() is called
+// fresh on selection (not memoized) so nextNodeId() always mints new,
+// non-colliding ids even if the same template is picked more than once.
+interface WorkflowTemplate {
+  id: string;
+  name: string;
+  description: string;
+  icon: React.ReactNode;
+  build: () => { nodes: Node[]; edges: Edge[] };
+}
+
+const WORKFLOW_TEMPLATES: WorkflowTemplate[] = [
+  {
+    id: 'chat_assistant',
+    name: 'Simple Chat Assistant',
+    description: 'On chat message → LLM → Send Reply — the smallest working chat handler, ready to customize.',
+    icon: <MessageCircle className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />,
+    build: () => {
+      const triggerId = nextNodeId(), llmId = nextNodeId(), replyId = nextNodeId();
+      return {
+        nodes: [
+          { id: triggerId, type: 'workflowNode', position: { x: 730, y: 100 }, data: { label: 'On chat message', kind: 'chat_trigger', isAi: false, status: 'idle' } },
+          { id: llmId, type: 'workflowNode', position: { x: 700, y: 330 }, data: { label: 'Reply', kind: 'llm', isAi: false, modelName: '', instruction: 'You are a helpful assistant. Answer clearly and concisely.', status: 'idle' } },
+          { id: replyId, type: 'workflowNode', position: { x: 795, y: 560 }, data: { label: 'Send Reply', kind: 'chat_reply', isAi: false, status: 'idle' } },
+        ],
+        edges: [makeEdge(triggerId, llmId), makeEdge(llmId, replyId)],
+      };
+    },
+  },
+  {
+    id: 'document_qa',
+    name: 'Document Q&A',
+    description: 'On document upload → Extract → Chunk → Embedding → Vector store — indexes an uploaded file yourself, instead of relying on the automatic index.',
+    icon: <FileText className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />,
+    build: () => {
+      const triggerId = nextNodeId(), extractId = nextNodeId(), chunkId = nextNodeId(), embedId = nextNodeId(), vectorId = nextNodeId();
+      return {
+        nodes: [
+          { id: triggerId, type: 'workflowNode', position: { x: 80, y: 80 }, data: { label: 'On document upload', kind: 'document_upload_trigger', isAi: false, status: 'idle' } },
+          { id: extractId, type: 'workflowNode', position: { x: 80, y: 310 }, data: { label: 'Extract', kind: 'extract', isAi: false, filePath: '', status: 'idle' } },
+          { id: chunkId, type: 'workflowNode', position: { x: 80, y: 540 }, data: { label: 'Chunk text', kind: 'chunk', isAi: false, chunkSize: 300, overlap: 50, status: 'idle' } },
+          { id: embedId, type: 'workflowNode', position: { x: 80, y: 770 }, data: { label: 'Embedding', kind: 'embedding', isAi: false, status: 'idle' } },
+          { id: vectorId, type: 'workflowNode', position: { x: 80, y: 1000 }, data: { label: 'Vector store', kind: 'vector', isAi: false, operation: 'upsert', topK: 5, status: 'idle' } },
+        ],
+        edges: [
+          // document_upload_trigger's output is a {file_path, document_id,
+          // filename, file_type} record — Extract needs the plain
+          // file_path string, so this needs the same explicit
+          // outputField mapping the trigger's own help text recommends,
+          // not a blind connection (which the type-checker would flag).
+          makeEdge(triggerId, extractId, { outputField: 'file_path' }),
+          makeEdge(extractId, chunkId), makeEdge(chunkId, embedId), makeEdge(embedId, vectorId),
+        ],
+      };
+    },
+  },
+  {
+    id: 'scheduled_digest',
+    name: 'Scheduled Digest',
+    description: 'On a schedule → LLM → Post to Chat — a background job that writes a message into a conversation on its own timer.',
+    icon: <Clock className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />,
+    build: () => {
+      const triggerId = nextNodeId(), llmId = nextNodeId(), postId = nextNodeId();
+      return {
+        nodes: [
+          { id: triggerId, type: 'workflowNode', position: { x: 80, y: 80 }, data: { label: 'On a schedule', kind: 'schedule_trigger', isAi: false, intervalMinutes: 60, status: 'idle' } },
+          { id: llmId, type: 'workflowNode', position: { x: 80, y: 310 }, data: { label: 'LLM step', kind: 'llm', isAi: false, modelName: '', instruction: 'Summarize anything notable and produce a short digest message.', status: 'idle' } },
+          { id: postId, type: 'workflowNode', position: { x: 80, y: 540 }, data: { label: 'Post to Chat', kind: 'send_to_chat', isAi: false, status: 'idle' } },
+        ],
+        edges: [makeEdge(triggerId, llmId), makeEdge(llmId, postId)],
+      };
+    },
+  },
+];
+
+// Sentinel NodeData.server value for the collapsed "Local Files & Folders"
+// palette row (addLocalToolsNode) — scopes the node's Tool dropdown to just
+// the built-in local tools (server: null in ToolDef), mirroring the
+// one-row-per-MCP-server pattern (addMcpServerNode) without colliding with a
+// real MCP server that happens to be named "filesystem" (Connectors' own
+// "Local Files & Folders" entry, catalog.py — a separate, unrelated tool
+// set backed by @modelcontextprotocol/server-filesystem, not this one).
+const LOCAL_TOOLS_SERVER = '__local_tools__';
+
+// The two media tools (server: null, same as filesystem tools) are split out
+// into their own "Media tools" palette section instead of the collapsed
+// Local Files & Folders node — each one is a single fixed-purpose tool (no
+// picking a mode inside it, unlike the filesystem node's dropdown), and each
+// needs its own mediaEngine picker in NodeConfigPanel.
+const MEDIA_TOOL_NAMES = new Set(['transcribe_media', 'extract_image_text']);
+
 export default function WorkflowsView() {
   const { addMessageHandler } = useSocket();
   const [workflows, setWorkflows] = useState<WorkflowSummary[]>([]);
   const [listSearch, setListSearch] = useState('');
+  // Shown instead of jumping straight to a blank canvas when "New Workflow"
+  // is clicked — a first-time user facing an empty canvas plus a 16-item
+  // node palette has no obvious first move; picking a template gives them
+  // a real, runnable graph to read and modify instead.
+  const [templatePickerOpen, setTemplatePickerOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
   // Deleting a workflow is more consequential than this app's other
   // one-click deletes (an installed model/database is trivially
   // re-added; a hand-wired workflow graph isn't) — but a native
@@ -668,9 +1001,10 @@ export default function WorkflowsView() {
   const [databases, setDatabases] = useState<InstalledDB[]>([]);
   const [embeddingModels, setEmbeddingModels] = useState<EmbeddingModelDef[]>([]);
   const [rerankerModels, setRerankerModels] = useState<RerankerModelDef[]>([]);
-  const [extractionEngines, setExtractionEngines] = useState<ExtractionEngineDef[]>([]);
-  const [mcpExtractionTools, setMcpExtractionTools] = useState<McpExtractionToolDef[]>([]);
   const [chunkingStrategies, setChunkingStrategies] = useState<ChunkingStrategyDef[]>([]);
+  const [extractionEngines, setExtractionEngines] = useState<ExtractionEngineDef[]>([]);
+  const [ocrEngines, setOcrEngines] = useState<MediaEngineDef[]>([]);
+  const [transcriptionEngines, setTranscriptionEngines] = useState<MediaEngineDef[]>([]);
   const [chatSessions, setChatSessions] = useState<ChatSessionDef[]>([]);
   const [aegisDbTables, setAegisDbTables] = useState<{ name: string; label: string; user_created: boolean }[]>([]);
   const [aegisDbBrowserOpen, setAegisDbBrowserOpen] = useState(false);
@@ -711,14 +1045,14 @@ export default function WorkflowsView() {
     try {
       const res = await fetch(`${API_BASE}/api/workflows`);
       if (res.ok) setWorkflows((await res.json()).workflows || []);
-    } catch (e) {}
+    } catch (e) { toast.error('Could not load your workflows — check that the backend is running.'); }
   }, []);
 
   const fetchTools = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/api/workflows/tools`);
       if (res.ok) setTools((await res.json()).tools || []);
-    } catch (e) {}
+    } catch (e) { toast.error('Could not load available tools — check that the backend is running.'); }
   }, []);
 
   const fetchModels = useCallback(async () => {
@@ -728,7 +1062,7 @@ export default function WorkflowsView() {
         const data = await res.json();
         setModels((data.models || []).filter((m: ModelDef) => m.status === 'downloaded'));
       }
-    } catch (e) {}
+    } catch (e) { toast.error('Could not load downloaded models.'); }
   }, []);
 
   const fetchDatabases = useCallback(async () => {
@@ -738,17 +1072,24 @@ export default function WorkflowsView() {
         const data = await res.json();
         setDatabases((data.databases || []).filter((d: InstalledDB) => d.status === 'ready'));
       }
-    } catch (e) {}
+    } catch (e) { toast.error('Could not load installed databases.'); }
   }, []);
 
   const fetchEmbeddingModels = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/marketplace/embeddings`);
-      if (res.ok) {
-        const data = await res.json();
-        setEmbeddingModels((data.models || []).filter((m: EmbeddingModelDef) => m.status === 'downloaded'));
-      }
-    } catch (e) {}
+      // Local Marketplace-downloaded models plus, alongside them, every
+      // connected MCP server's tool that plausibly embeds text
+      // (app.core.embeddings.registry.list_mcp_candidates) — same
+      // "mcp:<server>:<tool>" picker-append pattern as extraction engines
+      // and chunking strategies below.
+      const [localRes, mcpRes] = await Promise.all([
+        fetch(`${API_BASE}/api/marketplace/embeddings`),
+        fetch(`${API_BASE}/api/workflows/mcp-embedding-candidates`),
+      ]);
+      const local = localRes.ok ? ((await localRes.json()).models || []).filter((m: EmbeddingModelDef) => m.status === 'downloaded') : [];
+      const mcp = mcpRes.ok ? (await mcpRes.json()).models || [] : [];
+      setEmbeddingModels([...local, ...mcp]);
+    } catch (e) { toast.error('Could not load embedding models.'); }
   }, []);
 
   const fetchRerankerModels = useCallback(async () => {
@@ -758,52 +1099,76 @@ export default function WorkflowsView() {
         const data = await res.json();
         setRerankerModels((data.models || []).filter((m: RerankerModelDef) => m.status === 'downloaded'));
       }
-    } catch (e) {}
-  }, []);
-
-  // Per-format extraction engines (app.core.extraction_engines, surfaced
-  // via the Marketplace's Extraction-category catalog entries) — powers
-  // the engine picker in an Extract node's config panel.
-  const fetchExtractionEngines = useCallback(async () => {
-    try {
-      const res = await fetch(`${API_BASE}/api/marketplace/tools`);
-      if (res.ok) {
-        const data = await res.json();
-        setExtractionEngines(
-          (data.tools || [])
-            .filter((t: any) => t.category === 'Extraction' && t.format && t.engine_id)
-            .map((t: any) => ({ format: t.format, engine_id: t.engine_id, name: t.name, description: t.description, default: !!t.default }))
-        );
-      }
-    } catch (e) {}
-  }, []);
-
-  // Connected MCP tools an Extract node can pick as a custom extractor
-  // (app.core.extraction_engines.list_mcp_candidates) — how a user
-  // integrates an extraction tool Aegis doesn't bundle itself: connect it
-  // from Connectors and it shows up here, no separate "install" step.
-  const fetchMcpExtractionTools = useCallback(async () => {
-    try {
-      const res = await fetch(`${API_BASE}/api/workflows/extraction-mcp-tools`);
-      if (res.ok) {
-        const data = await res.json();
-        setMcpExtractionTools(data.tools || []);
-      }
-    } catch (e) {}
+    } catch (e) { toast.error('Could not load reranker models.'); }
   }, []);
 
   // Built-in chunking strategies (app.core.chunking_engines) — powers the
   // strategy picker in a Chunk node's config panel. Not a Marketplace-
   // installed capability like extraction engines, so its own small
-  // endpoint rather than the Marketplace tools listing.
+  // endpoint rather than the Marketplace tools listing. Every connected
+  // MCP server's tool that plausibly chunks text is appended alongside
+  // them (app.core.chunking_engines.list_mcp_candidates), same
+  // "mcp:<server>:<tool>" pattern as extraction engines and embedding
+  // models.
   const fetchChunkingStrategies = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/workflows/chunking-strategies`);
-      if (res.ok) {
-        const data = await res.json();
-        setChunkingStrategies(data.strategies || []);
+      const [builtinRes, mcpRes] = await Promise.all([
+        fetch(`${API_BASE}/api/workflows/chunking-strategies`),
+        fetch(`${API_BASE}/api/workflows/mcp-chunking-candidates`),
+      ]);
+      const builtin = builtinRes.ok ? (await builtinRes.json()).strategies || [] : [];
+      const mcp = mcpRes.ok ? (await mcpRes.json()).strategies || [] : [];
+      setChunkingStrategies([...builtin, ...mcp]);
+    } catch (e) { toast.error('Could not load chunking strategies.'); }
+  }, []);
+
+  // Extraction engines aren't their own endpoint — they're generated
+  // per-(format, engine) pairs inside the Marketplace's own tools listing
+  // (app.core.marketplace._document_extraction_catalog), tagged with
+  // `format`/`engine_id` on top of the normal tool shape. A format's own
+  // default is always kept even if "installed" says otherwise (it's the
+  // fallback the engine itself uses, and needs to be nameable in the
+  // config panel's "Default (...)" option) — every other engine needs a
+  // real opt-in install from the Marketplace before it's offered here.
+  const fetchExtractionEngines = useCallback(async () => {
+    try {
+      // Every connected MCP server's tool that plausibly extracts text
+      // from a file is appended alongside the local per-format engines
+      // (app.core.extraction_engines.list_mcp_candidates) — same
+      // "mcp:<server>:<tool>" pattern as chunking strategies and embedding
+      // models above.
+      const [localRes, mcpRes] = await Promise.all([
+        fetch(`${API_BASE}/api/marketplace/tools`),
+        fetch(`${API_BASE}/api/workflows/mcp-extraction-candidates`),
+      ]);
+      const local = localRes.ok
+        ? ((await localRes.json()).tools || []).filter((t: any) => t.format && t.engine_id && (t.default || t.installed))
+        : [];
+      const mcp = mcpRes.ok ? (await mcpRes.json()).engines || [] : [];
+      setExtractionEngines([...local, ...mcp]);
+    } catch (e) { toast.error('Could not load extraction engines.'); }
+  }, []);
+
+  // Same "always keep the default nameable, everything else needs a real
+  // install" rule as extraction engines above, but OCR/transcription each
+  // have their own dedicated endpoint (app.api.marketplace_media) instead
+  // of riding on the Marketplace tools listing — see MarketplaceView.tsx's
+  // own fetch of the same endpoint.
+  const fetchMediaEngines = useCallback(async () => {
+    try {
+      const [ocrRes, transcriptionRes] = await Promise.all([
+        fetch(`${API_BASE}/api/marketplace/media-engines?capability=ocr`),
+        fetch(`${API_BASE}/api/marketplace/media-engines?capability=transcription`),
+      ]);
+      if (ocrRes.ok) {
+        const data = await ocrRes.json();
+        setOcrEngines((data.engines || []).filter((e: any) => e.default || e.installed));
       }
-    } catch (e) {}
+      if (transcriptionRes.ok) {
+        const data = await transcriptionRes.json();
+        setTranscriptionEngines((data.engines || []).filter((e: any) => e.default || e.installed));
+      }
+    } catch (e) { toast.error('Could not load media engines.'); }
   }, []);
 
   const fetchAegisDbTables = useCallback(async () => {
@@ -813,7 +1178,7 @@ export default function WorkflowsView() {
         const data = await res.json();
         setAegisDbTables((data.tables || []).map((t: any) => ({ name: t.name, label: t.label, user_created: !!t.user_created })));
       }
-    } catch (e) {}
+    } catch (e) { toast.error('Could not load Aegis database tables.'); }
   }, []);
 
   // Powers the conversation picker on chat_trigger/document_upload_trigger/
@@ -822,10 +1187,10 @@ export default function WorkflowsView() {
     try {
       const res = await fetch(`${API_BASE}/api/chat/sessions`);
       if (res.ok) setChatSessions(await res.json());
-    } catch (e) {}
+    } catch (e) { toast.error('Could not load chat sessions.'); }
   }, []);
 
-  useEffect(() => { fetchWorkflows(); fetchTools(); fetchModels(); fetchDatabases(); fetchEmbeddingModels(); fetchRerankerModels(); fetchExtractionEngines(); fetchMcpExtractionTools(); fetchChunkingStrategies(); fetchAegisDbTables(); fetchChatSessions(); }, [fetchWorkflows, fetchTools, fetchModels, fetchDatabases, fetchEmbeddingModels, fetchRerankerModels, fetchExtractionEngines, fetchMcpExtractionTools, fetchChunkingStrategies, fetchAegisDbTables, fetchChatSessions]);
+  useEffect(() => { fetchWorkflows(); fetchTools(); fetchModels(); fetchDatabases(); fetchEmbeddingModels(); fetchRerankerModels(); fetchChunkingStrategies(); fetchExtractionEngines(); fetchMediaEngines(); fetchAegisDbTables(); fetchChatSessions(); }, [fetchWorkflows, fetchTools, fetchModels, fetchDatabases, fetchEmbeddingModels, fetchRerankerModels, fetchChunkingStrategies, fetchExtractionEngines, fetchMediaEngines, fetchAegisDbTables, fetchChatSessions]);
 
   // Live per-node status while a run is in flight — same WebSocket
   // broadcast pattern MCPServersPanel/ModelHub already use.
@@ -936,26 +1301,64 @@ export default function WorkflowsView() {
     fetchWorkflows();
   };
 
+  // The exact prompt+field shape _run_export_document_node expects on its
+  // classifier edge (is_export/format/parts) — kept here as a one-time
+  // starting point a user is expected to customize, not a live-synced
+  // copy of chat.py's DEFAULT_TURN_CLASSIFIER_PROMPT (the backend doesn't
+  // require exact wording, only these three field names).
+  const EXPORT_CLASSIFIER_PROMPT = `Analyze this message and answer two independent questions about it.
+
+Output a JSON object with three keys:
+- "is_export": true only if the user wants a FILE created from this conversation's content — not just a question that happens to mention a file/document, and not a request to read or open something that already exists.
+- "format": one of "pdf", "docx", "xlsx" if is_export is true (closest match — e.g. "word document" -> "docx", "spreadsheet"/"excel" -> "xlsx", anything else -> "pdf"), otherwise null.
+- "parts": a list of the distinct questions/requests as short strings, in order, ONLY if the message bundles 2 or more genuinely separate asks that each need their own answer. Otherwise an empty list.
+
+Output valid JSON only. Example: {"is_export": true, "format": "docx", "parts": []}`;
+
+  // Places a pre-configured classifier "llm" node (the exact shape
+  // _run_export_document_node's duck-typed is_export lookup expects) and
+  // wires it directly into the given Export Reply node — building this by
+  // hand (the right prompt, the right three output fields, a second edge
+  // into an already-placed node) has zero UI assistance otherwise, which
+  // made this node effectively expert-only. Placed to the left of the
+  // target so it doesn't overlap it.
+  const addExportClassifierNode = (targetNodeId: string) => {
+    const id = nextNodeId();
+    setNodes(prev => {
+      const target = prev.find(n => n.id === targetNodeId);
+      const position = target ? { x: target.position.x - 340, y: target.position.y } : { x: 80, y: 80 };
+      return [...prev, {
+        id, type: 'workflowNode', position,
+        data: {
+          label: 'Export Classifier', kind: 'llm', isAi: false, modelName: '',
+          instruction: EXPORT_CLASSIFIER_PROMPT,
+          outputFields: [
+            { name: 'is_export', type: 'boolean', description: '' },
+            { name: 'format', type: 'string', description: '' },
+            { name: 'parts', type: 'array', description: '' },
+          ],
+          status: 'idle',
+        } as NodeData,
+      }];
+    });
+    setEdges(prev => [...prev, { id: `edge_${id}_${targetNodeId}`, source: id, target: targetNodeId, data: {}, markerEnd: { type: MarkerType.ArrowClosed } }]);
+  };
+
   const placeNode = (data: NodeData) => {
     const id = nextNodeId();
-    setNodes(prev => [...prev, { id, type: 'workflowNode', position: { x: 80 + prev.length * 40, y: 80 + prev.length * 30 }, data }]);
+    // Cascades diagonally by a full node-card width/height so each new node
+    // is immediately visible next to the last one, not hidden directly
+    // underneath it (a node card is ~280-350px wide) — wraps back to the
+    // start every 5 steps so a long session adding many nodes doesn't push
+    // the cascade off the visible canvas.
+    setNodes(prev => {
+      const step = prev.length % 5;
+      return [...prev, { id, type: 'workflowNode', position: { x: 80 + step * 300, y: 80 + step * 110 }, data }];
+    });
     setPaletteOpen(false);
   };
 
-  const addToolNode = (tool: ToolDef) => {
-    placeNode({
-      label: tool.name,
-      kind: 'tool',
-      toolName: tool.name,
-      server: tool.server ?? null,
-      isAi: false,
-      instruction: '',
-      staticInputs: {},
-      status: 'idle',
-    });
-  };
-
-  // One node kind covers every MCP server, same as Extract/Chunk/Database —
+  // One node kind covers every MCP server, same as Chunk/Database —
   // the palette picks WHICH SERVER (a real, unique brand icon per server via
   // ServiceLogo/serviceIcons.tsx, keyed by the server name the backend
   // already sends), the node's own config panel picks WHICH TOOL from that
@@ -975,12 +1378,34 @@ export default function WorkflowsView() {
     });
   };
 
+  // Same one-row, pick-the-tool-inside collapsed pattern as addMcpServerNode,
+  // for Aegis's own built-in local filesystem tools (server: null in
+  // ToolDef) — see LOCAL_TOOLS_SERVER's own docstring for why it needs its
+  // own sentinel instead of reusing server: null (the old flat-list
+  // fallback, still used by a node saved before this collapsing existed).
+  const addLocalToolsNode = () => {
+    placeNode({
+      label: 'Local Files & Folders',
+      kind: 'tool',
+      toolName: undefined,
+      server: LOCAL_TOOLS_SERVER,
+      isAi: false,
+      instruction: '',
+      staticInputs: {},
+      status: 'idle',
+    });
+  };
+
   const addLlmNode = () => {
     placeNode({ label: 'LLM step', kind: 'llm', isAi: false, modelName: '', instruction: '', status: 'idle' });
   };
 
   const addLogicNode = () => {
     placeNode({ label: 'Logic', kind: 'logic', isAi: false, field: '', operator: 'is_true', value: '', status: 'idle' });
+  };
+
+  const addSwitchNode = () => {
+    placeNode({ label: 'Switch', kind: 'switch', isAi: false, field: '', status: 'idle' });
   };
 
   const addChatReplyNode = () => {
@@ -1001,19 +1426,6 @@ export default function WorkflowsView() {
 
   const addRerankerNode = () => {
     placeNode({ label: 'Reranker', kind: 'reranker', isAi: false, topK: 5, status: 'idle' });
-  };
-
-  // A single node kind covers every format — the config panel below shows
-  // one extractor picker per format (each backed by whatever the user has
-  // downloaded from the Marketplace's Document Extraction category), and
-  // the engine auto-detects which format it's actually looking at from
-  // the file's own extension (engine.py's _run_extract_node) — no need for
-  // a separate palette row (and separate node) per format.
-  const addAutoExtractNode = () => {
-    placeNode({
-      label: 'Extract text', kind: 'extract', isAi: false,
-      filePath: '', staticInputs: {}, status: 'idle',
-    });
   };
 
   const addChunkNode = () => {
@@ -1044,6 +1456,40 @@ export default function WorkflowsView() {
     placeNode({ label: 'Embedding', kind: 'embedding', isAi: false, status: 'idle' });
   };
 
+  const addAutoExtractNode = () => {
+    placeNode({ label: 'Extract', kind: 'extract', isAi: false, filePath: '', status: 'idle' });
+  };
+
+  const addHttpRequestNode = () => {
+    placeNode({ label: 'HTTP Request', kind: 'http_request', isAi: false, method: 'GET', headers: {}, status: 'idle' });
+  };
+
+  const addSetFieldsNode = () => {
+    placeNode({ label: 'Set fields', kind: 'set_fields', isAi: false, mode: 'merge', staticInputs: {}, status: 'idle' });
+  };
+
+  const addMergeNode = () => {
+    placeNode({ label: 'Merge', kind: 'merge', isAi: false, mergeMode: 'list', status: 'idle' });
+  };
+
+  // Media tools (transcribe_media, extract_image_text) are local (server:
+  // null) same as filesystem tools, but each gets its own fixed, single-
+  // purpose palette row instead of sharing the filesystem tools' one
+  // collapsed "pick inside" node — there's only ever one of each, so there's
+  // nothing to pick.
+  const addSingleToolNode = (tool: ToolDef) => {
+    placeNode({
+      label: tool.name,
+      kind: 'tool',
+      toolName: tool.name,
+      server: null,
+      isAi: false,
+      instruction: '',
+      staticInputs: {},
+      status: 'idle',
+    });
+  };
+
   const onNodesChange = useCallback((changes: NodeChange[]) => {
     // React Flow's own default Backspace/Delete key handling fires a
     // 'remove' change for whatever node is selected — bypasses
@@ -1063,11 +1509,45 @@ export default function WorkflowsView() {
   // per-field mapping never gets fought), it just renders flagged.
   const decoratedEdges = useMemo(() => {
     const nodeById = new Map(nodes.map(n => [n.id, n]));
+
+    // These kinds only ever read _upstream_node_ids(...)[0] on the backend
+    // (see app.core.workflows.engine's own docstrings) — nothing stops a
+    // user from drawing a second edge into one anyway, and without this it
+    // would be silently dropped with zero warning. First edge in array
+    // order (matching the backend's own _upstream_node_ids order) is the
+    // one actually used; every one after it for the same target gets
+    // flagged. "merge" is deliberately excluded — it's the one kind built
+    // to read every incoming edge on purpose.
+    const extraInputIgnored = new Set<string>();
+    const seenTargets = new Set<string>();
+    for (const e of edges) {
+      const targetNode = nodeById.get(e.target);
+      const kind = (targetNode?.data as NodeData | undefined)?.kind;
+      if (!kind || !SINGLE_INPUT_KINDS.has(kind)) continue;
+      if (seenTargets.has(e.target)) {
+        extraInputIgnored.add(e.id);
+      } else {
+        seenTargets.add(e.target);
+      }
+    }
+
     return edges.map(e => {
       const sourceNode = nodeById.get(e.source);
       const targetNode = nodeById.get(e.target);
       if (!sourceNode || !targetNode) return e;
-      const edgeData = (e.data || {}) as { outputField?: string; inputField?: string };
+
+      if (extraInputIgnored.has(e.id)) {
+        return {
+          ...e,
+          style: { stroke: '#D97706', strokeDasharray: '5 3' },
+          label: 'extra input ignored',
+          labelStyle: { fill: '#D97706', fontSize: 10, fontWeight: 600 },
+          labelBgStyle: { fill: '#FFFFFF' },
+          markerEnd: { type: MarkerType.ArrowClosed, color: '#D97706' },
+        };
+      }
+
+      const edgeData = (e.data || {}) as EdgeMapping;
       if (edgeData.outputField || edgeData.inputField) return e;
 
       const outType = outputPortType(sourceNode.data as NodeData);
@@ -1088,7 +1568,8 @@ export default function WorkflowsView() {
   const decoratedNodes = useMemo(() => {
     const warningByTarget = new Map<string, string>();
     for (const e of decoratedEdges) {
-      if (e.label === 'type mismatch' && !warningByTarget.has(e.target)) {
+      if (warningByTarget.has(e.target)) continue;
+      if (e.label === 'type mismatch') {
         const nodeById = new Map(nodes.map(n => [n.id, n]));
         const sourceNode = nodeById.get(e.source);
         const targetNode = nodeById.get(e.target);
@@ -1098,6 +1579,8 @@ export default function WorkflowsView() {
             inputPortTypes(targetNode.data as NodeData),
           ));
         }
+      } else if (e.label === 'extra input ignored') {
+        warningByTarget.set(e.target, 'This step only reads its first incoming edge — every other one wired in is silently ignored. Use a Merge node if you actually want to combine them.');
       }
     }
     if (warningByTarget.size === 0) return nodes;
@@ -1237,7 +1720,7 @@ export default function WorkflowsView() {
   // ever being baked in at seed time. Edited from the node's own Input
   // column (n8n-style — see the node modal below), not a separate click
   // on the connecting line itself.
-  const updateEdgeMapping = (edgeId: string, patch: { outputField?: string; inputField?: string }) => {
+  const updateEdgeMapping = (edgeId: string, patch: EdgeMapping) => {
     setEdges(prev => prev.map(e => e.id === edgeId ? { ...e, data: { ...(e.data || {}), ...patch } } : e));
   };
 
@@ -1258,8 +1741,12 @@ export default function WorkflowsView() {
     }
     return map;
   }, [tools, search]);
-  const localTools = useMemo(
-    () => tools.filter(t => !t.server && (!search || t.name.toLowerCase().includes(search))),
+  const filesystemTools = useMemo(
+    () => tools.filter(t => !t.server && !MEDIA_TOOL_NAMES.has(t.name) && (!search || t.name.toLowerCase().includes(search))),
+    [tools, search]
+  );
+  const mediaTools = useMemo(
+    () => tools.filter(t => !t.server && MEDIA_TOOL_NAMES.has(t.name) && (!search || t.name.toLowerCase().includes(search))),
     [tools, search]
   );
   const showTrigger = !search || 'chat'.includes(search) || 'trigger'.includes(search) || 'message'.includes(search);
@@ -1274,8 +1761,12 @@ export default function WorkflowsView() {
   const showVector = !search || 'vector'.includes(search) || 'search'.includes(search);
   const showReranker = !search || 'rerank'.includes(search) || 'reranker'.includes(search);
   const showEmbedding = !search || 'embedding'.includes(search) || 'vector'.includes(search);
-  const showExtract = !search || 'extract'.includes(search) || 'document'.includes(search) || 'text'.includes(search);
   const showChunk = !search || 'chunk'.includes(search);
+  const showExtract = !search || 'extract'.includes(search) || 'document'.includes(search) || 'text'.includes(search);
+  const showHttpRequest = !search || 'http'.includes(search) || 'request'.includes(search) || 'api'.includes(search) || 'webhook'.includes(search);
+  const showSetFields = !search || 'set'.includes(search) || 'fields'.includes(search) || 'transform'.includes(search) || 'rename'.includes(search);
+  const showMerge = !search || 'merge'.includes(search) || 'combine'.includes(search) || 'join'.includes(search);
+  const showSwitch = !search || 'switch'.includes(search) || 'router'.includes(search) || 'route'.includes(search) || 'branch'.includes(search);
 
   // ── List view ──────────────────────────────────────────────────────────
   if (activeId === null) {
@@ -1294,12 +1785,21 @@ export default function WorkflowsView() {
               </div>
               <p className="text-sm text-aegis-text-secondary">Design exactly which tool runs at each step — nothing for the model to guess.</p>
             </div>
-            <button
-              onClick={startNew}
-              className="flex-shrink-0 flex items-center gap-1.5 px-3.5 py-2 bg-aegis-primary text-white text-[13px] font-semibold rounded-lg hover:bg-aegis-primary-dark transition-colors"
-            >
-              <Plus className="w-4 h-4" /> New Workflow
-            </button>
+            <div className="flex-shrink-0 flex items-center gap-2">
+              <button
+                onClick={() => setHelpOpen(true)}
+                title="What each node does, and how workflows fit together"
+                className="flex items-center gap-1.5 px-3 py-2 bg-aegis-overlay border border-aegis-border text-aegis-text-secondary text-[13px] font-semibold rounded-lg hover:bg-aegis-base transition-colors"
+              >
+                <HelpCircle className="w-4 h-4" /> Guide
+              </button>
+              <button
+                onClick={() => setTemplatePickerOpen(true)}
+                className="flex items-center gap-1.5 px-3.5 py-2 bg-aegis-primary text-white text-[13px] font-semibold rounded-lg hover:bg-aegis-primary-dark transition-colors"
+              >
+                <Plus className="w-4 h-4" /> New Workflow
+              </button>
+            </div>
           </div>
         </div>
 
@@ -1314,7 +1814,7 @@ export default function WorkflowsView() {
                 Build a step-by-step pipeline — connect chat, document uploads, tools, and models exactly the way you want them to run.
               </p>
               <button
-                onClick={startNew}
+                onClick={() => setTemplatePickerOpen(true)}
                 className="inline-flex items-center gap-1.5 px-4 py-2 bg-aegis-primary text-white text-[13px] font-semibold rounded-lg hover:bg-aegis-primary-dark transition-colors"
               >
                 <Plus className="w-4 h-4" /> Create your first workflow
@@ -1394,12 +1894,20 @@ export default function WorkflowsView() {
                             {nodeCount} step{nodeCount === 1 ? '' : 's'}
                           </span>
                           {w.is_chat_handler && (
-                            <span className="inline-flex items-center gap-1 text-[10px] text-aegis-primary-light px-1.5 py-0.5 rounded bg-aegis-primary/10">
+                            <span className="inline-flex items-center gap-1.5 text-[10px] font-semibold text-aegis-success px-1.5 py-0.5 rounded bg-aegis-success/10 border border-aegis-success/30">
+                              <span className="relative flex w-1.5 h-1.5 flex-shrink-0">
+                                <span className="absolute inline-flex h-full w-full rounded-full bg-aegis-success opacity-75 animate-ping" />
+                                <span className="relative inline-flex rounded-full w-1.5 h-1.5 bg-aegis-success" />
+                              </span>
                               <MessageCircle className="w-2.5 h-2.5" /> Live in chat
                             </span>
                           )}
                           {w.is_ingestion_handler && (
-                            <span className="inline-flex items-center gap-1 text-[10px] text-aegis-primary-light px-1.5 py-0.5 rounded bg-aegis-primary/10">
+                            <span className="inline-flex items-center gap-1.5 text-[10px] font-semibold text-aegis-success px-1.5 py-0.5 rounded bg-aegis-success/10 border border-aegis-success/30">
+                              <span className="relative flex w-1.5 h-1.5 flex-shrink-0">
+                                <span className="absolute inline-flex h-full w-full rounded-full bg-aegis-success opacity-75 animate-ping" />
+                                <span className="relative inline-flex rounded-full w-1.5 h-1.5 bg-aegis-success" />
+                              </span>
                               <Upload className="w-2.5 h-2.5" /> Handles uploads
                             </span>
                           )}
@@ -1412,6 +1920,54 @@ export default function WorkflowsView() {
             </>
           )}
         </div>
+
+        {templatePickerOpen && (
+          <div
+            className="fixed inset-0 z-30 bg-black/50 backdrop-blur-md flex items-center justify-center p-6"
+            onClick={() => setTemplatePickerOpen(false)}
+          >
+            <div
+              className="bg-aegis-overlay border border-aegis-border rounded-xl shadow-2xl w-full max-w-lg p-5 flex flex-col gap-3"
+              onClick={e => e.stopPropagation()}
+            >
+              <div>
+                <h3 className="text-sm font-bold text-aegis-text-primary">Start a new workflow</h3>
+                <p className="text-[11px] text-aegis-text-muted mt-0.5">Pick a starting point — every one of these is a normal, fully editable workflow once created.</p>
+              </div>
+              <button
+                onClick={() => { setTemplatePickerOpen(false); startNew(); }}
+                className="w-full flex items-start gap-3 px-3.5 py-3 rounded-lg border border-aegis-border hover:border-aegis-primary/40 hover:bg-aegis-raised transition-colors text-left"
+              >
+                <WorkflowIcon className="w-4 h-4 text-aegis-text-muted flex-shrink-0 mt-0.5" />
+                <div className="min-w-0">
+                  <div className="text-[13px] font-semibold text-aegis-text-primary">Blank canvas</div>
+                  <div className="text-[11px] text-aegis-text-muted">Start from nothing and add steps yourself.</div>
+                </div>
+              </button>
+              {WORKFLOW_TEMPLATES.map(t => (
+                <button
+                  key={t.id}
+                  onClick={() => {
+                    setTemplatePickerOpen(false);
+                    startNew();
+                    const { nodes: tNodes, edges: tEdges } = t.build();
+                    setName(t.name);
+                    setNodes(tNodes);
+                    setEdges(tEdges);
+                  }}
+                  className="w-full flex items-start gap-3 px-3.5 py-3 rounded-lg border border-aegis-border hover:border-aegis-primary/40 hover:bg-aegis-raised transition-colors text-left"
+                >
+                  <div className="mt-0.5">{t.icon}</div>
+                  <div className="min-w-0">
+                    <div className="text-[13px] font-semibold text-aegis-text-primary">{t.name}</div>
+                    <div className="text-[11px] text-aegis-text-muted">{t.description}</div>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        {helpOpen && <WorkflowHelpModal onClose={() => setHelpOpen(false)} />}
       </div>
     );
   }
@@ -1475,6 +2031,13 @@ export default function WorkflowsView() {
           className="flex items-center gap-1.5 px-3 py-1.5 bg-aegis-overlay border border-aegis-border text-aegis-text-primary text-xs font-semibold rounded-lg hover:bg-aegis-base disabled:opacity-40 transition-colors"
         >
           <HistoryIcon className="w-3.5 h-3.5" /> History
+        </button>
+        <button
+          onClick={() => setHelpOpen(true)}
+          title="What each node does, and how workflows fit together"
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-aegis-overlay border border-aegis-border text-aegis-text-primary text-xs font-semibold rounded-lg hover:bg-aegis-base transition-colors"
+        >
+          <HelpCircle className="w-3.5 h-3.5" /> Guide
         </button>
         <button
           onClick={saveWorkflow}
@@ -1577,12 +2140,14 @@ export default function WorkflowsView() {
                   databases={databases}
                   embeddingModels={embeddingModels}
                   rerankerModels={rerankerModels}
-                  extractionEngines={extractionEngines}
-                  mcpExtractionTools={mcpExtractionTools}
                   chunkingStrategies={chunkingStrategies}
+                  extractionEngines={extractionEngines}
+                  ocrEngines={ocrEngines}
+                  transcriptionEngines={transcriptionEngines}
                   aegisDbTables={aegisDbTables}
                   chatSessions={chatSessions}
                   onOpenAegisDbBrowser={() => setAegisDbBrowserOpen(true)}
+                  onAddExportClassifier={() => addExportClassifierNode(selectedNode.id)}
                   selectedTool={selectedTool}
                   onChange={updateSelectedNode}
                   canDelete={!isSeeded}
@@ -1594,7 +2159,7 @@ export default function WorkflowsView() {
                   }}
                 />
               </div>
-              <NodeOutputColumn node={selectedNode} edges={edges} nodes={nodes} />
+              <NodeOutputColumn node={selectedNode} edges={edges} nodes={nodes} onUpdateMapping={updateEdgeMapping} />
             </div>
           </div>
         )}
@@ -1658,7 +2223,6 @@ export default function WorkflowsView() {
                     </div>
                     {selectedRun.error_message && (
                       <div className="text-xs text-aegis-error bg-aegis-error/10 border border-aegis-error/30 rounded-lg p-2">
-                        {selectedRun.failed_node_id && <span className="font-semibold">'{selectedRun.failed_node_id}': </span>}
                         {selectedRun.error_message}
                       </div>
                     )}
@@ -1737,28 +2301,68 @@ export default function WorkflowsView() {
           {/* Post to Chat — the delivery node for a schedule-triggered
               chain, which has no live chat turn to reply into the way
               Send Reply does. */}
-          {showSendToChat && (
+          {(showSendToChat || showHttpRequest) && (
             <section>
               <div className="text-[10px] font-bold text-aegis-text-muted uppercase tracking-wider mb-1.5">Automation</div>
-              <PaletteRow
-                icon={<Send className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />}
-                title="Post to Chat"
-                description="Delivers upstream text into a dedicated chat thread for this workflow — for a schedule-triggered chain with no live chat turn to reply into"
-                onClick={addSendToChatNode}
-              />
+              <div className="flex flex-col gap-0.5">
+                {showSendToChat && (
+                  <PaletteRow
+                    icon={<Send className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />}
+                    title="Post to Chat"
+                    description="Delivers upstream text into a dedicated chat thread for this workflow — for a schedule-triggered chain with no live chat turn to reply into"
+                    onClick={addSendToChatNode}
+                  />
+                )}
+                {showHttpRequest && (
+                  <PaletteRow
+                    icon={<Globe className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />}
+                    title="HTTP Request"
+                    description="Calls any REST API — for a service with no dedicated Connector, when a plain request is all you need"
+                    onClick={addHttpRequestNode}
+                  />
+                )}
+              </div>
             </section>
           )}
 
           {/* Logic */}
-          {showLogic && (
+          {(showLogic || showSwitch || showSetFields || showMerge) && (
             <section>
               <div className="text-[10px] font-bold text-aegis-text-muted uppercase tracking-wider mb-1.5">Logic</div>
-              <PaletteRow
-                icon={<GitBranch className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />}
-                title="Logic"
-                description="A gate — passes an upstream value through when a condition holds, otherwise skips everything wired after it"
-                onClick={addLogicNode}
-              />
+              <div className="flex flex-col gap-0.5">
+                {showLogic && (
+                  <PaletteRow
+                    icon={<GitBranch className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />}
+                    title="Logic"
+                    description="A gate — passes an upstream value through when a condition holds, otherwise skips everything wired after it"
+                    onClick={addLogicNode}
+                  />
+                )}
+                {showSwitch && (
+                  <PaletteRow
+                    icon={<Split className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />}
+                    title="Switch"
+                    description="Routes to exactly one of several outgoing branches by matching a value — set a case per edge instead of chaining several Logic gates"
+                    onClick={addSwitchNode}
+                  />
+                )}
+                {showSetFields && (
+                  <PaletteRow
+                    icon={<PencilLine className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />}
+                    title="Set fields"
+                    description="Renames, picks, or adds fields on the upstream value — a deterministic reshape, no model call needed"
+                    onClick={addSetFieldsNode}
+                  />
+                )}
+                {showMerge && (
+                  <PaletteRow
+                    icon={<GitMerge className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />}
+                    title="Merge"
+                    description="Explicitly combines every upstream branch into one value — wire more than one edge into this node on purpose, instead of by accident into something that only reads the first"
+                    onClick={addMergeNode}
+                  />
+                )}
+              </div>
             </section>
           )}
 
@@ -1867,16 +2471,19 @@ export default function WorkflowsView() {
             </section>
           )}
 
-          {/* Document extraction — a single node; which downloaded engine
-              runs for each format is configured inside the node itself
-              (its config panel shows one picker per format), not chosen by
-              which palette row you clicked. */}
+          {/* Document extraction — a single "Extract" node whose format and
+              engine (pymupdf/pdfplumber/..., install-on-demand from the
+              Marketplace's Document Extraction category) are picked inside
+              the node's own config panel, not here. See addAutoExtractNode. */}
           {showExtract && (
             <section>
               <div className="text-[10px] font-bold text-aegis-text-muted uppercase tracking-wider mb-1.5">Document extraction</div>
-              <div className="flex flex-col gap-0.5">
-                <PaletteRow icon={<FileText className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />} title="Extract" description="Pulls text out of a document — PDF, Word, PowerPoint, Excel, or plain text. Pick which downloaded engine handles each format inside the node." onClick={addAutoExtractNode} />
-              </div>
+              <PaletteRow
+                icon={<FileText className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />}
+                title="Extract"
+                description="Pulls text out of a PDF, Word, PowerPoint, or Excel file — wire a file path in, or leave it to a document-upload trigger upstream"
+                onClick={addAutoExtractNode}
+              />
             </section>
           )}
 
@@ -1893,21 +2500,39 @@ export default function WorkflowsView() {
             </section>
           )}
 
-          {/* Local tools */}
-          {localTools.length > 0 && (
+          {/* Local tools — one collapsed row, same as an MCP server: which
+              specific tool (read_file, write_file, ...) is picked inside
+              the node's own config panel, not here. See addLocalToolsNode
+              and LOCAL_TOOLS_SERVER. */}
+          {filesystemTools.length > 0 && (
             <section>
-              <div className="text-[10px] font-bold text-aegis-text-muted uppercase tracking-wider mb-1.5">Local tools ({localTools.length})</div>
-              <div className="flex flex-col gap-0.5">
-                {localTools.map(t => (
-                  <PaletteRow
-                    key={t.name}
-                    icon={toolIconByName(t.name, t.server)}
-                    title={t.name}
-                    description={t.description}
-                    onClick={() => addToolNode(t)}
-                  />
-                ))}
-              </div>
+              <div className="text-[10px] font-bold text-aegis-text-muted uppercase tracking-wider mb-1.5">Local tools</div>
+              <PaletteRow
+                icon={<FolderOpen className="w-4 h-4 text-aegis-primary-light flex-shrink-0" />}
+                title="Local Files & Folders"
+                description={`${filesystemTools.length} tool${filesystemTools.length === 1 ? '' : 's'} available — search, read, write, copy, move, delete, and export files on your own laptop, confined to your home directory. Pick which one in the node's settings`}
+                onClick={addLocalToolsNode}
+              />
+            </section>
+          )}
+
+          {/* Media tools — transcribe_media (Whisper) and extract_image_text
+              (OCR), each its own fixed-purpose row since there's only one of
+              each (unlike the filesystem tools' pick-inside dropdown). Each
+              node picks which installed engine to use in its own config
+              panel — see the mediaEngine picker in NodeConfigPanel. */}
+          {mediaTools.length > 0 && (
+            <section>
+              <div className="text-[10px] font-bold text-aegis-text-muted uppercase tracking-wider mb-1.5">Media tools</div>
+              {mediaTools.map(t => (
+                <PaletteRow
+                  key={t.name}
+                  icon={toolIconByName(t.name, t.server)}
+                  title={t.name === 'transcribe_media' ? 'Transcribe Audio/Video' : 'Extract Image Text (OCR)'}
+                  description={t.description}
+                  onClick={() => addSingleToolNode(t)}
+                />
+              ))}
             </section>
           )}
         </div>
@@ -1916,6 +2541,7 @@ export default function WorkflowsView() {
       {aegisDbBrowserOpen && (
         <AegisDatabaseBrowser onClose={() => { setAegisDbBrowserOpen(false); fetchAegisDbTables(); }} />
       )}
+      {helpOpen && <WorkflowHelpModal onClose={() => setHelpOpen(false)} />}
     </div>
   );
 }
@@ -1923,6 +2549,7 @@ export default function WorkflowsView() {
 const EXTRACT_FORMAT_LABELS: Record<NonNullable<NodeData['extractorFormat']>, string> = {
   pdf: 'PDF', docx: 'Word (DOCX)', pptx: 'PowerPoint (PPTX)', xlsx: 'Excel (XLSX)', text: 'Markdown/TXT/CSV',
 };
+const EXTRACT_FORMAT_ORDER: NonNullable<NodeData['extractorFormat']>[] = ['pdf', 'docx', 'pptx', 'xlsx', 'text'];
 
 // What each node kind's own output actually looks like — static reference
 // text, not dynamically introspected (nothing has run yet at edit time).
@@ -1932,22 +2559,26 @@ const EXTRACT_FORMAT_LABELS: Record<NonNullable<NodeData['extractorFormat']>, st
 // a list of {content, filename, document_id, ...} tells you "content" is
 // a real field name to type there, not "results" or "text".
 const NODE_OUTPUT_SHAPE: Partial<Record<NodeKind, string>> = {
-  chat_trigger: '{ message, history, attachments, pending_attachments }',
+  chat_trigger: '{ message, history, attachments, pending_attachments, source }  — source is "voice" or "text".',
   document_upload_trigger: '{ file_path, document_id, filename, file_type }',
   schedule_trigger: '{ fired_at } — just a timestamp; wire an "mcp"/"tool" node after it to actually fetch something fresh on each firing.',
   send_to_chat: 'The exact text it delivered — a real string, useful if you wire something after it too.',
   llm: 'Plain text — or, with structured Output configured, exactly those field names as a JSON object.',
   logic: "Whatever came in, unchanged (or nothing at all if this gate's condition is false).",
+  switch: 'Whatever came in, unchanged — routing happens by which outgoing edge is followed, not by this value.',
   loop: 'A list — one entry per item, each the last step in the chain\'s own output for that item.',
   tool: 'Whatever that tool returns — usually an object; check the tool\'s own description.',
   database: 'Query: a list of row objects (or { row_count } for a write). SQLite database, "List rows": { columns, rows, row_count }. Insert/Update/Delete: the affected row. Create a new table: { success, created_table }.',
   vector: 'Search: a list of matches, each { content, filename, document_id, ... a score field }. Store: { upserted: <count> }.',
   reranker: 'The same list of matches, re-ordered by relevance and trimmed to Top K (each gains a rerank_score field).',
   embedding: '{ texts: [...], vectors: [...] } — paired 1:1, in the same order.',
-  extract: 'Plain text — the document\'s extracted content.',
+  extract: "Plain text — the document's extracted content.",
   chunk: 'A list of text chunks.',
   chat_reply: 'The exact text the reply-generation "llm" node produced, unchanged.',
   export_document: 'The reply text, with a download link appended if a file was actually exported.',
+  http_request: '{ status_code, headers, body } — body is the parsed JSON object if the response was JSON, else raw text.',
+  set_fields: 'A dict with exactly the fields configured (plus whatever the upstream carried, in "merge" mode).',
+  merge: 'Depends on the mode: "list" — a plain list of every upstream output. "concat" — one joined string. "first" — whatever the first non-empty upstream output was.',
 };
 
 // The subset of NODE_OUTPUT_SHAPE whose keys are actually fixed and
@@ -1959,7 +2590,7 @@ const NODE_OUTPUT_SHAPE: Partial<Record<NodeKind, string>> = {
 // left out here (and so give no suggestions) rather than risk suggesting a
 // field name that's wrong for the operation actually configured.
 const NODE_OUTPUT_FIELDS: Partial<Record<NodeKind, string[]>> = {
-  chat_trigger: ['message', 'history', 'attachments', 'pending_attachments'],
+  chat_trigger: ['message', 'history', 'attachments', 'pending_attachments', 'source'],
   document_upload_trigger: ['file_path', 'document_id', 'filename', 'file_type'],
   schedule_trigger: ['fired_at'],
   embedding: ['texts', 'vectors'],
@@ -2008,7 +2639,7 @@ function NodeInputColumn({ node, edges, nodes, onUpdateMapping }: {
   node: Node;
   edges: Edge[];
   nodes: Node[];
-  onUpdateMapping: (edgeId: string, patch: { outputField?: string; inputField?: string }) => void;
+  onUpdateMapping: (edgeId: string, patch: EdgeMapping) => void;
 }) {
   const incoming = edges.filter(e => e.target === node.id);
   return (
@@ -2024,7 +2655,7 @@ function NodeInputColumn({ node, edges, nodes, onUpdateMapping }: {
         incoming.map(edge => {
           const source = nodes.find(n => n.id === edge.source);
           const sourceData = source?.data as NodeData | undefined;
-          const edgeData = (edge.data || {}) as { outputField?: string; inputField?: string };
+          const edgeData = (edge.data || {}) as EdgeMapping;
           const outputShape = sourceData?.kind ? NODE_OUTPUT_SHAPE[sourceData.kind] : undefined;
           return (
             <div key={edge.id} className="border border-aegis-border rounded-lg p-2.5 flex flex-col gap-2">
@@ -2064,7 +2695,7 @@ function NodeInputColumn({ node, edges, nodes, onUpdateMapping }: {
 // reference, not dynamically introspected (nothing has run yet at edit
 // time) — for structured "llm" output, lists the exact configured field
 // names instead of the generic text, since those ARE known ahead of time.
-function NodeOutputColumn({ node, edges, nodes }: { node: Node; edges: Edge[]; nodes: Node[] }) {
+function NodeOutputColumn({ node, edges, nodes, onUpdateMapping }: { node: Node; edges: Edge[]; nodes: Node[]; onUpdateMapping: (edgeId: string, patch: EdgeMapping) => void }) {
   const data = node.data as NodeData;
   const shape = NODE_OUTPUT_SHAPE[data.kind];
   // "Feeds into" — the mirror of the Input column's own list, so which
@@ -2097,14 +2728,26 @@ function NodeOutputColumn({ node, edges, nodes }: { node: Node; edges: Edge[]; n
           outgoing.map(edge => {
             const target = nodes.find(n => n.id === edge.target);
             const targetData = target?.data as NodeData | undefined;
-            const edgeData = (edge.data || {}) as { outputField?: string; inputField?: string };
+            const edgeData = (edge.data || {}) as EdgeMapping;
             return (
               <div key={edge.id} className="border border-aegis-border rounded-lg p-2 flex flex-col gap-1">
                 <p className="text-xs font-semibold text-aegis-text-secondary">{targetData?.label || edge.target}</p>
-                <p className="text-[10px] text-aegis-text-muted leading-relaxed">
-                  {edgeData.outputField ? <>Sends field <span className="font-mono text-aegis-text-primary">{edgeData.outputField}</span></> : 'Sends the whole output'}
-                  {edgeData.inputField ? <> as <span className="font-mono text-aegis-text-primary">{edgeData.inputField}</span></> : ''}
-                </p>
+                {data.kind === 'switch' ? (
+                  <div>
+                    <label className="text-[9px] font-semibold text-aegis-text-muted uppercase">Case value</label>
+                    <input
+                      value={edgeData.caseValue || ''}
+                      onChange={e => onUpdateMapping(edge.id, { caseValue: e.target.value })}
+                      placeholder="Blank = default branch"
+                      className="w-full mt-0.5 bg-aegis-overlay border border-aegis-border rounded-md px-1.5 py-1 text-[11px] font-mono text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+                    />
+                  </div>
+                ) : (
+                  <p className="text-[10px] text-aegis-text-muted leading-relaxed">
+                    {edgeData.outputField ? <>Sends field <span className="font-mono text-aegis-text-primary">{edgeData.outputField}</span></> : 'Sends the whole output'}
+                    {edgeData.inputField ? <> as <span className="font-mono text-aegis-text-primary">{edgeData.inputField}</span></> : ''}
+                  </p>
+                )}
               </div>
             );
           })
@@ -2115,7 +2758,7 @@ function NodeOutputColumn({ node, edges, nodes }: { node: Node; edges: Edge[]; n
 }
 
 function NodeConfigPanel({
-  data, isReplyGenerator, upstreamFieldSuggestions, tools, models, databases, embeddingModels, rerankerModels, extractionEngines, mcpExtractionTools, chunkingStrategies, aegisDbTables, chatSessions, onOpenAegisDbBrowser, selectedTool, onChange, onDelete, canDelete,
+  data, isReplyGenerator, upstreamFieldSuggestions, tools, models, databases, embeddingModels, rerankerModels, chunkingStrategies, extractionEngines, ocrEngines, transcriptionEngines, aegisDbTables, chatSessions, onOpenAegisDbBrowser, onAddExportClassifier, selectedTool, onChange, onDelete, canDelete,
 }: {
   data: NodeData;
   // Only meaningful for kind "llm" — true when THIS node is the one whose
@@ -2136,12 +2779,19 @@ function NodeConfigPanel({
   databases: InstalledDB[];
   embeddingModels: EmbeddingModelDef[];
   rerankerModels: RerankerModelDef[];
-  extractionEngines: ExtractionEngineDef[];
-  mcpExtractionTools: McpExtractionToolDef[];
   chunkingStrategies: ChunkingStrategyDef[];
+  // format -> installed engines for that format (see extraction_engines.py),
+  // powers the Extract node's per-format engine picker.
+  extractionEngines: ExtractionEngineDef[];
+  ocrEngines: MediaEngineDef[];
+  transcriptionEngines: MediaEngineDef[];
   aegisDbTables: { name: string; label: string; user_created: boolean }[];
   chatSessions: ChatSessionDef[];
   onOpenAegisDbBrowser: () => void;
+  // "export_document" kind only — places a pre-configured classifier "llm"
+  // node (right prompt, right output fields) wired directly into THIS
+  // node, since building that by hand has zero other UI assistance.
+  onAddExportClassifier: () => void;
   selectedTool?: ToolDef;
   onChange: (patch: Partial<NodeData>) => void;
   onDelete: () => void;
@@ -2185,16 +2835,16 @@ function NodeConfigPanel({
   const conversationField = (blankOptionLabel: string) => (
     <div>
       <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Conversation</label>
-      <select
+      <Select
         value={data.conversationId || ''}
         onChange={e => onChange({ conversationId: e.target.value || undefined })}
-        className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+        className="mt-1"
       >
         <option value="">{blankOptionLabel}</option>
         {chatSessions.map(s => (
           <option key={s.id} value={s.id}>{s.preview.length > 60 ? s.preview.slice(0, 60) + '…' : s.preview}</option>
         ))}
-      </select>
+      </Select>
     </div>
   );
 
@@ -2222,8 +2872,111 @@ function NodeConfigPanel({
           Leave blank to take over ALL your chats when connected — the only option before per-conversation scoping existed. Pick one here to scope this workflow to just that conversation instead; your other chats keep using the normal pipeline (or a different workflow scoped to them). A global handler and any number of conversation-scoped ones can all be connected at the same time.
         </p>
         <p className="text-[10px] text-aegis-text-muted leading-relaxed border-t border-aegis-border pt-2">
-          A document attached to a chat message uses the SAME upload path as the standalone document library, and this turn's output includes a "pending_attachments" list — wire a Loop node off this trigger (itemsField "pending_attachments") into an Extract → Chunk → Embedding → Vector chain to index it as part of this same turn, exactly like the seeded pipeline does.
+          A document attached to a chat message uses the SAME upload path as the standalone document library — Aegis already extracts and indexes it automatically, so this turn's "pending_attachments" list is mainly useful for images: wire a Loop node off this trigger (itemsField "pending_attachments") into an "llm" node with a vision-capable model picked to look at each one. For a document, build your own Extract → Chunk → Embedding → Vector chain instead if you need this workflow to see its contents directly, rather than relying on the automatic index.
         </p>
+        <label className="flex items-start gap-2 text-xs text-aegis-text-secondary pt-1 border-t border-aegis-border">
+          <input
+            type="checkbox"
+            checked={data.acceptsVoice !== false}
+            onChange={e => onChange({ acceptsVoice: e.target.checked ? undefined : false })}
+            className="mt-0.5"
+          />
+          <span>Also accept voice input</span>
+        </label>
+        <p className="text-[10px] text-aegis-text-muted leading-relaxed">
+          On by default: a voice message runs through this workflow just like a typed one. Uncheck this only if this specific workflow should refuse voice turns (e.g. it expects exact typed syntax). A normal typed message, including a voice transcript the user reviewed before hitting Send, is never affected by this either way. The mic button always stays in the chat composer — everything below only decides what happens once it's pressed.
+        </p>
+        {data.acceptsVoice !== false && (() => {
+          const mcpTools = tools.filter(t => !!t.server);
+          const selectedMcpTool = mcpTools.find(t => t.name === data.voiceMcpTool);
+          const audioFieldOptions = Object.keys(selectedMcpTool?.inputSchema?.properties || {});
+          return (
+            <div className="flex flex-col gap-3 pl-2 border-l-2 border-aegis-border ml-0.5">
+              <label className="flex items-start gap-2 text-xs text-aegis-text-secondary">
+                <input
+                  type="checkbox"
+                  checked={!!data.voiceAutoSend}
+                  onChange={e => onChange({ voiceAutoSend: e.target.checked || undefined })}
+                  className="mt-0.5"
+                />
+                <span>
+                  Send automatically
+                  <span className="block text-[10px] text-aegis-text-muted leading-snug font-normal">Stop recording and it sends right away — no review, straight through this workflow.</span>
+                </span>
+              </label>
+
+              <div>
+                <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Transcription source</label>
+                <Select
+                  value={data.voiceBackend || 'local'}
+                  onChange={e => onChange({
+                    voiceBackend: (e.target.value as 'local' | 'mcp') === 'mcp' ? 'mcp' : undefined,
+                    voiceEngineId: undefined,
+                    voiceMcpTool: undefined,
+                    voiceMcpAudioField: undefined,
+                  })}
+                  className="mt-1"
+                >
+                  <option value="local">Local engine</option>
+                  <option value="mcp">MCP tool</option>
+                </Select>
+              </div>
+
+              {(data.voiceBackend || 'local') === 'local' ? (
+                <div>
+                  <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Engine</label>
+                  <Select
+                    value={data.voiceEngineId || ''}
+                    onChange={e => onChange({ voiceEngineId: e.target.value || undefined })}
+                    className="mt-1"
+                  >
+                    <option value="">whisper-small (default)</option>
+                    {transcriptionEngines.filter(e => e.id !== 'whisper-small').map(e => (
+                      <option key={e.id} value={e.id}>{e.display_name}</option>
+                    ))}
+                  </Select>
+                  <p className="text-[10px] text-aegis-text-muted mt-1 leading-relaxed">Install more sizes from the Marketplace's Media Extraction category — only installed ones show up here.</p>
+                </div>
+              ) : (
+                <>
+                  <div>
+                    <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">MCP tool</label>
+                    <Select
+                      value={data.voiceMcpTool || ''}
+                      onChange={e => onChange({ voiceMcpTool: e.target.value || undefined, voiceMcpAudioField: undefined })}
+                      title={selectedMcpTool?.description}
+                      className="mt-1"
+                    >
+                      <option value="">Select a tool…</option>
+                      {mcpTools.map(t => (
+                        <option key={t.name} value={t.name}>{t.server} — {t.name}</option>
+                      ))}
+                    </Select>
+                    {mcpTools.length === 0 && (
+                      <p className="text-[10px] text-aegis-text-muted mt-1 leading-relaxed">No MCP servers connected yet — add one under Connectors first.</p>
+                    )}
+                  </div>
+                  {data.voiceMcpTool && (
+                    <div>
+                      <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Audio input field</label>
+                      <Select
+                        value={data.voiceMcpAudioField || ''}
+                        onChange={e => onChange({ voiceMcpAudioField: e.target.value || undefined })}
+                        className="mt-1"
+                      >
+                        <option value="">Select…</option>
+                        {audioFieldOptions.map(key => (
+                          <option key={key} value={key}>{key}</option>
+                        ))}
+                      </Select>
+                      <p className="text-[10px] text-aegis-text-muted mt-1 leading-relaxed">Which of this tool's own inputs receives the recorded clip (base64-encoded) — MCP has no standard "this is audio" convention, so pick the field yourself.</p>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          );
+        })()}
       </div>
     );
   }
@@ -2234,7 +2987,7 @@ function NodeConfigPanel({
         {header}
         {labelField}
         <p className="text-[10px] text-aegis-text-muted leading-relaxed">
-          Fires when you upload a document — only if this workflow is connected via the toolbar's "Connect to uploads" button. Needs exactly one final step overall. Typically feeds an Extract → Chunk → Embedding → Vector store chain.
+          Fires when you upload a document — only if this workflow is connected via the toolbar's "Connect to uploads" button. Every document upload reaches this trigger with a real {'{'}file_path, document_id, filename, file_type{'}'} payload, alongside Aegis's own automatic extract-and-index pipeline (they run independently — this trigger doesn't replace it). Needs exactly one final step overall.
         </p>
         {conversationField('Every upload (global handler)')}
         <p className="text-[10px] text-aegis-text-muted leading-relaxed">
@@ -2251,7 +3004,7 @@ function NodeConfigPanel({
         </label>
         {data.includeImages ? (
           <p className="text-[10px] text-aegis-text-muted leading-relaxed">
-            Off by default: an uploaded image (PNG/JPG) normally never reaches this trigger at all — it's read by whatever vision model is active for chat instead, or rejected if none is. With this on, an image fires this trigger like any file ({'{'}file_path, document_id, filename, file_type{'}'}), letting THIS workflow's own "llm" node read it with whatever model it picks — independent of the active chat model. Extract only understands documents, not images, so branch first: add a Logic node right after this trigger, Field "file_type", condition "matches regex", value <code className="font-mono">png|jpe?g</code> — route matches to an "llm" node with a vision-capable model picked, everything else to your normal Extract chain.
+            Off by default: an uploaded image (PNG/JPG) normally never reaches this trigger at all — it's read by whatever vision model is active for chat instead, or rejected if none is. With this on, an image fires this trigger too, alongside documents. Extract only understands documents, not images, so route on file_type with a Logic node: image types into an "llm" node with a vision-capable model picked, everything else into your normal Extract chain.
           </p>
         ) : (
           <p className="text-[10px] text-aegis-text-muted leading-relaxed">
@@ -2269,6 +3022,15 @@ function NodeConfigPanel({
         {labelField}
         <p className="text-[10px] text-aegis-text-muted leading-relaxed">
           Wire this AFTER the Send Reply node, with a classifier "llm" node (outputFields including is_export/format) also feeding it directly if you want real export detection. If a file was requested, turns the reply into a real PDF/DOCX/XLSX and appends a download link — otherwise passes the reply through unchanged. Make this the workflow's final step.
+        </p>
+        <button
+          onClick={onAddExportClassifier}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-aegis-border hover:border-aegis-primary/40 hover:bg-aegis-raised transition-colors text-[11px] font-semibold text-aegis-primary-light self-start"
+        >
+          <Sparkles className="w-3.5 h-3.5 flex-shrink-0" /> Add classifier node
+        </button>
+        <p className="text-[10px] text-aegis-text-muted leading-relaxed -mt-1">
+          Places a pre-configured "llm" node (the right prompt and output fields) and wires it directly into this one — customize its prompt afterward if you want different export triggers.
         </p>
       </div>
     );
@@ -2311,6 +3073,30 @@ function NodeConfigPanel({
         <p className="text-[10px] text-aegis-text-muted leading-relaxed">
           Delivers whatever's wired into it (usually an "llm" summary) as a real chat message. Notifies you immediately wherever you are in the app, and the message is there for good whenever you open that conversation.
         </p>
+        {fieldDatalist}
+        <div>
+          <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Field</label>
+          <input
+            value={data.field || ''}
+            onChange={e => onChange({ field: e.target.value })}
+            placeholder="e.g. summary — blank sends the whole upstream value"
+            list="upstream-field-suggestions"
+            className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+          />
+          {upstreamFieldSuggestions.length > 0 && (
+            <p className="text-[10px] text-aegis-text-muted mt-1">
+              Known fields from what's wired in: {upstreamFieldSuggestions.map((f, i) => (
+                <span key={f}>
+                  <button type="button" onClick={() => onChange({ field: f })} className="text-aegis-primary-light hover:underline font-mono">{f}</button>
+                  {i < upstreamFieldSuggestions.length - 1 ? ', ' : ''}
+                </span>
+              ))}
+            </p>
+          )}
+          <p className="text-[10px] text-aegis-text-muted mt-1 leading-relaxed">
+            Only matters if what's wired in is a structured object (e.g. an "llm" node with Output fields configured) — picks one field out of it instead of dumping the whole thing as JSON.
+          </p>
+        </div>
         {conversationField('Dedicated thread for this workflow (default)')}
         <p className="text-[10px] text-aegis-text-muted leading-relaxed">
           Leave blank and it lands in one dedicated conversation kept just for this workflow's automated updates, titled from the workflow's own name. Pick an existing conversation here instead — your main chat, say — to have it show up right there.
@@ -2335,14 +3121,14 @@ function NodeConfigPanel({
         {labelField}
         <div>
           <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Model</label>
-          <select
+          <Select
             value={data.modelName || ''}
             onChange={e => onChange({ modelName: e.target.value || undefined })}
-            className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+            className="mt-1"
           >
             <option value="">{models.length === 0 ? 'No models downloaded yet' : 'Select a model…'}</option>
             {models.map(m => <option key={m.name} value={m.name}>{m.display_name || m.name}</option>)}
-          </select>
+          </Select>
           {(() => {
             const selected = models.find(m => m.name === data.modelName);
             return selected?.is_vision && selected.mmproj_status === 'downloaded' && (
@@ -2433,14 +3219,19 @@ function NodeConfigPanel({
             </div>
           )}
         </div>
-        <p className="text-[10px] text-aegis-primary-light leading-relaxed border-t border-aegis-border pt-2">
-          {isReplyGenerator
-            ? 'This is the reply generator — its sole outgoing edge leads to a Chat Reply node, so it streams live to the user instead of running as a one-shot call.'
-            : 'Memory settings below always apply to this call — for a plain judgment call (e.g. a decide/classify step) they still fold in, they just have less to work with than a full reply.'}
-        </p>
-        <div className="pt-1 border-t border-aegis-border">
-          <MemorySettingsPanel />
-        </div>
+        {isReplyGenerator && (
+          <p className="text-[10px] text-aegis-primary-light leading-relaxed border-t border-aegis-border pt-2">
+            This is the reply generator — its sole outgoing edge leads to a Chat Reply node, so it streams live to the user instead of running as a one-shot call.
+          </p>
+        )}
+        <Disclosure label="Memory settings">
+          <p className="text-[10px] text-aegis-text-muted leading-relaxed -mt-1">
+            {isReplyGenerator
+              ? 'Applies to this reply.'
+              : 'Applies to this call too — for a plain judgment call (e.g. a decide/classify step) it still folds in, just with less to work with than a full reply.'}
+          </p>
+          <MemorySettingsPanel modelMaxContext={models.find(m => m.name === data.modelName)?.effective_context_length} />
+        </Disclosure>
       </div>
     );
   }
@@ -2476,10 +3267,10 @@ function NodeConfigPanel({
         </div>
         <div>
           <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Condition</label>
-          <select
+          <Select
             value={data.operator || 'is_true'}
             onChange={e => onChange({ operator: e.target.value as NodeData['operator'] })}
-            className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+            className="mt-1"
           >
             <option value="is_true">is true</option>
             <option value="is_false">is false</option>
@@ -2488,7 +3279,7 @@ function NodeConfigPanel({
             <option value="contains">contains</option>
             <option value="matches_regex">matches regex</option>
             <option value="changed_since_last_run">changed since last run</option>
-          </select>
+          </Select>
         </div>
         {data.operator === 'changed_since_last_run' && (
           <p className="text-[10px] text-aegis-text-muted leading-relaxed">
@@ -2505,6 +3296,39 @@ function NodeConfigPanel({
             />
           </div>
         )}
+      </div>
+    );
+  }
+
+  if (data.kind === 'switch') {
+    return (
+      <div className="flex flex-col gap-3">
+        {header}
+        {labelField}
+        {fieldDatalist}
+        <p className="text-[10px] text-aegis-text-muted leading-relaxed">
+          Routes to exactly one outgoing branch, by matching this value against a "Case value" set on each outgoing edge — see this node's own Output column to set one per branch. An edge left with no case value acts as the default, used only when nothing else matches.
+        </p>
+        <div>
+          <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Field</label>
+          <input
+            value={data.field || ''}
+            onChange={e => onChange({ field: e.target.value })}
+            placeholder="e.g. category — blank uses the upstream value directly"
+            list="upstream-field-suggestions"
+            className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+          />
+          {upstreamFieldSuggestions.length > 0 && (
+            <p className="text-[10px] text-aegis-text-muted mt-1">
+              Known fields from what's wired in: {upstreamFieldSuggestions.map((f, i) => (
+                <span key={f}>
+                  <button type="button" onClick={() => onChange({ field: f })} className="text-aegis-primary-light hover:underline font-mono">{f}</button>
+                  {i < upstreamFieldSuggestions.length - 1 ? ', ' : ''}
+                </span>
+              ))}
+            </p>
+          )}
+        </div>
       </div>
     );
   }
@@ -2576,16 +3400,16 @@ function NodeConfigPanel({
         {labelField}
         <div>
           <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Database</label>
-          <select
+          <Select
             value={data.databaseId ?? ''}
             onChange={e => onChange({ databaseId: e.target.value ? parseInt(e.target.value) : undefined })}
-            className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+            className="mt-1"
           >
             <option value="">{relationalDatabases.length === 0 ? 'None installed yet' : 'Select a database…'}</option>
             {relationalDatabases.map(d => (
               <option key={d.id} value={d.id}>{d.name}{!d.is_builtin ? ` (${d.engine_id})` : ''}</option>
             ))}
-          </select>
+          </Select>
           {relationalDatabases.length === 0 && (
             <p className="text-[10px] text-aegis-text-muted mt-1">Install one from the Marketplace's Databases category.</p>
           )}
@@ -2600,10 +3424,10 @@ function NodeConfigPanel({
             </button>
             <div>
               <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Operation</label>
-              <select
+              <Select
                 value={dbOp}
                 onChange={e => onChange({ operation: e.target.value as any })}
-                className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+                className="mt-1"
               >
                 <option value="list">List rows</option>
                 <option value="insert">Insert a row</option>
@@ -2611,7 +3435,7 @@ function NodeConfigPanel({
                 <option value="delete">Delete a row</option>
                 <option value="create_table">Create a new table</option>
                 <option value="query">Run SQL query</option>
-              </select>
+              </Select>
             </div>
 
             {isRunningQuery ? (
@@ -2688,10 +3512,10 @@ function NodeConfigPanel({
               <>
                 <div>
                   <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Table</label>
-                  <select
+                  <Select
                     value={data.table || ''}
                     onChange={e => onChange({ table: e.target.value || undefined })}
-                    className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+                    className="mt-1"
                   >
                     <option value="">{aegisDbTables.length === 0 ? 'Loading…' : 'Select a table…'}</option>
                     {userTables.length > 0 && (
@@ -2704,7 +3528,7 @@ function NodeConfigPanel({
                         {systemTables.map(t => <option key={t.name} value={t.name}>{t.label}</option>)}
                       </optgroup>
                     )}
-                  </select>
+                  </Select>
                   {isSystemTableSelected && dbOp !== 'list' && (
                     <p className="text-[10px] text-aegis-error mt-1 leading-relaxed">
                       '{selectedTableInfo?.label}' is a system table — you can list its rows, but not {dbOp} them. Pick a table you created, or switch Operation to "List rows".
@@ -2773,10 +3597,10 @@ function NodeConfigPanel({
         {labelField}
         <div>
           <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Vector store</label>
-          <select
+          <Select
             value={data.databaseId ?? ''}
             onChange={e => onChange({ databaseId: e.target.value ? parseInt(e.target.value) : undefined })}
-            className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+            className="mt-1"
           >
             <option value="">{vectorDatabases.length === 0 ? 'None installed yet' : 'Select a vector store…'}</option>
             {vectorDatabases.map(d => (
@@ -2784,7 +3608,7 @@ function NodeConfigPanel({
                 {d.name}{!d.is_builtin ? ` (${d.engine_id}${d.config?.embedding_dim ? `, ${d.config.embedding_dim}d` : ''})` : ''}
               </option>
             ))}
-          </select>
+          </Select>
           {vectorDatabases.length === 0 && (
             <p className="text-[10px] text-aegis-text-muted mt-1">Install one from the Marketplace's Databases category.</p>
           )}
@@ -2802,29 +3626,29 @@ function NodeConfigPanel({
         </div>
         <div>
           <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Operation</label>
-          <select
+          <Select
             value={data.operation || 'search'}
             onChange={e => onChange({ operation: e.target.value as 'upsert' | 'search' })}
-            className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+            className="mt-1"
           >
             <option value="upsert">Store — save vectors from an upstream Embedding node</option>
             <option value="search">Search — embed a query and find matches</option>
-          </select>
+          </Select>
         </div>
         {data.operation === 'search' ? (
           <>
             {selectedVectorDb?.is_builtin && (
               <div>
                 <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Search strategy</label>
-                <select
+                <Select
                   value={data.searchMode || 'hybrid'}
                   onChange={e => onChange({ searchMode: e.target.value as NodeData['searchMode'] })}
-                  className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+                  className="mt-1"
                 >
                   <option value="hybrid">Hybrid — dense + BM25, fused (best default)</option>
                   <option value="semantic">Semantic — dense/embedding similarity only</option>
                   <option value="bm25">BM25 — sparse keyword match only</option>
-                </select>
+                </Select>
                 <p className="text-[10px] text-aegis-text-muted mt-1.5 leading-relaxed">
                   Returns candidates in raw similarity order — wire a Reranker node after this one to re-score them with a cross-encoder before they reach the reply.
                 </p>
@@ -2878,17 +3702,18 @@ function NodeConfigPanel({
         {labelField}
         <div>
           <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Reranker model</label>
-          <select
+          <Select
             value={data.rerankerModel || ''}
             onChange={e => onChange({ rerankerModel: e.target.value || undefined })}
-            className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+            className="mt-1"
           >
-            <option value="">BAAI/bge-reranker-base (bundled) — default</option>
+            <option value="">BAAI/bge-reranker-base — default</option>
             {rerankerModels.map(m => <option key={m.model_id} value={m.model_id}>{m.display_name}</option>)}
-          </select>
-          {rerankerModels.length === 0 && (
-            <p className="text-[10px] text-aegis-text-muted mt-1">Install another one from the Marketplace's Rerankers category.</p>
-          )}
+          </Select>
+          <p className="text-[10px] text-aegis-text-muted mt-1">
+            Not bundled — needs sentence-transformers installed from the Dependencies panel first, even for the default.
+            {rerankerModels.length === 0 && ' Install a different one from the Marketplace\'s Rerankers category.'}
+          </p>
         </div>
         <div>
           <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Top K</label>
@@ -2913,14 +3738,14 @@ function NodeConfigPanel({
         {labelField}
         <div>
           <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Embedding model</label>
-          <select
+          <Select
             value={data.embeddingModel || ''}
             onChange={e => onChange({ embeddingModel: e.target.value || undefined })}
-            className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+            className="mt-1"
           >
             <option value="">BAAI/bge-base-en-v1.5 (768d, bundled) — default</option>
             {embeddingModels.map(m => <option key={m.model_id} value={m.model_id}>{m.display_name} ({m.dim}d)</option>)}
-          </select>
+          </Select>
         </div>
         <p className="text-[10px] text-aegis-text-muted leading-relaxed">
           Embeds each piece of upstream text (e.g. from a Chunk node) into vectors — wire this node's output into a Vector store node's "Store" operation.
@@ -2930,18 +3755,10 @@ function NodeConfigPanel({
   }
 
   if (data.kind === 'extract') {
-    // A node placed from a specific palette row (e.g. "Extract PDF") knows
-    // its one format up front — show just that format's config. A node fed
-    // by an upstream trigger (e.g. "On document upload") or the generic
-    // "Extract text (auto-detect)" row doesn't know the format until a real
-    // file arrives, so it shows every format Aegis can extract, each
-    // stored under its own key in enginePerFormat (see engine.py's
-    // _run_extract_node) — every format gets its own row here, each always
-    // naming the real tool that runs it, never a blank/generic fallback.
-    const formatsToShow = data.extractorFormat
-      ? [data.extractorFormat]
-      : Array.from(new Set(extractionEngines.map(e => e.format)));
-    const enginePerFormat = data.enginePerFormat || {};
+    const engineOptionsByFormat = EXTRACT_FORMAT_ORDER.map(fmt => ({
+      fmt,
+      engines: extractionEngines.filter(e => e.format === fmt),
+    }));
     return (
       <div className="flex flex-col gap-3">
         {header}
@@ -2949,62 +3766,30 @@ function NodeConfigPanel({
         <div>
           <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">File path</label>
           <input
-            value={data.staticInputs?.filePath ?? data.filePath ?? ''}
-            onChange={e => onChange({ staticInputs: { ...(data.staticInputs || {}), filePath: e.target.value } })}
-            placeholder="/path/to/document.pdf — or wire it in from upstream"
+            value={data.filePath || ''}
+            onChange={e => onChange({ filePath: e.target.value })}
+            placeholder="Leave blank to use whatever's wired in from upstream"
             className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
           />
         </div>
-        {formatsToShow.map(fmt => {
-          const formatEngines = extractionEngines.filter(e => e.format === fmt);
-          if (formatEngines.length === 0 && mcpExtractionTools.length === 0) return null;
-          const defaultEngine = formatEngines.find(e => e.default) || formatEngines[0];
-          const selectedId = enginePerFormat[fmt] || '';
-          const activeEngine =
-            formatEngines.find(e => e.engine_id === selectedId)
-            || mcpExtractionTools.find(t => t.engine_id === selectedId)
-            || defaultEngine;
-          const fmtLabel = EXTRACT_FORMAT_LABELS[fmt as keyof typeof EXTRACT_FORMAT_LABELS] || fmt;
-          const totalChoices = formatEngines.length + mcpExtractionTools.length;
-          return (
+        <Disclosure label="Engine per format">
+          <p className="text-[10px] text-aegis-text-muted leading-relaxed -mt-1">
+            The real format is auto-detected from the file's own extension at run time, so it may not match {EXTRACT_FORMAT_LABELS[data.extractorFormat || 'pdf']} — pick an engine for every format this node might actually see. Leave one on "Default" to use whatever's installed as that format's default (install more from the Marketplace's Document Extraction section).
+          </p>
+          {engineOptionsByFormat.map(({ fmt, engines }) => (
             <div key={fmt}>
-              <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">{fmtLabel} extractor</label>
-              {totalChoices > 1 ? (
-                <select
-                  value={selectedId}
-                  onChange={e => {
-                    const next = { ...enginePerFormat };
-                    if (e.target.value) next[fmt] = e.target.value; else delete next[fmt];
-                    onChange({ enginePerFormat: next });
-                  }}
-                  className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
-                >
-                  <option value="">Default ({defaultEngine ? defaultEngine.name : 'built-in'})</option>
-                  {formatEngines.length > 0 && (
-                    <optgroup label="Built in">
-                      {formatEngines.map(e => <option key={e.engine_id} value={e.engine_id}>{e.name}</option>)}
-                    </optgroup>
-                  )}
-                  {mcpExtractionTools.length > 0 && (
-                    <optgroup label="Custom — via a connected MCP tool">
-                      {mcpExtractionTools.map(t => <option key={t.engine_id} value={t.engine_id}>{t.name}</option>)}
-                    </optgroup>
-                  )}
-                </select>
-              ) : (
-                <div className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary">
-                  {activeEngine?.name ?? 'None'}
-                </div>
-              )}
-              {activeEngine && <p className="text-[10px] text-aegis-text-muted mt-1">{activeEngine.description}</p>}
+              <label className="text-[10px] text-aegis-text-secondary">{EXTRACT_FORMAT_LABELS[fmt]}</label>
+              <Select
+                value={data.enginePerFormat?.[fmt] || ''}
+                onChange={e => onChange({ enginePerFormat: { ...(data.enginePerFormat || {}), [fmt]: e.target.value || undefined } as Record<string, string> })}
+                className="mt-1"
+              >
+                <option value="">Default ({engines.find(e => e.default)?.name ?? '…'})</option>
+                {engines.filter(e => !e.default).map(e => <option key={e.engine_id} value={e.engine_id}>{e.name}</option>)}
+              </Select>
             </div>
-          );
-        })}
-        <p className="text-[10px] text-aegis-text-muted leading-relaxed">
-          Supports PDF, DOCX, PPTX, Markdown, TXT/CSV, and XLSX. Need a tool Aegis doesn't ship — a specialized OCR
-          service, a company-internal document parser? Connect it as an MCP server from{' '}
-          <span className="font-medium text-aegis-text-secondary">Connectors</span> and it shows up as a "Custom" choice above.
-        </p>
+          ))}
+        </Disclosure>
       </div>
     );
   }
@@ -3017,14 +3802,14 @@ function NodeConfigPanel({
         {labelField}
         <div>
           <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Strategy</label>
-          <select
+          <Select
             value={data.strategy || ''}
             onChange={e => onChange({ strategy: e.target.value || undefined })}
-            className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+            className="mt-1"
           >
             <option value="">{chunkingStrategies.length === 0 ? 'Loading…' : `Default (${chunkingStrategies.find(s => s.default)?.name ?? 'Recursive'})`}</option>
             {chunkingStrategies.filter(s => !s.default).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-          </select>
+          </Select>
           {activeStrategy && <p className="text-[10px] text-aegis-text-muted mt-1 leading-relaxed">{activeStrategy.description}</p>}
         </div>
         <div className="flex items-center gap-2.5">
@@ -3047,13 +3832,130 @@ function NodeConfigPanel({
             />
           </div>
         </div>
-        <p className="text-[10px] text-aegis-text-muted leading-relaxed">Splits the text from an upstream node (e.g. Extract text) into overlapping pieces.</p>
+        <p className="text-[10px] text-aegis-text-muted leading-relaxed">Splits text from an upstream node into overlapping pieces.</p>
       </div>
     );
   }
 
-  // "tool" kind — an MCP node (data.server set) or a local tool node.
+  if (data.kind === 'http_request') {
+    const showBody = ['POST', 'PUT', 'PATCH'].includes(data.method || 'GET');
+    return (
+      <div className="flex flex-col gap-3">
+        {header}
+        {labelField}
+        <div>
+          <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">URL</label>
+          <input
+            value={data.url || ''}
+            onChange={e => onChange({ url: e.target.value })}
+            placeholder="https://api.example.com/... — or leave blank and map it from upstream"
+            className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+          />
+        </div>
+        <div>
+          <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Method</label>
+          <Select
+            value={data.method || 'GET'}
+            onChange={e => onChange({ method: e.target.value as NodeData['method'] })}
+            className="mt-1"
+          >
+            <option value="GET">GET</option>
+            <option value="POST">POST</option>
+            <option value="PUT">PUT</option>
+            <option value="PATCH">PATCH</option>
+            <option value="DELETE">DELETE</option>
+          </Select>
+        </div>
+        <ParamsEditor label="Headers" values={data.headers || {}} onChange={v => onChange({ headers: v })} />
+        {showBody && (
+          <div>
+            <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Body</label>
+            <textarea
+              value={data.body || ''}
+              onChange={e => onChange({ body: e.target.value })}
+              rows={4}
+              placeholder='Sent as JSON if it parses as valid JSON, else as plain text — e.g. {"key": "value"}'
+              spellCheck={false}
+              className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs font-mono text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary resize-y"
+            />
+          </div>
+        )}
+        <p className="text-[10px] text-aegis-text-muted leading-relaxed">
+          URL/Method/Body can each be overridden per-run by mapping an incoming edge to inputField "url"/"method"/"body" (e.g. a classifier "llm" node deciding which endpoint to hit) — see this node's Input column. Output is {'{'}status_code, headers, body{'}'} — body is the parsed JSON object if the response was JSON, else raw text. Retried automatically on a transient failure.
+        </p>
+      </div>
+    );
+  }
+
+  if (data.kind === 'set_fields') {
+    return (
+      <div className="flex flex-col gap-3">
+        {header}
+        {labelField}
+        <div>
+          <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Mode</label>
+          <Select
+            value={data.mode || 'merge'}
+            onChange={e => onChange({ mode: e.target.value as NodeData['mode'] })}
+            className="mt-1"
+          >
+            <option value="merge">Merge — keep the upstream value's other fields</option>
+            <option value="replace">Replace — output only the fields set below</option>
+          </Select>
+        </div>
+        <ParamsEditor label="Fields" values={data.staticInputs || {}} onChange={v => onChange({ staticInputs: v })} />
+        <p className="text-[10px] text-aegis-text-muted leading-relaxed">
+          A field's value here is a literal string, unless an incoming edge is mapped to that exact field name (see this node's Input column) — a real mapping always wins over a same-named typed value. In "Merge" mode, any upstream field not listed here passes through unchanged.
+        </p>
+      </div>
+    );
+  }
+
+  if (data.kind === 'merge') {
+    const mergeMode = data.mergeMode || 'list';
+    return (
+      <div className="flex flex-col gap-3">
+        {header}
+        {labelField}
+        <div>
+          <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Combine as</label>
+          <Select
+            value={mergeMode}
+            onChange={e => onChange({ mergeMode: e.target.value as NodeData['mergeMode'] })}
+            className="mt-1"
+          >
+            <option value="list">List — every upstream output, in order</option>
+            <option value="concat">Concatenate text — joined into one string</option>
+            <option value="first">First non-empty — a fallback chain</option>
+          </Select>
+        </div>
+        {mergeMode === 'concat' && (
+          <div>
+            <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Separator</label>
+            <input
+              value={data.separator ?? ''}
+              onChange={e => onChange({ separator: e.target.value })}
+              placeholder="Blank = two newlines"
+              className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+            />
+          </div>
+        )}
+        <p className="text-[10px] text-aegis-text-muted leading-relaxed">
+          Wire every branch you want combined directly into this node — unlike most other nodes here, Merge reads every incoming edge, not just the first.
+        </p>
+      </div>
+    );
+  }
+
+  // "tool" kind — an MCP node (data.server set to a real server name), the
+  // collapsed local-tools node (data.server === LOCAL_TOOLS_SERVER), or a
+  // pre-collapsing node saved with no server at all (falls back to the full
+  // flat list below, same as it always has).
   const properties = selectedTool?.inputSchema?.properties || {};
+  const isLocalToolsNode = data.server === LOCAL_TOOLS_SERVER;
+  const scopedTools = isLocalToolsNode
+    ? tools.filter(t => !t.server)
+    : (data.server ? tools.filter(t => t.server === data.server) : tools);
   return (
     <div className="flex flex-col gap-3">
       {header}
@@ -3061,37 +3963,54 @@ function NodeConfigPanel({
 
       {data.server && (
         <div className="flex items-center gap-1.5 text-[10px] text-aegis-text-muted">
-          <ServiceLogo serviceKey={data.server} size="sm" /> MCP server: <span className="font-semibold text-aegis-text-secondary">{data.server}</span>
+          {isLocalToolsNode ? (
+            <>
+              <FolderOpen className="w-3.5 h-3.5 flex-shrink-0" /> <span className="font-semibold text-aegis-text-secondary">Local Files & Folders</span> — confined to your home directory
+            </>
+          ) : (
+            <>
+              <ServiceLogo serviceKey={data.server} size="sm" /> MCP server: <span className="font-semibold text-aegis-text-secondary">{data.server}</span>
+            </>
+          )}
         </div>
       )}
 
-      <label className="flex items-center gap-2 text-xs text-aegis-text-secondary">
-        <input type="checkbox" checked={data.isAi} onChange={e => onChange({ isAi: e.target.checked })} />
-        AI step (LLM fills this in, scoped to this step only)
-      </label>
+      <div>
+        <label className="flex items-center gap-2 text-xs text-aegis-text-secondary">
+          <input type="checkbox" checked={data.isAi} onChange={e => onChange({ isAi: e.target.checked })} />
+          AI step (LLM fills this in, scoped to this step only)
+        </label>
+        <p className="text-[10px] text-aegis-text-muted mt-1 leading-relaxed">
+          {data.isAi
+            ? 'Checked: the model decides this tool\'s inputs at run time, from the instruction below.'
+            : 'Unchecked: you set this tool\'s inputs yourself below, and they run exactly as typed every time.'}
+        </p>
+      </div>
 
       <div>
         <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Tool</label>
-        <select
+        <Select
           value={data.toolName || ''}
           onChange={e => {
-            // Placed from an MCP server's own palette row (data.server
-            // already fixed) — stays scoped to that server's own tools,
-            // the options below never offer another server's. A node with
-            // no server yet (local tool, or one from before per-server
-            // scoping existed) still gets the full picker.
-            const scoped = data.server ? tools.filter(t => t.server === data.server) : tools;
-            const tool = scoped.find(t => t.name === e.target.value);
-            onChange({ toolName: tool?.name || undefined, server: data.server ?? tool?.server ?? null, staticInputs: {} });
+            // Placed from an MCP server's own palette row, or the collapsed
+            // local-tools row — either way data.server is already fixed and
+            // stays scoped to just that set, same list as the options below.
+            const tool = scopedTools.find(t => t.name === e.target.value);
+            onChange({
+              toolName: tool?.name || undefined,
+              server: data.server ?? tool?.server ?? null,
+              staticInputs: {},
+              isAi: toolNeedsStructuredInput(tool),
+            });
           }}
           title={selectedTool?.description}
-          className="w-full mt-1 bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+          className="mt-1"
         >
           <option value="">Select a tool…</option>
-          {(data.server ? tools.filter(t => t.server === data.server) : tools).map(t => (
+          {scopedTools.map(t => (
             <option key={t.name} value={t.name}>{!data.server && t.server ? `${t.server} — ${t.name}` : t.name}</option>
           ))}
-        </select>
+        </Select>
       </div>
 
       {data.isAi ? (
@@ -3110,27 +4029,90 @@ function NodeConfigPanel({
           <div>
             <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Fixed values</label>
             <div className="flex flex-col gap-2 mt-1">
-              {Object.entries(properties).map(([key, meta]: [string, any]) => (
+              {Object.entries(properties).map(([key, meta]: [string, any]) => {
+                const isStructured = meta?.type === 'object' || meta?.type === 'array';
+                const isEnum = Array.isArray(meta?.enum) && meta.enum.length > 0;
+                const isBoolean = meta?.type === 'boolean';
+                const isNumeric = meta?.type === 'number' || meta?.type === 'integer';
+                const defaultHint = meta?.default !== undefined ? `Blank = ${JSON.stringify(meta.default)}` : (meta.description ? `Blank = ${meta.description}` : 'Blank = the tool\'s own default');
+                const setField = (v: string) => onChange({ staticInputs: { ...(data.staticInputs || {}), [key]: v } });
+                return (
                 <div key={key}>
                   <label className="text-[10px] text-aegis-text-muted">
                     {key}{selectedTool?.inputSchema?.required?.includes(key) && ' *'}
+                    {isStructured && <span className="ml-1 text-aegis-text-muted/70">(JSON {meta.type})</span>}
                   </label>
+                  {isEnum ? (
+                    <Select
+                      value={data.staticInputs?.[key] || ''}
+                      onChange={e => setField(e.target.value)}
+                      title={meta.description}
+                      className=""
+                    >
+                      <option value="">{meta.default !== undefined ? `Default (${meta.default})` : 'Select…'}</option>
+                      {meta.enum.map((choice: string | number) => (
+                        <option key={String(choice)} value={String(choice)}>{String(choice)}</option>
+                      ))}
+                    </Select>
+                  ) : isBoolean ? (
+                    <label className="flex items-center gap-2 mt-1 text-xs text-aegis-text-secondary">
+                      <input
+                        type="checkbox"
+                        checked={data.staticInputs?.[key] === 'true'}
+                        onChange={e => setField(e.target.checked ? 'true' : 'false')}
+                      />
+                      {meta.default !== undefined ? `Default: ${String(meta.default)}` : 'true'}
+                    </label>
+                  ) : isStructured ? (
+                    <textarea
+                      value={data.staticInputs?.[key] || ''}
+                      onChange={e => setField(e.target.value)}
+                      rows={4}
+                      placeholder={meta.description ? `${meta.type === 'array' ? '[...]' : '{...}'} — ${meta.description}` : `Blank = the tool's own default. Must be valid JSON, e.g. ${meta.type === 'array' ? '["a", "b"]' : '{"key": "value"}'}`}
+                      title={meta.description}
+                      spellCheck={false}
+                      className="w-full bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs font-mono text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary placeholder:text-aegis-text-muted/70 resize-y"
+                    />
+                  ) : (
                   <input
+                    type={isNumeric ? 'number' : 'text'}
                     value={data.staticInputs?.[key] || ''}
-                    onChange={e => onChange({ staticInputs: { ...(data.staticInputs || {}), [key]: e.target.value } })}
-                    placeholder={meta.description ? `Blank = ${meta.description}` : 'Blank = the tool\'s own default'}
+                    onChange={e => setField(e.target.value)}
+                    placeholder={defaultHint}
                     title={meta.description}
                     className="w-full bg-aegis-overlay border border-aegis-border rounded-md px-2 py-1.5 text-xs text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary placeholder:text-aegis-text-muted/70"
                   />
+                  )}
                   {meta.description && (
                     <p className="text-[10px] text-aegis-text-muted mt-0.5 leading-snug">{meta.description}</p>
                   )}
                 </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )
       )}
+
+      {(data.toolName === 'extract_image_text' || data.toolName === 'transcribe_media') && (() => {
+        const engines = data.toolName === 'extract_image_text' ? ocrEngines : transcriptionEngines;
+        return (
+          <div>
+            <label className="text-[10px] font-semibold text-aegis-text-muted uppercase">Engine</label>
+            <Select
+              value={data.mediaEngine || ''}
+              onChange={e => onChange({ mediaEngine: e.target.value || undefined })}
+              className="mt-1"
+            >
+              <option value="">Default ({engines.find(e => e.default)?.display_name ?? '…'})</option>
+              {engines.filter(e => !e.default).map(e => <option key={e.id} value={e.id}>{e.display_name}</option>)}
+            </Select>
+            <p className="text-[10px] text-aegis-text-muted mt-1 leading-relaxed">
+              Install more engines from the Marketplace's Media Extraction section.
+            </p>
+          </div>
+        );
+      })()}
     </div>
   );
 }
@@ -3150,11 +4132,27 @@ interface MemorySettings {
   max_rag_chunks: number;
 }
 
-function MemorySettingsPanel() {
+function MemorySettingsPanel({ modelMaxContext: modelMaxContextOverride }: { modelMaxContext?: number }) {
   const [config, setConfig] = useState<MemorySettings | null>(null);
-  const [modelMaxContext, setModelMaxContext] = useState(4096);
-  const [hasChanges, setHasChanges] = useState(false);
-  const [isSaving, setIsSaving] = useState(false);
+  const [activeModelMaxContext, setActiveModelMaxContext] = useState(4096);
+  // Auto-saves (debounced), same as every other field in a node's config
+  // panel — this was the one lone field needing an explicit "Save" click,
+  // which read as unfinished next to everything around it. 'saved' fades
+  // itself back to 'idle' after a beat, mirroring a toast's own lifetime.
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved'>('idle');
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const savedBadgeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // The real ceiling for whatever model actually answers THIS call: the
+  // caller's own picked model (modelMaxContextOverride, its real GGUF
+  // context_length — see WorkflowsView's "llm" node, which always resolves
+  // its own data.modelName in engine.py regardless of what's globally
+  // active) takes priority over whichever model just happens to be loaded
+  // right now. Falling back to the global active model was frequently
+  // wrong here — including showing the bare 4,096 default whenever nothing
+  // happened to be loaded at all, even though the node's own picked model
+  // has a real, much larger context.
+  const modelMaxContext = modelMaxContextOverride ?? activeModelMaxContext;
 
   useEffect(() => {
     (async () => {
@@ -3163,44 +4161,63 @@ function MemorySettingsPanel() {
           fetch(`${API_BASE}/api/context-config`),
           fetch(`${API_BASE}/api/hardware/status`),
         ]);
-        if (cfgRes.ok) {
-          const data = await cfgRes.json();
-          if (data.chat) setConfig(data.chat);
-        }
-        if (hwRes.ok) {
-          const hw = await hwRes.json();
-          setModelMaxContext(hw.max_context || 4096);
-        }
-      } catch (e) {}
+        const chatConfig = cfgRes.ok ? (await cfgRes.json()).chat : null;
+        const activeMax = hwRes.ok ? (await hwRes.json()).max_context || 4096 : 4096;
+        setActiveModelMaxContext(activeMax);
+        if (chatConfig) setConfig(chatConfig);
+      } catch (e) { toast.error('Could not load context & memory settings.'); }
     })();
   }, []);
 
-  const handleChange = (key: keyof MemorySettings, val: number) => {
-    setConfig(c => c ? { ...c, [key]: val } : c);
-    setHasChanges(true);
-  };
-
-  const save = async () => {
-    if (!config) return;
-    setIsSaving(true);
+  const persist = useCallback(async (cfg: MemorySettings) => {
+    setSaveState('saving');
     try {
-      const { max_rag_chunks, ...shared } = config;
+      const { max_rag_chunks, ...shared } = cfg;
       const res = await fetch(`${API_BASE}/api/context-config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat: config, agent: shared }),
+        body: JSON.stringify({ chat: cfg, agent: shared }),
       });
       if (res.ok) {
-        setHasChanges(false);
-        toast.success('Saved.');
+        setSaveState('saved');
+        if (savedBadgeTimerRef.current) clearTimeout(savedBadgeTimerRef.current);
+        savedBadgeTimerRef.current = setTimeout(() => setSaveState('idle'), 1500);
       } else {
         toast.error('Failed to save settings.');
+        setSaveState('idle');
       }
     } catch (e) {
       toast.error('Network error while saving settings.');
-    } finally {
-      setIsSaving(false);
+      setSaveState('idle');
     }
+  }, []);
+
+  // Re-clamp whenever the effective ceiling (this call's own model, once
+  // known) drops below the saved value — covers the initial load AND
+  // switching this node to a smaller-context model without leaving its
+  // config panel. A value saved while a larger-context model was in play
+  // can otherwise exceed what the model that will actually run this call
+  // supports, so the correction is persisted immediately (not debounced —
+  // this isn't the user actively dragging a slider) rather than left to
+  // silently disagree with reality.
+  useEffect(() => {
+    if (!config || config.max_output_tokens <= modelMaxContext) return;
+    const clamped = { ...config, max_output_tokens: modelMaxContext };
+    setConfig(clamped);
+    persist(clamped);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modelMaxContext, config?.max_output_tokens]);
+
+  const handleChange = (key: keyof MemorySettings, val: number) => {
+    setConfig(c => {
+      if (!c) return c;
+      const next = { ...c, [key]: val };
+      // Debounced — a slider fires on every tick while dragging, so saving
+      // on each one would spam the endpoint; wait for the drag to settle.
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = setTimeout(() => persist(next), 500);
+      return next;
+    });
   };
 
   if (!config) {
@@ -3228,20 +4245,20 @@ function MemorySettingsPanel() {
 
   return (
     <div className="flex flex-col gap-3 mt-2">
-      <p className="text-[10px] text-aegis-text-muted leading-relaxed">
-        Shared by Chat and the Agent — same underlying LLM. Higher values improve recall but increase RAM and latency.
-      </p>
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-[10px] text-aegis-text-muted leading-relaxed">
+          Shared by Chat and the Agent — same underlying LLM. Higher values improve recall but increase RAM and latency.
+        </p>
+        {saveState !== 'idle' && (
+          <span className="text-[10px] font-medium text-aegis-text-muted flex-shrink-0 flex items-center gap-1">
+            {saveState === 'saving' ? 'Saving…' : <><CheckCircle2 className="w-3 h-3 text-aegis-success" /> Saved</>}
+          </span>
+        )}
+      </div>
       {slider('Max response length', 'max_output_tokens', 2048, modelMaxContext, 512, `Model max: ${modelMaxContext.toLocaleString()}`)}
       {slider('Max history messages', 'max_history_messages', 1, 20, 1)}
       {slider('Max characters per message', 'max_msg_chars', 500, 10000, 500, '10.0k')}
       {slider('Tool result snippet size', 'max_result_snippet', 500, 10000, 500, '10.0k')}
-      <button
-        onClick={save}
-        disabled={!hasChanges || isSaving}
-        className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${hasChanges ? 'bg-aegis-primary text-white hover:opacity-90' : 'bg-aegis-overlay text-aegis-text-muted cursor-not-allowed'}`}
-      >
-        {isSaving ? 'Saving…' : 'Save'}
-      </button>
     </div>
   );
 }

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Aegis — macOS hardened-runtime entitlements.
+
+  Needed because the bundled Python backend (backend/dist/main, PyInstaller)
+  ships compiled native libraries — llama-cpp-python and faster-whisper's
+  ctranslate2 — that the default hardened runtime (required for
+  notarization) blocks without these explicit exceptions:
+    - allow-jit / allow-unsigned-executable-memory: llama.cpp's own
+      inference code generates/executes memory at runtime.
+    - disable-library-validation: those libraries aren't signed by Apple or
+      under Aegis's own Team ID, so the default "only load libraries signed
+      by the same team" check would otherwise reject them at launch.
+    - allow-dyld-environment-variables: PyInstaller's bundled interpreter
+      needs its own DYLD_* env vars to find its bundled shared libraries.
+
+  Without this file, a from-scratch notarization attempt on this app is
+  likely to fail with a library-signature or "killed by hardened runtime"
+  error rather than an actual code-signing problem — this is the standard,
+  documented fix for that class of failure, not a security compromise
+  specific to this app.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>

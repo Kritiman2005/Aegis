@@ -7,15 +7,23 @@ from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 
 # ── Light extractors — safe to import at startup ──────────────────────────────
+# fitz (PyMuPDF) is always bundled regardless of the document-extraction
+# on-demand story below — app.core.exporter's PDF export needs it too, an
+# unrelated write-out direction. python-pptx (Presentation) is NOT bundled
+# — see extract_text's own docstring — so it stays a lazy, function-local
+# import unlike this one.
 import fitz  # PyMuPDF
-from pptx import Presentation
 
 # ── ALL heavy ML libraries are lazy-imported inside functions ─────────────────
-# qdrant_client, fastembed, and sentence_transformers all pull in PyTorch
-# (~2 GB of DLLs) when imported. Importing them at module level causes
-# the PyInstaller binary to crash immediately on Windows before /api/health
-# can respond. They are imported inside the getter functions below, so the
-# server starts in <1 second and the libraries load on first actual use.
+# qdrant_client and fastembed are onnxruntime-based (no torch); only
+# sentence_transformers.CrossEncoder (get_reranker, below) genuinely needs
+# torch, which is itself an optional runtime download now (see
+# app.core.optional_deps' own module docstring for why) rather than bundled
+# into the app. Importing any of these at module level would still add
+# real startup latency even where torch isn't involved, so they're all kept
+# lazy-imported inside the getter functions below regardless — the server
+# starts in well under a second, and each library only loads on first
+# actual use.
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +117,7 @@ def get_dense_model():
     if _dense_model is None:
         with _model_init_lock:
             if _dense_model is None:  # re-check: another thread may have just finished this
-                from fastembed import TextEmbedding  # lazy import — pulls torch
+                from fastembed import TextEmbedding  # lazy import — ONNX-based, no torch needed
                 logger.info("Initializing Dense Embedding Model...")
                 # Upgraded from bge-small-en-v1.5 (384-dim, ~33M params) —
                 # meaningfully better semantic discrimination on longer/
@@ -126,7 +134,7 @@ def get_sparse_model():
     if _sparse_model is None:
         with _model_init_lock:
             if _sparse_model is None:
-                from fastembed import SparseTextEmbedding  # lazy import — pulls torch
+                from fastembed import SparseTextEmbedding  # lazy import — ONNX-based, no torch needed
                 logger.info("Initializing Sparse Embedding Model...")
                 _sparse_model = SparseTextEmbedding("Qdrant/bm25")
     return _sparse_model
@@ -320,6 +328,14 @@ def _extract_docx_body_text(parent) -> List[str]:
 
 
 def extract_text(file_path: str, file_type: str) -> str:
+    """PDF (fitz) and DOCX (python-docx) always work — both are already
+    bundled regardless, for app.core.exporter's own PDF/DOCX export (the
+    opposite, write-out direction). PPTX (python-pptx) and XLSX (openpyxl)
+    are NOT bundled — install-on-demand from the Marketplace's Document
+    Extraction category, same as the alternative engines in
+    app.core.extraction_engines; raises a clear, actionable message
+    (via app.core.optional_deps.require_available) instead of a raw
+    ImportError if the format's package isn't installed yet."""
     ext = file_type.lower()
     try:
         if ext == 'pdf':
@@ -345,6 +361,9 @@ def extract_text(file_path: str, file_type: str) -> str:
                 doc.close()
 
         elif ext in ['ppt', 'pptx']:
+            from app.core.optional_deps import require_available
+            require_available("python-pptx", "PowerPoint extraction")
+            from pptx import Presentation
             prs = Presentation(file_path)
             parts: List[str] = []
             for slide in prs.slides:
@@ -374,6 +393,8 @@ def extract_text(file_path: str, file_type: str) -> str:
             return "\n".join(_extract_docx_body_text(doc))
 
         elif ext == 'xlsx':
+            from app.core.optional_deps import require_available
+            require_available("openpyxl", "Excel extraction")
             from openpyxl import load_workbook
             # data_only=True reads each cell's last-calculated value rather
             # than its formula string — "=SUM(A1:A5)" is useless as
@@ -681,8 +702,7 @@ def hybrid_embed_and_upsert(document_id: int, chunks: List[str], filename: str) 
     `chunks` — rather than the generic dense-only embedding those nodes'
     own "embedding" node output would give, which can't reproduce this
     collection's hybrid dense+sparse point shape (see _run_vector_node's
-    upsert branch). ingest_document itself now just extracts+chunks a raw
-    file and calls this. Returns the number of chunks actually indexed.
+    upsert branch). Returns the number of chunks actually indexed.
 
     Embed and upsert in batches rather than one call over the whole
     document (matching AnythingLLM's maxConcurrentChunks=25 pattern). For a
@@ -756,7 +776,7 @@ def delete_document_points(document_id: int) -> None:
 
 
 # One-time marker (not a DB row — this is purely internal bookkeeping, not
-# a user-facing setting) proving _migrate_documents_to_current_embedding
+# a user-facing setting) proving migrate_documents_to_current_embedding
 # below has already run, so a re-ingestion pass over every document
 # doesn't repeat on every single server start. Lives next to the Qdrant
 # DB itself, same directory scoping as everything else in this file.
@@ -983,7 +1003,25 @@ def rerank_chunks(
     """
     if not chunks:
         return []
-    reranker = reranker or get_reranker()
+    if reranker is None:
+        try:
+            reranker = get_reranker()
+        except (ModuleNotFoundError, ImportError) as e:
+            # The bundled default reranker needs sentence_transformers,
+            # which isn't bundled by default any more (see main.spec's
+            # excludes list) — but THIS specific call path is
+            # hybrid_search's own AUTOMATIC rerank pass, never something a
+            # user explicitly asked for (unlike a Workflow's own Reranker
+            # node passing a real `reranker` in, which skips this branch
+            # entirely and still raises on failure — see
+            # app.core.rerankers.get_cross_encoder's own docstring on why
+            # an explicitly-configured reranker's failure must stay
+            # visible, not be silently skipped). Automatic search
+            # shouldn't break outright over an optional accuracy boost
+            # nobody explicitly asked for here — trust Qdrant's own
+            # fusion/similarity ordering instead, same as rerank=False.
+            logger.warning(f"Skipping automatic rerank (sentence-transformers isn't installed): {e}")
+            return chunks[:top_k]
     logger.info(f"Reranking {len(chunks)} candidates...")
     pairs = [[query, chunk.get("content") or (chunk.get("payload") or {}).get("content") or (chunk.get("payload") or {}).get("text") or ""] for chunk in chunks]
     scores = reranker.predict(pairs)

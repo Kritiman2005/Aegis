@@ -316,7 +316,11 @@ export function useSocket() {
           appendMessageRef.current({
             id: generateId(),
             role: 'system',
-            content: `⚠ Backend error: ${payload.content ?? 'Unknown error'}`,
+            // payload.content is already a plain-language sentence (see
+            // backend's friendly_errors.humanize_exception) — no "Backend
+            // error:" prefix, which would just re-add the jargon this was
+            // meant to remove.
+            content: `⚠ ${payload.content ?? 'Something went wrong. Please try again.'}`,
             timestamp: new Date(),
           });
           break;
@@ -388,7 +392,7 @@ export function useSocket() {
   // ── Public API ───────────────────────────────────────────────────────────────
 
   const sendMessage = useCallback(
-    (content: string, msgType: string = 'message', userPrompt?: string, attachments?: Attachment[], exportFormat?: string): boolean => {
+    (content: string, msgType: string = 'message', userPrompt?: string, attachments?: Attachment[], source?: string): boolean => {
       const trimmed = content.trim();
       // Claude-style: a message can be attachments alone with no typed text.
       if (!trimmed && !(attachments && attachments.length > 0)) return false;
@@ -432,7 +436,15 @@ export function useSocket() {
       }
 
       socketRef.current.send(
-        JSON.stringify({ type: msgType, content: trimmed, user_prompt: userPrompt, attachments, export_format: exportFormat })
+        // source: "voice" only ever set by the mic's auto-send path (see
+        // ChatView.tsx) — the one unambiguous case, sent immediately with
+        // no chance for the user to edit it first. A message typed
+        // (including a manually-reviewed, then-sent voice transcript) is
+        // never tagged, avoiding the ambiguity of "is edited-then-sent
+        // text still really voice". Read by app.api.websocket and gated
+        // per-workflow by the "On chat message" trigger's own
+        // acceptsVoice setting (app.core.workflows.engine).
+        JSON.stringify({ type: msgType, content: trimmed, user_prompt: userPrompt, attachments, source })
       );
       return true;
     },

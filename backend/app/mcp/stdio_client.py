@@ -15,6 +15,8 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from app.mcp.content import flatten_content_item
+
 logger = logging.getLogger(__name__)
 
 
@@ -233,18 +235,8 @@ class StdioMCPClient:
         result = response.get("result", {})
         content = result.get("content", [])
 
-        # Flatten MCP content array → plain text
-        parts = []
-        for item in content:
-            item_type = item.get("type", "")
-            if item_type == "text":
-                parts.append(item.get("text", ""))
-            elif item_type == "resource":
-                parts.append(json.dumps(item.get("resource", {})))
-            elif item_type == "image":
-                parts.append(f"[image: {item.get('url', 'embedded')}]")
-        
-        return "\n".join(parts) if parts else str(result)
+        parts = [flatten_content_item(item) for item in content]
+        return "\n".join(p for p in parts if p) if parts else str(result)
 
     def list_resources(self) -> List[dict]:
         """Fetch resources exposed by this server (if supported)."""
@@ -269,6 +261,41 @@ class StdioMCPClient:
             "params": {},
         })
         return response.get("result", {}).get("prompts", [])
+
+    def read_resource(self, uri: str) -> dict:
+        """
+        Fetch one resource's actual content (resources/read) — list_resources
+        only returns the catalog entry (uri/name/description/mimeType), not
+        the content itself. Returns the raw MCP result: {"contents": [...]},
+        each entry having `text` (for text resources) or `blob` (base64, for
+        binary ones) alongside its own `uri`/`mimeType`.
+        """
+        response = self._send_recv({
+            "jsonrpc": "2.0",
+            "id": self._next_id(),
+            "method": "resources/read",
+            "params": {"uri": uri},
+        })
+        if "error" in response:
+            raise RuntimeError(f"resources/read failed for '{uri}': {response['error']}")
+        return response.get("result", {})
+
+    def get_prompt(self, name: str, arguments: Optional[dict] = None) -> dict:
+        """
+        Fetch a filled prompt template (prompts/get) — list_prompts only
+        returns the catalog entry (name/description/arguments schema), not
+        the actual rendered messages. Returns the raw MCP result:
+        {"description": ..., "messages": [{"role": ..., "content": {...}}]}.
+        """
+        response = self._send_recv({
+            "jsonrpc": "2.0",
+            "id": self._next_id(),
+            "method": "prompts/get",
+            "params": {"name": name, "arguments": arguments or {}},
+        })
+        if "error" in response:
+            raise RuntimeError(f"prompts/get failed for '{name}': {response['error']}")
+        return response.get("result", {})
 
     @property
     def cached_tools(self) -> List[dict]:

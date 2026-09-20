@@ -49,6 +49,10 @@ class HardwareConfig(BaseModel):
     n_gpu_layers: int = Field(-1, description="Number of layers to offload to GPU")
     n_threads: int = Field(4, description="Number of CPU threads to use")
     # Note: db_max_workers dropped per UI discussion, llm_max_workers locked.
+    # Context window cap lives per-model (ModelRegistry.context_cap, see
+    # POST /api/hub/{model_id}/context-cap in models_hub.py) — different
+    # models legitimately want different caps, so it's not a single
+    # app-wide hardware setting like n_gpu_layers/n_threads are.
 
 class ContextConfigPayload(BaseModel):
     chat: Optional[ChatConfig] = None
@@ -190,6 +194,50 @@ def unload_model():
 
     return {"success": True, "message": f"Unloaded {len(loaded)} model(s)."}
 
+
+@router.post("/api/hardware/unload/{model_id}")
+def unload_one_model(model_id: int):
+    """
+    Ejects exactly ONE model from RAM — the per-model 'Eject' button on
+    each Memory Hub row. Unlike /api/hardware/unload (every loaded model at
+    once), this leaves every OTHER model — including one a workflow loaded
+    independently (see context_config.get_hardware_status's
+    other_loaded_models) — untouched, so ejecting one model a workflow
+    isn't using doesn't also kill a different one it is.
+    """
+    if is_llm_busy():
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot unload model while a generation is in progress."
+        )
+
+    from app.db.database import SessionLocal
+    from app.db.models import ModelRegistry
+    from app.core.agents.chat import get_llm_manager
+
+    with SessionLocal() as db:
+        model = db.query(ModelRegistry).filter(ModelRegistry.id == model_id).first()
+        if not model:
+            raise HTTPException(status_code=404, detail="Model not found.")
+
+        manager = get_llm_manager()
+        was_loaded = manager.unload_model(model.name)
+
+        # Same reasoning as the all-models endpoint above: clear is_active
+        # so /api/hardware/status stops reporting this exact model as
+        # active via its DB-fallback path once it's the one just ejected.
+        if model.is_active:
+            model.is_active = False
+            db.commit()
+
+        # Captured before the session closes below — accessing an ORM
+        # attribute on a detached instance after the `with` block exits
+        # raises DetachedInstanceError.
+        display_name = model.display_name
+
+    return {"success": True, "was_loaded": was_loaded, "message": f"Ejected '{display_name}' from RAM."}
+
+
 class LoadModelRequest(BaseModel):
     model_id: int
 
@@ -233,13 +281,16 @@ def load_active_model(req: LoadModelRequest):
 def get_hardware_status():
     """Return active model, system RAM usage, and model capabilities for the frontend UI."""
     from app.core.agents.chat import get_llm_manager
+    from app.core.llm_manager import resolve_effective_n_ctx
+    from app.db.crud import get_model_usage_by_workflows
     import psutil
     manager = get_llm_manager()
     loaded_models = list(manager.loaded_models.keys())
-    
+
     active_model = "None"
     active_model_display = "None"
     max_context = 4096
+    other_loaded_models = []
 
     from app.db.database import SessionLocal
     from app.db.models import ModelRegistry
@@ -252,10 +303,39 @@ def get_hardware_status():
                 model_info = db.query(ModelRegistry).filter(ModelRegistry.repo_id == active_model).first()
             if model_info:
                 active_model_display = model_info.display_name
-                if model_info.context_length:
-                    max_context = model_info.context_length
             else:
                 active_model_display = active_model
+            # Ground truth from the actual loaded llama.cpp instance — not
+            # the DB's native/trained context_length, which is frequently
+            # much higher than what the model was really loaded with (see
+            # llm_manager.resolve_effective_n_ctx).
+            try:
+                max_context = manager.loaded_models[active_model].n_ctx()
+            except Exception:
+                max_context = resolve_effective_n_ctx(
+                    model_info.context_length if model_info else None,
+                    model_info.name if model_info else None,
+                )
+
+            # Other models a workflow node (or anything else) has loaded
+            # alongside the "primary" active one — loaded_models isn't
+            # exclusive, so these were previously invisible to the UI even
+            # though they're really sitting in RAM right now.
+            usage_by_model = get_model_usage_by_workflows(db)
+            for name in loaded_models:
+                if name == active_model:
+                    continue
+                info = db.query(ModelRegistry).filter(ModelRegistry.name == name).first()
+                try:
+                    real_ctx = manager.loaded_models[name].n_ctx()
+                except Exception:
+                    real_ctx = resolve_effective_n_ctx(info.context_length if info else None, name)
+                other_loaded_models.append({
+                    "name": name,
+                    "display_name": (info.display_name if info else name),
+                    "max_context": real_ctx,
+                    "used_by_workflows": usage_by_model.get(name, []),
+                })
         else:
             # Only trust an explicit is_active flag here — silently falling back to
             # "any downloaded model" would make the UI claim a model is active right
@@ -266,7 +346,7 @@ def get_hardware_status():
             if active:
                 active_model = active.repo_id or active.name
                 active_model_display = active.display_name
-                max_context = active.context_length or 4096
+                max_context = resolve_effective_n_ctx(active.context_length, active.name)
 
     mem = psutil.virtual_memory()
     total_gb = mem.total / (1024**3)
@@ -276,6 +356,7 @@ def get_hardware_status():
         "active_model": active_model,
         "active_model_display": active_model_display,
         "max_context": max_context,
+        "other_loaded_models": other_loaded_models,
         "ram_total_gb": round(total_gb, 1),
         "ram_used_gb": round(used_gb, 1),
         "ram_percent": mem.percent

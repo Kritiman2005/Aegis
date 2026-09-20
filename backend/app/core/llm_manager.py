@@ -6,6 +6,45 @@ from typing import Dict, Optional, Any, List
 
 logger = logging.getLogger(__name__)
 
+
+DEFAULT_N_CTX = 8192
+
+
+def resolve_effective_n_ctx(context_length: Optional[int], model_name: Optional[str] = None) -> int:
+    """
+    The REAL context window a model will actually be loaded with — not its
+    native/trained max. Each model has its OWN cap override
+    (ModelRegistry.context_cap, set per-model from Memory Hub's per-model
+    "Context Window Cap" card — different models legitimately want
+    different caps, so this is never a single app-wide value) which wins
+    over the safe 8192-token default when set, but is always clamped to
+    that model's own native context_length — asking for more than a model
+    was actually trained on has no ceiling worth honoring. Looked up fresh
+    from SQLite (not any in-memory cache) so a cap change takes effect
+    without needing the process to notice a stale snapshot. Shared by
+    LLMManager (the actual load call, via _resolve_n_ctx below) and by API
+    endpoints that need to report this same real ceiling for a model that
+    ISN'T currently loaded (so they don't have to load it just to ask) —
+    see models_hub.list_downloaded_models's effective_context_length and
+    context_config.get_hardware_status's is_active fallback.
+    """
+    ceiling = context_length or DEFAULT_N_CTX
+    override = None
+    if model_name:
+        try:
+            from app.db.database import SessionLocal
+            from app.db.models import ModelRegistry
+            with SessionLocal() as db:
+                m = db.query(ModelRegistry).filter(ModelRegistry.name == model_name).first()
+                if m:
+                    override = m.context_cap
+        except Exception as e:
+            logger.debug(f"Could not look up context_cap for '{model_name}': {e}")
+    if override:
+        return min(override, ceiling)
+    return min(ceiling, DEFAULT_N_CTX)
+
+
 @dataclass
 class ModelConfig:
     """Configuration for a specific LLM model."""
@@ -109,21 +148,11 @@ class LLMManager:
         
     def _resolve_n_ctx(self, config: "ModelConfig") -> int:
         """
-        Decide the actual n_ctx to load a model with. If the user explicitly set
-        one in Hardware settings, honor it as-is. Otherwise use the model's real
-        trained context (read from its GGUF metadata at download time), capped at
-        a safe default — a 128k+ context model would otherwise try to allocate a
-        KV cache that OOMs typical consumer hardware. Shared by the RAM estimator
-        and the actual load call so both agree on the same number.
+        Decide the actual n_ctx to load a model with — see module-level
+        resolve_effective_n_ctx for the real rule. Shared by the RAM
+        estimator and the actual load call so both agree on the same number.
         """
-        from app.core import context_config
-        hw_cfg = context_config.get("hardware")
-        user_n_ctx = hw_cfg.get("n_ctx")
-        if user_n_ctx:
-            return user_n_ctx
-        safe_cap = 8192
-        model_max = config.context_length or safe_cap
-        return min(model_max, safe_cap)
+        return resolve_effective_n_ctx(config.context_length, config.name)
 
     def _estimate_ram_required_gb(self, config: "ModelConfig") -> float:
         """

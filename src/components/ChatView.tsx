@@ -18,28 +18,12 @@ import {
   ChevronRight,
   Mic,
   Square,
-  Download,
-  Globe,
 } from 'lucide-react';
 import { type ChatMessage, type ConnectionStatus, type Attachment } from '@/hooks/useSocket';
 import { useAppSelector } from '@/hooks/useStore';
 import { selectSessionId } from '@/store/sessionSlice';
 import MarkdownContent from './MarkdownContent';
 import { useMemo } from 'react';
-
-function ToggleSwitch({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
-  return (
-    <button
-      onClick={(e) => { e.stopPropagation(); onChange(!checked); }}
-      className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 ${checked ? 'bg-aegis-primary' : 'bg-aegis-overlay border border-aegis-border'}`}
-      title={checked ? 'On for this chat' : 'Off for this chat'}
-    >
-      <span
-        className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${checked ? 'translate-x-4' : 'translate-x-0'}`}
-      />
-    </button>
-  );
-}
 
 type DocStatus = 'processing' | 'ready' | 'failed';
 
@@ -69,13 +53,12 @@ interface ChatViewProps {
   messages: ChatMessage[];
   status: ConnectionStatus;
   isStreaming: boolean;
-  onSendMessage: (msg: string, msgType?: string, userPrompt?: string, attachments?: Attachment[], exportFormat?: string) => boolean;
+  onSendMessage: (msg: string, msgType?: string, userPrompt?: string, attachments?: Attachment[], source?: string) => boolean;
   onCancelGeneration?: () => void;
   onClearMessages: () => void;
   activeConnectorName?: string;
   streamingContent?: string;
   statusText?: string | null;
-  onOpenLLMPanel?: () => void;
   onOpenContextPanel?: () => void;
   onOpenMarketplace?: () => void;
 }
@@ -90,7 +73,6 @@ export default function ChatView({
   activeConnectorName = 'GitHub',
   streamingContent,
   statusText,
-  onOpenLLMPanel,
   onOpenContextPanel,
   onOpenMarketplace,
 }: ChatViewProps) {
@@ -261,34 +243,6 @@ export default function ChatView({
   // "+" attach menu: Upload Document / Tools
   const [previewAttachment, setPreviewAttachment] = useState<Attachment | null>(null);
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
-  // Collapsed by default — the "+" menu shows one "Export" row that expands
-  // to reveal the PDF/DOCX/XLSX choices, rather than always showing all
-  // three as separate top-level rows. Reset whenever the parent menu closes
-  // (for any reason: picking an item, clicking outside, toggling "+" again)
-  // so it doesn't reopen pre-expanded next time.
-  const [exportSubmenuOpen, setExportSubmenuOpen] = useState(false);
-  useEffect(() => {
-    if (!attachMenuOpen) setExportSubmenuOpen(false);
-  }, [attachMenuOpen]);
-  const [scrapeBarOpen, setScrapeBarOpen] = useState(false);
-  const [scrapeUrl, setScrapeUrl] = useState('');
-  const [isScraping, setIsScraping] = useState(false);
-  // First scrape ever needs a one-time Chromium download (~250MB) — off by
-  // default (see backend app/api/documents.py's upload endpoint for the
-  // equivalent image-upload gate) so a fresh install doesn't eat that cost
-  // for a user who never scrapes. Real per-component progress (Chromium
-  // itself, then its paired FFMPEG and Headless Shell builds) parsed
-  // straight from Playwright's own CLI output — see backend
-  // app/core/scraper.py's install_chromium.
-  const [browserInstall, setBrowserInstall] = useState<{ status: 'installing' | 'failed'; component?: string; percent?: number; error?: string } | null>(null);
-  const installSocketRef = useRef<WebSocket | null>(null);
-  useEffect(() => () => { installSocketRef.current?.close(); }, []);
-
-  // "+" > Export: picks the format up front instead of relying on the
-  // agent to guess export intent from free text. Chat Mode only — Agent
-  // Mode has no export tool at all (see backend chat.py's _get_local_tools
-  // docstring) and just nudges back to Chat Mode.
-  const [pendingExportFormat, setPendingExportFormat] = useState<'pdf' | 'docx' | 'xlsx' | null>(null);
 
   // Installed Tools for THIS conversation, with their per-chat on/off
   // state — the "+" menu's Claude-Desktop-style toggle list.
@@ -324,90 +278,6 @@ export default function ChatView({
     }
   };
 
-  // Clicking a Tool row itself (not its toggle) runs that tool's manual
-  // one-off action — only "web_scrape"/playwright_scraper exists today.
-  const handleToolClick = (toolId: string) => {
-    setAttachMenuOpen(false);
-    if (toolId === 'playwright_scraper') {
-      setScrapeBarOpen(true);
-    }
-  };
-
-  const handleScrapeSubmit = async () => {
-    const url = scrapeUrl.trim();
-    if (!url || !sessionId) return;
-    setIsScraping(true);
-    setBrowserInstall(null);
-
-    let res: Response;
-    try {
-      res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/scrape`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, conversation_id: sessionId }),
-      });
-    } catch (err) {
-      console.error(err);
-      onSendMessage('[System] Failed to connect to the scraping endpoint.', 'toast');
-      setIsScraping(false);
-      setScrapeUrl('');
-      setScrapeBarOpen(false);
-      return;
-    }
-
-    // 409 = the headless browser this needs has never been installed (see
-    // backend app/api/documents.py's upload endpoint for the equivalent
-    // gate on images) — this used to just be a dead end (a generic
-    // "failed" toast, no way to actually install it from the UI at all).
-    // Install it now, with real progress, then automatically retry this
-    // exact scrape the moment it's ready — a one-time ~250MB cost, not
-    // something the user should have to notice or retry by hand.
-    if (res.status === 409) {
-      installBrowserThenRetry();
-      return;
-    }
-
-    if (!res.ok) {
-      onSendMessage('[System] Failed to start scraping that page.', 'toast');
-    }
-    // Same deal as document upload: the backend broadcasts real progress
-    // ("Opening..." -> "✅ Scraped..." / "❌ ...") over the websocket, so we
-    // don't post an assumed-success message here.
-    setIsScraping(false);
-    setScrapeUrl('');
-    setScrapeBarOpen(false);
-  };
-
-  const installBrowserThenRetry = () => {
-    setBrowserInstall({ status: 'installing' });
-    const wsUrl = (process.env.NEXT_PUBLIC_WS_URL || 'ws://127.0.0.1:8000/ws') + `?client_id=scrape-install-${Date.now()}`;
-    const ws = new WebSocket(wsUrl);
-    installSocketRef.current = ws;
-    ws.onmessage = (event) => {
-      let msg: any;
-      try {
-        msg = JSON.parse(event.data);
-      } catch {
-        return;
-      }
-      if (msg.type !== 'browser_install_progress') return;
-      if (msg.status === 'installing') {
-        setBrowserInstall({ status: 'installing', component: msg.component, percent: msg.percent });
-      } else if (msg.status === 'ready') {
-        ws.close();
-        setBrowserInstall(null);
-        handleScrapeSubmit();
-      } else if (msg.status === 'failed') {
-        ws.close();
-        setIsScraping(false);
-        setBrowserInstall({ status: 'failed', error: msg.error || 'Could not set up the browser for scraping.' });
-      }
-    };
-    fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/scrape/install`, { method: 'POST' }).catch(() => {
-      setIsScraping(false);
-      setBrowserInstall({ status: 'failed', error: 'Could not reach the backend.' });
-    });
-  };
 
   // Voice input (mic button) — local speech-to-text via faster-whisper.
   // The model ships inside the app bundle itself (see
@@ -458,6 +328,8 @@ export default function ChatView({
       const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
       const formData = new FormData();
       formData.append('file', audioBlob, 'clip.webm');
+      formData.append('partial', 'true');
+      if (sessionId) formData.append('conversation_id', sessionId);
       const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/voice/transcribe`, {
         method: 'POST',
         body: formData,
@@ -498,15 +370,36 @@ export default function ChatView({
         try {
           const formData = new FormData();
           formData.append('file', audioBlob, 'clip.webm');
-          const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/voice/transcribe`, {
-            method: 'POST',
-            body: formData,
-          });
-          if (res.ok) {
-            const data = await res.json();
+          if (sessionId) formData.append('conversation_id', sessionId);
+          const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
+          // Fired together: /transcribe does the actual work (server-side,
+          // it resolves the same "send automatically" / engine choice off
+          // whichever workflow's "On chat message" node is connected — see
+          // app.api.voice._get_active_voice_config), /active-config here is
+          // only so the COMPOSER knows, once text comes back, whether to
+          // send it immediately or leave it for review. All mic settings
+          // now live on that trigger node (WorkflowsView.tsx), not in chat.
+          const [transcribeRes, configRes] = await Promise.all([
+            fetch(`${apiBase}/api/voice/transcribe`, { method: 'POST', body: formData }),
+            fetch(`${apiBase}/api/voice/active-config${sessionId ? `?conversation_id=${encodeURIComponent(sessionId)}` : ''}`),
+          ]);
+          if (transcribeRes.ok) {
+            const data = await transcribeRes.json();
             const text = (data.text || '').trim();
-            setInputVal(baseTextRef.current && text ? `${baseTextRef.current} ${text}` : (text || baseTextRef.current));
-            textareaRef.current?.focus();
+            const finalText = baseTextRef.current && text ? `${baseTextRef.current} ${text}` : (text || baseTextRef.current);
+            let autoSend = false;
+            if (configRes.ok) {
+              try { autoSend = !!(await configRes.json()).auto_send; } catch {}
+            }
+            if (autoSend && finalText.trim()) {
+              // Send automatically, per the connected trigger node's own
+              // setting: runs through that workflow immediately (including
+              // any MCP/Tool nodes) rather than leaving it in the composer.
+              sendMessageText(finalText, 'voice');
+            } else {
+              setInputVal(finalText);
+              textareaRef.current?.focus();
+            }
           } else {
             onSendMessage('[System] Voice transcription failed.', 'toast');
           }
@@ -603,24 +496,31 @@ export default function ChatView({
     a => docStatuses[a.document_id] === undefined || docStatuses[a.document_id] === 'processing'
   );
 
-  const handleSend = () => {
-    if ((!inputVal.trim() && pendingAttachments.length === 0) || isStreaming || status !== 'connected' || hasProcessingAttachment) return;
+  // Takes the text to send explicitly rather than always reading `inputVal`
+  // state — needed by the mic's auto-send path (below), which has the
+  // freshly-transcribed text as a local value right after the fetch
+  // resolves, before a setInputVal from the same tick would actually be
+  // visible on `inputVal` yet.
+  const sendMessageText = (text: string, source?: string): boolean => {
+    if ((!text.trim() && pendingAttachments.length === 0) || isStreaming || status !== 'connected' || hasProcessingAttachment) return false;
     const sent = onSendMessage(
-      inputVal,
+      text,
       'message',
       undefined,
       pendingAttachments.length > 0 ? pendingAttachments : undefined,
-      pendingExportFormat || undefined
+      source
     );
     if (sent) {
       setInputVal('');
       setPendingAttachments([]);
-      setPendingExportFormat(null);
       if (textareaRef.current) {
         textareaRef.current.style.height = 'auto';
       }
     }
+    return sent;
   };
+
+  const handleSend = () => { sendMessageText(inputVal); };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -705,7 +605,7 @@ export default function ChatView({
              just "Thinking…" here, deliberately — Claude never surfaces its
              own backend substeps ("searching documents", "generating"…) to
              the user, so this doesn't either; that stays reserved for the
-             standalone status line below (uploads/scrapes with no chat turn). */}
+             standalone status line below (an upload with no chat turn). */}
         {isStreaming && (
           <div className="max-w-4xl mx-auto">
             <div className="max-w-2xl w-full space-y-2">
@@ -732,7 +632,7 @@ export default function ChatView({
         )}
 
         {/* Standalone status line — covers cases with no response bubble to
-            show it in yet: a document/scrape upload (no chat turn at all).
+            show it in yet: a document upload (no chat turn at all).
             During an active chat turn this is already shown inline in the
             response bubble's header, so it's suppressed here to avoid a
             duplicate. */}
@@ -747,42 +647,6 @@ export default function ChatView({
 
       {/* ── Bottom Input Bar ─────────────────────────────── */}
       <div className="p-6 pt-2 bg-aegis-base max-w-4xl w-full mx-auto space-y-3">
-        {pendingExportFormat && (
-          <div className="flex flex-wrap gap-2 mb-2">
-            <div className="flex items-center gap-2 bg-aegis-raised border border-aegis-border rounded-xl pl-3 pr-2 py-2">
-              <Download className="w-3.5 h-3.5 text-aegis-primary-light flex-shrink-0" />
-              <span className="text-[12px] text-aegis-text-primary">
-                Will export your next answer as {pendingExportFormat.toUpperCase()}
-              </span>
-              <button
-                onClick={() => setPendingExportFormat(null)}
-                className="text-aegis-text-muted hover:text-aegis-error p-0.5"
-                title="Cancel export"
-              >
-                <X className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          </div>
-        )}
-
-        {pendingExportFormat && (
-          <div className="flex flex-wrap gap-2 mb-2">
-            <div className="flex items-center gap-2 bg-aegis-raised border border-aegis-border rounded-xl pl-3 pr-2 py-2">
-              <Download className="w-3.5 h-3.5 text-aegis-primary-light flex-shrink-0" />
-              <span className="text-[12px] text-aegis-text-primary">
-                Will export your next answer as {pendingExportFormat.toUpperCase()}
-              </span>
-              <button
-                onClick={() => setPendingExportFormat(null)}
-                className="text-aegis-text-muted hover:text-aegis-error p-0.5"
-                title="Cancel export"
-              >
-                <X className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          </div>
-        )}
-
         {pendingAttachments.length > 0 && (
           <div className="flex flex-wrap gap-2 mb-2">
             {pendingAttachments.map(a => (
@@ -841,68 +705,6 @@ export default function ChatView({
           </div>
         )}
 
-        {scrapeBarOpen && (
-          <div className="mb-2 bg-aegis-raised border border-aegis-border rounded-xl px-3 py-2.5">
-            {browserInstall ? (
-              browserInstall.status === 'installing' ? (
-                <div>
-                  <div className="flex items-center gap-2 text-[12px] text-aegis-text-secondary">
-                    <Loader2 className="w-3.5 h-3.5 animate-spin text-aegis-primary-light flex-shrink-0" />
-                    <span className="truncate">
-                      Setting up the browser for scraping (one-time, ~250MB)
-                      {browserInstall.component ? ` — ${browserInstall.component}` : ''}
-                    </span>
-                    {typeof browserInstall.percent === 'number' && (
-                      <span className="ml-auto flex-shrink-0 font-semibold tabular-nums text-aegis-primary-light">{Math.round(browserInstall.percent)}%</span>
-                    )}
-                  </div>
-                  {typeof browserInstall.percent === 'number' && (
-                    <div className="mt-2 h-1 w-full rounded-full bg-aegis-border overflow-hidden">
-                      <div
-                        className="h-full rounded-full bg-aegis-primary transition-[width] duration-300 ease-out"
-                        style={{ width: `${Math.min(100, Math.max(0, browserInstall.percent))}%` }}
-                      />
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="flex items-center justify-between gap-2">
-                  <p className="text-[12px] text-aegis-error truncate">{browserInstall.error}</p>
-                  <div className="flex-shrink-0 flex items-center gap-2">
-                    <button onClick={handleScrapeSubmit} className="text-[11px] font-semibold text-aegis-primary-light hover:underline">Retry</button>
-                    <button onClick={() => { setBrowserInstall(null); setScrapeBarOpen(false); }} className="text-aegis-text-muted hover:text-aegis-error p-0.5">
-                      <X className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                </div>
-              )
-            ) : (
-              <div className="flex items-center gap-2">
-                <Globe className="w-3.5 h-3.5 text-aegis-primary-light flex-shrink-0" />
-                <input
-                  autoFocus
-                  value={scrapeUrl}
-                  onChange={(e) => setScrapeUrl(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter' && !isScraping) { e.preventDefault(); handleScrapeSubmit(); } if (e.key === 'Escape') setScrapeBarOpen(false); }}
-                  placeholder="Paste a URL to scrape…"
-                  disabled={isScraping}
-                  className="flex-1 min-w-0 bg-transparent text-[13px] text-aegis-text-primary placeholder:text-aegis-text-muted focus:outline-none disabled:opacity-50"
-                />
-                <button
-                  onClick={handleScrapeSubmit}
-                  disabled={isScraping || !scrapeUrl.trim()}
-                  className="flex-shrink-0 text-[12px] font-semibold text-white bg-aegis-primary hover:bg-aegis-primary-dark disabled:opacity-40 px-2.5 py-1 rounded-lg transition-colors"
-                >
-                  {isScraping ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : 'Scrape'}
-                </button>
-                <button onClick={() => setScrapeBarOpen(false)} disabled={isScraping} className="flex-shrink-0 text-aegis-text-muted hover:text-aegis-error p-0.5 disabled:opacity-40">
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            )}
-          </div>
-        )}
-
         <div className="relative bg-aegis-raised border border-aegis-border rounded-2xl shadow-sm focus-within:ring-1 focus-within:border-aegis-primary focus-within:ring-aegis-primary transition-all">
           <textarea
             ref={textareaRef}
@@ -922,7 +724,7 @@ export default function ChatView({
 
           {/* Input Bar Bottom Toolbar */}
           <div className="absolute bottom-2.5 left-3 right-3 flex items-center justify-between pointer-events-none">
-            {/* "+" attach menu: Upload Document, Export, and per-chat tool toggles */}
+            {/* "+" attach menu: Upload Document and per-chat tool toggles */}
             <div className="relative pointer-events-auto">
               <input
                 type="file"
@@ -951,43 +753,6 @@ export default function ChatView({
                       <Paperclip className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
                       <span className="whitespace-nowrap">Upload Document</span>
                     </button>
-
-                    <button
-                      onClick={() => { setAttachMenuOpen(false); setScrapeBarOpen(true); }}
-                      className="w-full flex items-center gap-2.5 px-3.5 py-2 text-[13px] text-aegis-text-primary hover:bg-aegis-overlay transition-colors"
-                    >
-                      <Globe className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
-                      <span className="whitespace-nowrap">Scrape a Webpage</span>
-                    </button>
-
-                    {/* Export — one "Export" row expands to the PDF/DOCX/XLSX
-                        choices rather than showing all three as separate
-                        top-level rows. Picking a format skips the model
-                        having to guess export intent from free text — it's
-                        attached to the next message like a pending
-                        attachment and applies automatically once sent
-                        (backend's deterministic _classify_export_intent
-                        path, chat.py). */}
-                    <div className="mt-1 pt-1.5 border-t border-aegis-border">
-                      <button
-                        onClick={() => setExportSubmenuOpen(v => !v)}
-                        className="w-full flex items-center gap-2.5 px-3.5 py-2 text-[13px] text-aegis-text-primary hover:bg-aegis-overlay transition-colors"
-                      >
-                        <Download className="w-4 h-4 text-aegis-text-muted flex-shrink-0" />
-                        <span className="flex-1 text-left whitespace-nowrap">Export</span>
-                        <ChevronDown className={`w-3.5 h-3.5 text-aegis-text-muted flex-shrink-0 transition-transform ${exportSubmenuOpen ? 'rotate-180' : ''}`} />
-                      </button>
-                      {exportSubmenuOpen && (['pdf', 'docx', 'xlsx'] as const).map(fmt => (
-                        <button
-                          key={fmt}
-                          onClick={() => { setAttachMenuOpen(false); setPendingExportFormat(fmt); }}
-                          className="w-full flex items-center gap-2.5 pl-9 pr-3.5 py-2 text-[13px] text-aegis-text-primary hover:bg-aegis-overlay transition-colors"
-                        >
-                          <span className="whitespace-nowrap">{fmt.toUpperCase()}</span>
-                        </button>
-                      ))}
-                    </div>
-
                   </div>
                 </>
               )}
@@ -996,10 +761,14 @@ export default function ChatView({
             {/* Right Buttons: Active model status + RAM gauge + Send Button */}
             <div className="flex items-center gap-2 pointer-events-auto">
               {/* Mic — click records; click again (or the transcribing spinner)
-                  stops and sends the clip to /api/voice/transcribe, which fills
-                  the composer with the resulting text. Disabled (not hidden)
-                  when 'unavailable' so a broken build is visibly diagnosable
-                  rather than silently missing a button. */}
+                  stops and sends the clip to /api/voice/transcribe. Disabled
+                  (not hidden) when 'unavailable' so a broken build is visibly
+                  diagnosable rather than silently missing a button. Which
+                  engine transcribes it, and whether the result sends itself
+                  or waits in the composer for review, are no longer set here
+                  — they're configured on whichever workflow's "On chat
+                  message" node is connected to this chat (WorkflowsView.tsx),
+                  resolved server-side per recording. */}
               <button
                 onClick={handleMicClick}
                 disabled={voiceStatus !== 'ready' || isTranscribing}
@@ -1068,7 +837,7 @@ export default function ChatView({
                             <p className={`text-xs mt-0.5 ${ramTextColorClass}`}>
                               {modelLoaded
                                 ? `Running locally${ramPercent != null ? ` · RAM ${ramPercent.toFixed(0)}%` : ' · Ready'}`
-                                : 'Open LLMs to load a model'}
+                                : 'Open Memory Hub to load a model'}
                             </p>
                           </div>
                           {modelLoaded && <Check className="w-4 h-4 text-aegis-primary flex-shrink-0 mt-0.5" />}
@@ -1086,7 +855,7 @@ export default function ChatView({
 
                         <div className="border-t border-aegis-border" />
                         <button
-                          onClick={() => { setModelMenuOpen(false); onOpenLLMPanel?.(); }}
+                          onClick={() => { setModelMenuOpen(false); onOpenContextPanel?.(); }}
                           className="w-full flex items-center justify-between px-4 py-3 text-sm text-aegis-text-primary hover:bg-aegis-overlay transition-colors"
                         >
                           <span>More models</span>

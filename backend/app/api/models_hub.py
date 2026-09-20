@@ -7,7 +7,6 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
 from pydantic import BaseModel
 from huggingface_hub import HfApi
 import httpx
-import certifi
 
 from app.core.connection_manager import manager
 from app.db.database import get_db
@@ -112,12 +111,18 @@ def search_models(q: str = "", limit: int = 20):
             "full": "False"
         }
         
-        # Explicitly point at certifi's bundled CA file rather than trusting
-        # Python's default SSL context — PyInstaller doesn't always locate the
-        # system cert store correctly (notably on Windows), which used to cause
-        # [SSL: CERTIFICATE_VERIFY_FAILED]. certifi.where() is bundled into the
-        # packaged app via main.spec's collect_data_files('certifi').
-        res = httpx.get(url, params=params, timeout=15.0, verify=certifi.where())
+        # No explicit verify= here — main.py's truststore.inject_into_ssl()
+        # (called at process startup, before any SSLContext is created)
+        # already makes every SSL connection use the OS's own native trust
+        # evaluation instead of a bundled CA file. That's a strictly better
+        # fix for the original problem this used to work around
+        # (PyInstaller/Windows sometimes failing to locate the system cert
+        # store in a frozen build) — truststore queries Windows' CryptoAPI
+        # directly rather than needing any file to exist on disk at all —
+        # and it ALSO correctly trusts a locally-installed interception CA
+        # (corporate VPN/antivirus doing TLS inspection), which a fixed
+        # certifi.where() bundle never would.
+        res = httpx.get(url, params=params, timeout=15.0)
         res.raise_for_status()
         models_data = res.json()
         
@@ -197,9 +202,10 @@ async def download_file_task(repo_id: str, filename: str, file_path: Path, model
     })
 
     try:
-        # Use a generous timeout for large files; verify against certifi's bundled
-        # CA file (see search_models() above for why this isn't verify=False).
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=None), verify=certifi.where()) as client:
+        # Use a generous timeout for large files; no explicit verify= — see
+        # search_models() above for why (truststore.inject_into_ssl(), not
+        # verify=False).
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=None)) as client:
             async with client.stream("GET", url, follow_redirects=True) as response:
                 response.raise_for_status()
                 total_bytes = int(response.headers.get("Content-Length", 0))
@@ -355,7 +361,11 @@ async def start_download(req: DownloadRequest, background_tasks: BackgroundTasks
 @router.get("/downloaded")
 def list_downloaded_models(db: Session = Depends(get_db_session)):
     """List all downloaded/downloading models from SQLite."""
+    from app.core.llm_manager import resolve_effective_n_ctx
+    from app.db.crud import get_model_usage_by_workflows
+
     models = db.query(ModelRegistry).order_by(ModelRegistry.created_at.desc()).all()
+    usage_by_model = get_model_usage_by_workflows(db)
     return {"models": [{
         "id": m.id,
         "name": m.name,
@@ -366,10 +376,62 @@ def list_downloaded_models(db: Session = Depends(get_db_session)):
         "file_size_bytes": m.file_size_bytes,
         "is_active": m.is_active,
         "context_length": m.context_length,
+        # The REAL context window this model actually loads with — capped
+        # well below context_length (its native/trained max) unless THIS
+        # model has its own context_cap override set. See
+        # llm_manager.resolve_effective_n_ctx's docstring for why the raw
+        # context_length alone is misleading as a "what will I actually
+        # get" ceiling.
+        "effective_context_length": resolve_effective_n_ctx(m.context_length, m.name),
+        "context_cap": m.context_cap,
         "is_vision": m.is_vision,
         "mmproj_filename": m.mmproj_filename,
         "mmproj_status": m.mmproj_status,
+        "used_by_workflows": usage_by_model.get(m.name, []),
     } for m in models]}
+
+
+class ContextCapRequest(BaseModel):
+    # None clears the override, falling back to the safe default again.
+    n_ctx: Optional[int] = None
+
+
+@router.post("/{model_id}/context-cap")
+def set_model_context_cap(model_id: int, req: ContextCapRequest, db: Session = Depends(get_db_session)):
+    """
+    Set (or clear) this ONE model's own context window cap override — see
+    ModelRegistry.context_cap and llm_manager.resolve_effective_n_ctx. Each
+    model gets its own cap rather than one app-wide value, since a small
+    model and a large one legitimately want different limits. If this
+    model is currently loaded, only it (not every other loaded model) is
+    unloaded so it picks up the new cap next time it's actually used.
+    """
+    model = db.query(ModelRegistry).filter(ModelRegistry.id == model_id).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found.")
+
+    if req.n_ctx is not None:
+        if req.n_ctx < 512:
+            raise HTTPException(status_code=400, detail="Context cap must be at least 512 tokens.")
+        if model.context_length and req.n_ctx > model.context_length:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Context cap can't exceed this model's native context ({model.context_length:,} tokens).",
+            )
+
+    from app.api.context_config import is_llm_busy
+    if is_llm_busy():
+        raise HTTPException(status_code=409, detail="Cannot change the context cap while a generation is in progress.")
+
+    model.context_cap = req.n_ctx
+    db.commit()
+
+    from app.core.agents.chat import get_llm_manager
+    llm_manager = get_llm_manager()
+    if model.name in llm_manager.loaded_models:
+        llm_manager.unload_model(model.name)
+
+    return {"success": True, "context_cap": model.context_cap}
 
 
 @router.delete("/{model_id}")

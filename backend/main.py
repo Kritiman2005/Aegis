@@ -13,6 +13,24 @@ import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
+# Every outbound HTTPS call this app makes (to aegisaistudio.online for the
+# account/desktop-handoff/plan-sync endpoints) uses Python's own bundled CA
+# list (certifi) by default, which only trusts publicly-issued certificates.
+# A user behind corporate/endpoint-security TLS inspection (a VPN client, an
+# antivirus product, a managed network appliance — anything that re-signs
+# HTTPS traffic with its own locally-generated CA to scan it) has that CA
+# trusted by their OS and browsers, but NOT by certifi's bundle, so a plain
+# httpx call fails with a certificate-verify error even though the same
+# machine's browser loads the exact same site fine. truststore makes every
+# ssl.SSLContext Python creates from this point on defer to the OS's own
+# native trust evaluation (Keychain on macOS, Cert Store on Windows) instead
+# — the same trust decision the system's own browsers and tools make, so
+# this app's own network calls succeed under the same conditions a browser
+# already would. Injected here, before any other import has a chance to
+# create an SSLContext of its own.
+import truststore
+truststore.inject_into_ssl()
+
 # Load the .env file from the project root (Dev only — .env is not bundled in packaged builds)
 if not getattr(sys, 'frozen', False):
     root_dir = Path(__file__).resolve().parent.parent
@@ -50,6 +68,18 @@ if len(sys.argv) > 1 and sys.argv[1] == "mcp_google":
     run_server(sys.argv[2:])
     sys.exit(0)
 
+# Makes any package installed via the Dependencies panel's free-text pip
+# install box (app/core/optional_deps.py — see its own module docstring)
+# importable again this run, before anything below could ever need it.
+from app.core.optional_deps import ensure_on_path
+ensure_on_path()
+
+# Attaches the Dependencies panel's recent-errors log viewer as early as
+# possible — see app/core/log_buffer.py's own module docstring — so it's
+# already capturing warnings/errors from everything imported below.
+from app.core.log_buffer import install as install_log_buffer
+install_log_buffer()
+
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -66,17 +96,19 @@ from app.api.documents import router as documents_router
 from app.api.models_hub import router as models_hub_router
 from app.api.context_config import router as context_config_router
 from app.api.analytics import router as analytics_router
-from app.api.scraping import router as scraping_router
 from app.api.voice import router as voice_router
 from app.api.marketplace import router as marketplace_router
 from app.api.marketplace_databases import router as marketplace_databases_router
 from app.api.marketplace_embeddings import router as marketplace_embeddings_router
 from app.api.marketplace_rerankers import router as marketplace_rerankers_router
+from app.api.marketplace_media import router as marketplace_media_router
+from app.api.optional_deps import router as optional_deps_router
 from app.api.conversation_capabilities import router as conversation_capabilities_router
 from app.api.export import router as export_router
 from app.api.workflows import router as workflows_router
 from app.api.aegis_db import router as aegis_db_router
 from app.api.account_auth import router as account_auth_router
+from app.api.updates import router as updates_router
 
 # ─── App Factory ─────────────────────────────────────────────────────────────
 
@@ -137,17 +169,19 @@ app.include_router(documents_router)     # /api/documents/*
 app.include_router(models_hub_router)    # /api/hub/*
 app.include_router(context_config_router) # /api/context-config
 app.include_router(analytics_router)     # /api/analytics
-app.include_router(scraping_router)      # /api/scrape/*
 app.include_router(voice_router)         # /api/voice/*
 app.include_router(marketplace_router)   # /api/marketplace/*
 app.include_router(marketplace_databases_router)  # /api/marketplace/databases/*
 app.include_router(marketplace_embeddings_router)  # /api/marketplace/embeddings/*
 app.include_router(marketplace_rerankers_router)  # /api/marketplace/rerankers/*
+app.include_router(marketplace_media_router)  # /api/marketplace/media-engines/*
+app.include_router(optional_deps_router)  # /api/optional-deps/*
 app.include_router(conversation_capabilities_router)  # /api/conversations/{id}/capabilities
 app.include_router(export_router)        # /api/export
 app.include_router(workflows_router)     # /api/workflows/*
 app.include_router(aegis_db_router)      # /api/aegis-db/*
 app.include_router(account_auth_router)  # /api/account/*
+app.include_router(updates_router)       # /api/updates/*
 
 # ─── Startup: SQLite Initialization & OAuth Auto-Restore ──────────────────────
 
@@ -156,6 +190,19 @@ _system_status = {
     "sqlite": False,
     "qdrant": False,
     "embedding_models": False,
+    # Sub-stage + percentage for the embedding preload (dense -> sparse ->
+    # reranker) — the reranker stage is what actually takes most of the
+    # time (a full `sentence_transformers` import pulls in transformers/
+    # sklearn/pandas/datasets even though this app only ever does
+    # inference — see the cold-start investigation this replaced a flat
+    # boolean with), so the splash screen can show real movement instead
+    # of a frozen spinner for ~10-15s straight.
+    "embedding_stage": "pending",  # pending | dense | sparse | reranker | done | failed
+    "embedding_progress": 0,       # 0-100
+    "llm_ready": False,
+    "llm_stage": "pending",        # pending | none | loading | done | failed
+    "llm_progress": 0,             # 0-100
+    "llm_model_name": None,
     "downloaded_models": [],
 }
 
@@ -163,6 +210,28 @@ _system_status = {
 async def get_system_status():
     """Returns the readiness state of all backend subsystems for the Splash Screen."""
     return _system_status
+
+
+def _tick_progress(status_key: str, start: int, end: int, duration_s: float, stop: "threading.Event") -> None:
+    """Advances _system_status[status_key] from start toward end over
+    duration_s, easing out (fast at first, slower near the end) so it never
+    actually reaches `end` on its own — the caller snaps the real final
+    value once the thing it's estimating for has genuinely finished. Neither
+    sentence_transformers' import machinery nor llama_cpp's model loader
+    expose a real progress callback, so this time-based estimate is the
+    honest alternative to a frozen spinner for an operation known to take
+    several seconds to tens of seconds."""
+    steps = 50
+    interval = max(0.05, duration_s / steps)
+    for i in range(steps):
+        # Event.wait() (vs. sleep()+is_set()) closes the race where stop is
+        # set mid-sleep: sleep()+check-before would still write one more
+        # stale, lower value right after the caller's own final write,
+        # visibly ticking the percentage backwards.
+        if stop.wait(interval):
+            return
+        frac = 1 - (1 - (i + 1) / steps) ** 2
+        _system_status[status_key] = int(start + (end - start) * frac)
 
 
 @app.get("/api/feature-flags")
@@ -211,21 +280,6 @@ async def on_startup():
         if fixed:
             _logger.warning(f"Reconciled documents: marked {fixed} orphaned in-progress row(s) as failed.")
 
-    # Same idea for documents stuck 'processing' from a prior process
-    # lifetime — see reconcile_stuck_documents's docstring.
-    with SessionLocal() as db:
-        fixed = reconcile_stuck_documents(db)
-        if fixed:
-            _logger.warning(f"Reconciled documents: marked {fixed} orphaned in-progress row(s) as failed.")
-
-    # Remove any "downloaded" model rows whose file no longer exists on disk —
-    # otherwise the UI can report a model as downloaded/active that isn't
-    # really there (e.g. a stale seed row, or a file removed outside the app).
-    with SessionLocal() as db:
-        removed = reconcile_model_registry(db)
-        if removed:
-            _logger.warning(f"Reconciled model registry: removed {removed} orphaned row(s).")
-
     # Refresh downloaded models list in status
     with SessionLocal() as db:
         downloaded = db.query(ModelRegistry).filter(ModelRegistry.status == "downloaded").all()
@@ -237,58 +291,48 @@ async def on_startup():
     # schedule_plan's websocket handler is gone, but old jobs keep working.
     scheduler_daemon.start()
 
-    # Reap browser_* tool sessions (app.core.browser_session) idle for too
-    # long, so an agent that finishes browsing — or a user who just closes
-    # the tab — doesn't leave a headless Chromium process running forever.
-    from app.core.browser_session import start_reaper
-    start_reaper()
-
     # Reap expired agent-triggered exports (app.api.export's in-memory store)
     # so a long-running backend doesn't accumulate exported files forever.
     from app.api.export import start_export_reaper
     start_export_reaper()
 
-    # Reap browser_* tool sessions (app.core.browser_session) idle for too
-    # long, so an agent that finishes browsing — or a user who just closes
-    # the tab — doesn't leave a headless Chromium process running forever.
-    from app.core.browser_session import start_reaper
-    start_reaper()
+    # Embedding models (dense/sparse/reranker) are no longer eagerly
+    # preloaded here — Aegis's own default pipeline is a bare
+    # chat_trigger -> llm -> chat_reply now (see app.core.workflows.seed),
+    # not the earlier auto-RAG tree that actually used them on every turn.
+    # Downloading BAAI/bge-base-en-v1.5 + a sparse model + the
+    # sentence-transformers-based reranker at every fresh install's first
+    # boot was real, unwanted default-download weight for an app that, by
+    # default, never touches any of them — and the reranker specifically
+    # would now just fail every single startup anyway, since
+    # sentence_transformers isn't bundled any more (see main.spec's
+    # excludes list). get_dense_model/get_sparse_model/get_reranker
+    # (app.core.rag.processor) are already lazy — first real use (a
+    # user-built RAG workflow, or a document search) initializes them
+    # then, same one-time cost just moved from every boot to first actual
+    # need. Nothing left to wait on, so the splash screen's embedding
+    # stage reports done immediately instead of ticking through a
+    # multi-second preload that no longer happens.
+    _system_status["embedding_stage"] = "done"
+    _system_status["embedding_progress"] = 100
+    _system_status["embedding_models"] = True
 
-    # Reap expired agent-triggered exports (app.api.export's in-memory store)
-    # so a long-running backend doesn't accumulate exported files forever.
-    from app.api.export import start_export_reaper
-    start_export_reaper()
-
-    # Eagerly preload embedding models in a background thread
-    def _preload_embedding_models():
-        try:
-            _logger.info("Preloading embedding models in background...")
-            from app.core.rag.processor import get_dense_model, get_sparse_model, get_reranker
-            get_dense_model()
-            get_sparse_model()
-            get_reranker()
-            _system_status["embedding_models"] = True
-            _logger.info("Embedding models preloaded successfully.")
-        except Exception as e:
-            _logger.error(f"Failed to preload embedding models: {e}")
-            _system_status["embedding_models"] = True  # Non-fatal: mark done so splash doesn't block
-            return
-
-        # One-time re-ingestion of every existing document under the
-        # current embedding model — a no-op after the first successful run
-        # (see migrate_documents_to_current_embedding's own marker-file
-        # gate), but required once whenever the embedding model changes
-        # (different output dimension = a new, empty Qdrant collection —
-        # nothing uploaded before the change is searchable again until
-        # this runs). Chained after the preload above rather than its own
-        # thread so it never races the same models still being loaded.
+    # Document text-extraction/ingestion is back (Extract node, document
+    # upload) — existing "ready" documents from before an embedding-model
+    # upgrade still need re-ingesting under the new model (see
+    # migrate_documents_to_current_embedding's own docstring). Its own
+    # guards (a marker file, an early return when there are no "ready"
+    # documents at all) make this a cheap no-op on a fresh install; it only
+    # actually touches get_dense_model() when there's real migration work,
+    # so it doesn't reintroduce the eager-download preload removed above.
+    def _migrate_embeddings_if_needed():
         try:
             from app.core.rag.processor import migrate_documents_to_current_embedding
             migrate_documents_to_current_embedding()
         except Exception as e:
             _logger.error(f"Embedding migration pass failed: {e}")
 
-    threading.Thread(target=_preload_embedding_models, daemon=True).start()
+    threading.Thread(target=_migrate_embeddings_if_needed, daemon=True).start()
 
     # Eagerly load the active LLM in the background so it's already resident in
     # RAM by the time the user opens chat, instead of loading it lazily on the
@@ -308,46 +352,45 @@ async def on_startup():
                     active = db.query(ModelRegistry).filter(ModelRegistry.status == "downloaded").first()
                 if not active:
                     _logger.info("No downloaded model to preload.")
+                    _system_status["llm_stage"] = "none"
+                    _system_status["llm_ready"] = True
                     return
                 model_name = active.name
+                model_path = active.file_path
 
+            _system_status["llm_model_name"] = model_name
+            _system_status["llm_stage"] = "loading"
             _logger.info(f"Preloading active LLM '{model_name}' in background...")
-            from app.core.agents.chat import get_llm_manager
-            get_llm_manager().get_model(model_name)
+
+            # llama_cpp's Llama() constructor has no progress callback either —
+            # estimate the load duration from the GGUF's on-disk size (~150MB/s
+            # is a conservative floor for mmap + KV-cache init across SSD-class
+            # disks) so the splash bar still moves at something like the real rate.
+            try:
+                size_gb = os.path.getsize(model_path) / (1024 ** 3) if model_path and os.path.exists(model_path) else 2.0
+            except Exception:
+                size_gb = 2.0
+            est_seconds = max(4.0, size_gb / 0.15)
+
+            stop_ticker = threading.Event()
+            ticker = threading.Thread(
+                target=_tick_progress, args=("llm_progress", 0, 95, est_seconds, stop_ticker), daemon=True
+            )
+            ticker.start()
+            try:
+                from app.core.agents.chat import get_llm_manager
+                get_llm_manager().get_model(model_name)
+            finally:
+                stop_ticker.set()
+
+            _system_status["llm_progress"] = 100
+            _system_status["llm_stage"] = "done"
+            _system_status["llm_ready"] = True
             _logger.info(f"LLM '{model_name}' preloaded successfully.")
         except Exception as e:
             _logger.error(f"Failed to preload active LLM: {e}")
-
-    from app.core.agents.chat import llm_executor
-    llm_executor.submit(_preload_active_llm)
-
-    # Eagerly load the active LLM in the background so it's already resident in
-    # RAM by the time the user opens chat, instead of loading it lazily on the
-    # first message (which is what caused the noticeable lag on first send).
-    # Submitted to the same single-worker llm_executor a real chat request would
-    # use, so there's no race between this and an actual chat request trying to
-    # load the same model concurrently.
-    def _preload_active_llm():
-        try:
-            from app.db.models import ModelRegistry
-            with SessionLocal() as db:
-                active = db.query(ModelRegistry).filter(
-                    ModelRegistry.status == "downloaded",
-                    ModelRegistry.is_active == True
-                ).first()
-                if not active:
-                    active = db.query(ModelRegistry).filter(ModelRegistry.status == "downloaded").first()
-                if not active:
-                    _logger.info("No downloaded model to preload.")
-                    return
-                model_name = active.name
-
-            _logger.info(f"Preloading active LLM '{model_name}' in background...")
-            from app.core.agents.chat import get_llm_manager
-            get_llm_manager().get_model(model_name)
-            _logger.info(f"LLM '{model_name}' preloaded successfully.")
-        except Exception as e:
-            _logger.error(f"Failed to preload active LLM: {e}")
+            _system_status["llm_stage"] = "failed"
+            _system_status["llm_ready"] = True
 
     from app.core.agents.chat import llm_executor
     llm_executor.submit(_preload_active_llm)
@@ -412,20 +455,6 @@ def on_shutdown():
     from app.core.scheduler import scheduler_daemon
     scheduler_daemon.stop()
 
-    # Close every open browser_* tool session so no headless Chromium
-    # process outlives the backend (each session's own reaper thread would
-    # get there eventually, but not until IDLE_TIMEOUT_SECONDS after this
-    # process is already gone).
-    from app.core.browser_session import close_all_sessions
-    close_all_sessions()
-
-    # Close every open browser_* tool session so no headless Chromium
-    # process outlives the backend (each session's own reaper thread would
-    # get there eventually, but not until IDLE_TIMEOUT_SECONDS after this
-    # process is already gone).
-    from app.core.browser_session import close_all_sessions
-    close_all_sessions()
-
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "selftest_llama":
         # CI-only entry point: proves the packaged binary can actually load and run
@@ -437,19 +466,6 @@ if __name__ == "__main__":
         llm.create_completion("Hello", max_tokens=4)
         print("SELFTEST_LLAMA_OK")
         sys.exit(0)
-
-    if len(sys.argv) > 2 and sys.argv[1] == "selftest_scrape":
-        # CI-only entry point: proves the packaged binary can actually drive a
-        # real headless browser scrape end to end (Node driver spawn, page
-        # render, extraction) — the same class of check as selftest_llama
-        # above, for the same reason: a packaged native-subprocess dependency
-        # that /api/health never touches, so a broken build would otherwise
-        # only surface the first time a user tries to scrape a page.
-        import asyncio
-        from app.core.scraper import scrape_url
-        r = asyncio.run(scrape_url(sys.argv[2]))
-        print(f"SELFTEST_SCRAPE_RESULT success={r.success} title={r.title!r} warnings={r.warnings} error={r.error}")
-        sys.exit(0 if r.success else 1)
 
     uvicorn.run(
         app,

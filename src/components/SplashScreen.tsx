@@ -8,8 +8,43 @@ interface SystemStatus {
   sqlite: boolean;
   qdrant: boolean;
   embedding_models: boolean;
+  embedding_stage: 'pending' | 'dense' | 'sparse' | 'reranker' | 'done' | 'failed';
+  embedding_progress: number;
+  llm_ready: boolean;
+  llm_stage: 'pending' | 'none' | 'loading' | 'done' | 'failed';
+  llm_progress: number;
+  llm_model_name: string | null;
   downloaded_models: string[];
 }
+
+// "dense"/"sparse"/"reranker" are dead states now — main.py's on_startup no
+// longer eagerly preloads any of these (they're all lazy, first-real-use
+// initialized instead — see its own comment there on why: a fresh install
+// downloading BAAI/bge-base-en-v1.5 + a sparse model + a reranker on every
+// boot was unwanted default weight for a pipeline that, by default, never
+// touches any of them). embedding_stage only ever actually arrives as
+// "pending" (briefly, before the first status poll) or "done" (within a
+// fraction of a second after) in a real run — worded honestly here rather
+// than implying a multi-step load that doesn't happen.
+const EMBEDDING_STAGE_LABEL: Record<SystemStatus['embedding_stage'], string> = {
+  pending: 'Checking embedding models',
+  dense: 'Checking embedding models',
+  sparse: 'Checking embedding models',
+  reranker: 'Checking embedding models',
+  done: 'Embedding models ready',
+  failed: 'Embedding models will load on first use',
+};
+
+// Rotates while the reranker/LLM stages are in flight — this is the part of
+// the wait that's actually visible now (see the cold-start investigation:
+// sentence_transformers' own import graph alone is ~11s), so it gets a
+// little texture instead of sitting on a static spinner.
+const LOADING_TIPS = [
+  'Everything runs locally — nothing you type ever leaves this device.',
+  'The reranker re-scores search results for accuracy after retrieval.',
+  'You can swap the language model anytime from the Model Hub.',
+  'First boot is the slowest — these models stay warm in RAM after this.',
+];
 
 interface Recommendation {
   ram_total_gb: number;
@@ -96,8 +131,12 @@ export default function SplashScreen({ onReady, onGoToLLMPanel, onBackendReachab
       const data: SystemStatus = await statusRes.json();
       setStatus(data);
 
-      // Proceed only when core DBs are up
-      if (data.sqlite && data.qdrant && data.downloaded_models.length > 0) {
+      // Proceed once core DBs are up AND both background preloads
+      // (embedding models + the active LLM) have actually finished — the
+      // splash screen is the whole point of showing real progress for the
+      // slow part of boot, so it shouldn't hand off to the app while the
+      // reranker/LLM are still silently loading behind it.
+      if (data.sqlite && data.qdrant && data.downloaded_models.length > 0 && data.embedding_models && data.llm_ready) {
         setBackendFullyReady(true);
       }
     } catch {
@@ -127,12 +166,61 @@ export default function SplashScreen({ onReady, onGoToLLMPanel, onBackendReachab
     }
   }, [backendFullyReady, introPhase, onReady]);
 
-  const checks: { label: string; done: boolean; key: string }[] = [
+  const embeddingStage = status?.embedding_stage ?? 'pending';
+  const embeddingPct = status?.embedding_progress ?? 0;
+  const llmStage = status?.llm_stage ?? 'pending';
+  const llmPct = status?.llm_progress ?? 0;
+  const llmDone = llmStage === 'done' || llmStage === 'none' || llmStage === 'failed';
+
+  const checks: { key: string; label: string; done: boolean; pct?: number }[] = [
     { key: 'backend', label: 'Starting backend server', done: backendReachable },
     { key: 'sqlite', label: 'Initializing SQLite database', done: status?.sqlite ?? false },
     { key: 'qdrant', label: 'Starting Qdrant vector store', done: status?.qdrant ?? false },
-    { key: 'embed', label: 'Preloading embedding models', done: status?.embedding_models ?? false },
+    {
+      key: 'embed',
+      label: EMBEDDING_STAGE_LABEL[embeddingStage],
+      done: status?.embedding_models ?? false,
+      // No real percentage to show anymore — embeddingStage resolves
+      // pending -> done in a fraction of a second, with nothing in
+      // between (see EMBEDDING_STAGE_LABEL's own comment).
+      pct: undefined,
+    },
+    ...(llmStage !== 'pending' && llmStage !== 'none'
+      ? [{
+          key: 'llm',
+          label: llmStage === 'loading'
+            ? `Loading language model${status?.llm_model_name ? ` — ${status.llm_model_name}` : ''}`
+            : llmStage === 'failed'
+            ? 'Language model will load on first message'
+            : 'Language model ready',
+          done: llmDone,
+          pct: llmStage === 'loading' ? llmPct : undefined,
+        }]
+      : []),
   ];
+
+  // Weighted overall percentage — the two heavy background preloads
+  // (embedding models, LLM) dominate the real wait, so they dominate the
+  // bar too, instead of every checklist item counting equally the way a
+  // flat done-count would.
+  const progressPct = Math.round(
+    (backendReachable ? 10 : 0) +
+    (status?.sqlite ? 5 : 0) +
+    (status?.qdrant ? 5 : 0) +
+    40 * (embeddingPct / 100) +
+    40 * (llmDone ? 1 : llmPct / 100)
+  );
+
+  // embeddingStage can never actually be 'reranker' anymore (see
+  // EMBEDDING_STAGE_LABEL's own comment) — the LLM download/load is the
+  // only real multi-second wait left to show rotating tips during.
+  const isLoadingHeavyStage = llmStage === 'loading';
+  const [tipIndex, setTipIndex] = useState(0);
+  useEffect(() => {
+    if (!isLoadingHeavyStage) return;
+    const t = setInterval(() => setTipIndex(i => (i + 1) % LOADING_TIPS.length), 4000);
+    return () => clearInterval(t);
+  }, [isLoadingHeavyStage]);
 
   const coreReady = status?.sqlite && status?.qdrant;
   const noModel = coreReady && (status?.downloaded_models?.length ?? 0) === 0;
@@ -224,7 +312,6 @@ export default function SplashScreen({ onReady, onGoToLLMPanel, onBackendReachab
       }
     }, 1500);
   }, [recommendation, onReady]);
-  const progressPct = Math.round((checks.filter(c => c.done).length / checks.length) * 100);
 
   return (
     <div className="relative flex h-screen w-screen flex-col items-center justify-center bg-aegis-base text-aegis-text-primary overflow-hidden">
@@ -264,33 +351,65 @@ export default function SplashScreen({ onReady, onGoToLLMPanel, onBackendReachab
           </div>
           <div className="flex justify-between text-[10px] text-aegis-text-muted tracking-wide">
             <span>{coreReady ? 'Core systems online' : 'Booting local stack'}</span>
-            <span>{progressPct}%</span>
+            <span className="tabular-nums">{progressPct}%</span>
           </div>
         </div>
 
         {/* Status checklist — same re-sync: staggered off CONTENT_REVEAL_MS
             instead of 0, so the stagger plays out only once the logo is
-            fully gone, not overlapping it mid-fade. */}
+            fully gone, not overlapping it mid-fade. Items with a live `pct`
+            (the reranker/LLM stages — the two that actually take real time,
+            see the cold-start investigation) get their own mini progress
+            bar and a moving percentage instead of just a spinner, so the
+            wait has something concrete to look at. */}
         <div className="w-full space-y-3">
-          {checks.map(({ key, label, done }, i) => (
+          {checks.map(({ key, label, done, pct }, i) => (
             <div
               key={key}
-              className="flex items-center gap-3 animate-fade-in-up"
+              className="animate-fade-in-up"
               style={{ animationDelay: `${CONTENT_REVEAL_MS + i * 80}ms`, animationFillMode: 'backwards' }}
             >
-              <div className="flex-shrink-0 w-4 h-4 relative">
-                {done ? (
-                  <CheckCircle2 className="w-4 h-4 text-aegis-success" />
-                ) : (
-                  <Circle className="w-4 h-4 text-aegis-border" strokeWidth={2} />
+              <div className="flex items-center gap-3">
+                <div className="flex-shrink-0 w-4 h-4 relative">
+                  {done ? (
+                    <CheckCircle2 className="w-4 h-4 text-aegis-success" />
+                  ) : pct !== undefined ? (
+                    <Loader2 className="w-4 h-4 animate-spin text-aegis-primary-light" />
+                  ) : (
+                    <Circle className="w-4 h-4 text-aegis-border" strokeWidth={2} />
+                  )}
+                </div>
+                <span className={`text-sm transition-colors duration-300 flex-1 ${done ? 'text-aegis-text-secondary' : pct !== undefined ? 'text-aegis-text-primary font-medium' : 'text-aegis-text-muted'}`}>
+                  {label}
+                </span>
+                {pct !== undefined && (
+                  <span className="text-xs font-semibold text-aegis-primary-light tabular-nums flex-shrink-0">{pct}%</span>
                 )}
               </div>
-              <span className={`text-sm transition-colors duration-300 ${done ? 'text-aegis-text-secondary' : 'text-aegis-text-muted'}`}>
-                {label}
-              </span>
+              {pct !== undefined && (
+                <div className="mt-1.5 ml-7 h-[3px] w-[calc(100%-1.75rem)] bg-aegis-overlay rounded-full overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-aegis-primary-light transition-all duration-500 ease-out"
+                    style={{ width: `${Math.max(3, pct)}%` }}
+                  />
+                </div>
+              )}
             </div>
           ))}
         </div>
+
+        {/* Rotating tip — only while a genuinely slow stage is in flight
+            (reranker import, LLM load), so it doesn't flash in for the
+            sub-second sqlite/qdrant checks. */}
+        {isLoadingHeavyStage && (
+          <p
+            key={tipIndex}
+            className="text-xs text-aegis-text-muted text-center leading-relaxed animate-fade-in-up max-w-[280px]"
+            style={{ animationFillMode: 'backwards' }}
+          >
+            {LOADING_TIPS[tipIndex]}
+          </p>
+        )}
 
         {/* No model — recommend one for this machine. Styled to match
             WelcomeScreen's "Your Mac is ready" language: eyebrow label,

@@ -14,7 +14,6 @@ broken across huggingface_hub releases before).
 import logging
 from typing import Any, Dict, List, Optional
 
-import certifi
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -37,9 +36,11 @@ def search_models(query: str, filter_tag: Optional[str] = None, limit: int = 20)
         params["filter"] = filter_tag
 
     try:
+        # No explicit verify= — main.py's truststore.inject_into_ssl() already
+        # makes every SSL connection use the OS's own native trust evaluation.
         res = httpx.get(
             "https://huggingface.co/api/models",
-            params=params, timeout=15.0, verify=certifi.where(),
+            params=params, timeout=15.0,
         )
         res.raise_for_status()
         models_data = res.json()

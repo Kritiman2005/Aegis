@@ -68,15 +68,43 @@ def list_chunking_strategies():
     return {"strategies": chunking_engines.list_strategies()}
 
 
-@router.get("/extraction-mcp-tools")
-def list_extraction_mcp_tools():
-    """Every connected MCP tool an Extract node can pick as a custom
-    extractor (app.core.extraction_engines.list_mcp_candidates) — how a
-    user integrates a document-extraction tool Aegis doesn't bundle itself:
-    connect it as an MCP server (Connectors — the catalog, a GitHub repo,
-    the registry, or a raw pasted config all work) and it shows up here."""
+@router.get("/mcp-extraction-candidates")
+def list_mcp_extraction_candidates():
+    """Every connected MCP tool that plausibly extracts text from a file —
+    offered as an Extract node engine choice alongside the bundled
+    per-format engines (app.core.extraction_engines.list_mcp_candidates).
+    Not format-scoped upstream (Aegis has no way to know which file types a
+    given MCP tool actually handles), so expanded into one row per known
+    extraction format here — matching the same per-format shape the
+    frontend already consumes from GET /api/marketplace/tools, so these
+    slot into the same picker list with no special-casing."""
     from app.core import extraction_engines
-    return {"tools": extraction_engines.list_mcp_candidates()}
+    candidates = extraction_engines.list_mcp_candidates()
+    return {
+        "engines": [
+            {"format": fmt, "engine_id": c["engine_id"], "name": c["name"], "description": c["description"], "default": False}
+            for fmt in extraction_engines.ENGINES.keys()
+            for c in candidates
+        ]
+    }
+
+
+@router.get("/mcp-chunking-candidates")
+def list_mcp_chunking_candidates():
+    """Every connected MCP tool that plausibly chunks text — offered as a
+    Chunk node strategy choice alongside the built-in strategies
+    (app.core.chunking_engines.list_mcp_candidates)."""
+    from app.core import chunking_engines
+    return {"strategies": chunking_engines.list_mcp_candidates()}
+
+
+@router.get("/mcp-embedding-candidates")
+def list_mcp_embedding_candidates():
+    """Every connected MCP tool that plausibly embeds text into a vector —
+    offered as an Embedding node model choice alongside Marketplace-
+    installed local models (app.core.embeddings.registry.list_mcp_candidates)."""
+    from app.core.embeddings import registry as embeddings_registry
+    return {"models": embeddings_registry.list_mcp_candidates()}
 
 
 @router.get("")
@@ -374,8 +402,11 @@ def set_chat_handler(workflow_id: int, db: Session = Depends(get_db)):
 @router.post("/{workflow_id}/unset-chat-handler")
 def unset_chat_handler(workflow_id: int, db: Session = Depends(get_db)):
     """Disconnects this workflow — its scope (global or one conversation)
-    reverts to the built-in ChatAgent pipeline exactly as it behaves with
-    nothing connected there."""
+    goes back to having no chat handler at all, so a message there gets
+    "⚠ No workflow is connected to handle chat..." (see
+    app.api.websocket) until another workflow is connected. There's no
+    built-in fallback pipeline to revert to anymore — chat is
+    workflow-only."""
     w = db.query(Workflow).filter(Workflow.id == workflow_id).first()
     if not w:
         raise HTTPException(status_code=404, detail="Workflow not found.")
@@ -444,8 +475,10 @@ def set_ingestion_handler(workflow_id: int, db: Session = Depends(get_db)):
 @router.post("/{workflow_id}/unset-ingestion-handler")
 def unset_ingestion_handler(workflow_id: int, db: Session = Depends(get_db)):
     """Disconnects this workflow — its scope (global or one conversation)
-    reverts to the built-in app.core.rag.processor.ingest_document pipeline
-    exactly as before."""
+    goes back to having no ingestion handler at all, so a document upload
+    there is rejected (see app.api.documents's upload handler) until
+    another workflow is connected. There's no built-in fallback pipeline
+    to revert to anymore — ingestion is workflow-only."""
     w = db.query(Workflow).filter(Workflow.id == workflow_id).first()
     if not w:
         raise HTTPException(status_code=404, detail="Workflow not found.")

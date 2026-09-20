@@ -2,7 +2,6 @@ from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, B
 from fastapi.responses import FileResponse
 from typing import List, Dict, Any, Optional
 import hashlib
-import hashlib
 import mimetypes
 import os
 import threading
@@ -11,8 +10,9 @@ from datetime import datetime
 
 from app.db.database import get_db
 from app.db.models import UserDocument
-from app.core.rag.processor import ingest_document, delete_document_points
+from app.core.rag.processor import delete_document_points
 from app.core.connection_manager import manager as ws_manager
+from app.core.friendly_errors import humanize_exception
 import anyio
 
 router = APIRouter(prefix="/api/documents", tags=["Documents"])
@@ -206,20 +206,28 @@ def process_upload_task(doc_id: int, file_path: str, file_type: str, filename: s
 
         def _run():
             try:
+                # Ingestion only ever runs through a connected workflow now
+                # (see app.api.workflows's /set-ingestion-handler) — the
+                # upload endpoint below already refuses to even queue this
+                # background task when no workflow is connected, so
+                # active_workflow_id being None here would only mean the
+                # handler was disconnected in the brief window between that
+                # check and this thread actually running. Surfacing that as
+                # a failure (rather than silently falling back to a built-in
+                # pipeline) keeps "everything routes through workflows" true
+                # even in that race.
                 active_workflow_id = _get_active_ingestion_workflow_id(doc.conversation_id)
-                if active_workflow_id is not None:
-                    # A workflow is connected as the ingestion handler (see
-                    # app.api.workflows's /set-ingestion-handler) — run it
-                    # instead of the built-in pipeline for this document.
-                    # asyncio.run is safe here specifically because this
-                    # closure already runs on its own dedicated worker
-                    # Thread (see the comment below) with no existing event
-                    # loop of its own.
-                    import asyncio
-                    from app.core.workflows.engine import run_ingestion_workflow
-                    asyncio.run(run_ingestion_workflow(doc_id, file_path, filename, file_type))
-                else:
-                    ingest_document(doc_id, file_path, file_type, filename)
+                if active_workflow_id is None:
+                    raise RuntimeError(
+                        "No workflow is connected to handle document ingestion. Open "
+                        "Workflows and connect one as the ingestion handler."
+                    )
+                # asyncio.run is safe here specifically because this closure
+                # already runs on its own dedicated worker Thread (see the
+                # comment below) with no existing event loop of its own.
+                import asyncio
+                from app.core.workflows.engine import run_ingestion_workflow
+                asyncio.run(run_ingestion_workflow(doc_id, file_path, filename, file_type))
                 result["ok"] = True
             except Exception as e:
                 result["ok"] = False
@@ -244,25 +252,15 @@ def process_upload_task(doc_id: int, file_path: str, file_type: str, filename: s
         logger.info(f"Successfully processed and embedded document: {filename}")
         return True, None
     except Exception as e:
+        friendly = humanize_exception(e, context=f"processing '{filename}'")
         doc.status = "failed"
-        doc.error_message = str(e)
+        doc.error_message = friendly
         db.commit()
-        logger.error(f"Failed to process document {filename}: {e}")
-        return False, str(e)
+        logger.info(f"Failed to process document {filename} raw error: {e}")
+        logger.error(friendly)
+        return False, friendly
     finally:
         db.close()
-
-# Audio/video upload+transcription was removed — faster-whisper transcription
-# stays only for the composer's live mic button (app/core/transcription.py,
-# app/api/voice.py), which is unaffected by this. Rejected explicitly here
-# rather than left to fail downstream in extract_text(), so the user gets an
-# immediate, clear reason instead of a document stuck in "processing" until
-# ingestion gets to it.
-_REJECTED_AUDIO_VIDEO_EXTENSIONS = {
-    "mp3", "wav", "m4a", "ogg", "flac", "aac", "wma",
-    "mp4", "mov", "mkv", "webm", "avi",
-}
-
 
 # Audio/video upload+transcription was removed — faster-whisper transcription
 # stays only for the composer's live mic button (app/core/transcription.py,
@@ -390,8 +388,7 @@ async def upload_document(
     # style: attach a file, optionally add text, send when ready). The real
     # chat message (with this document referenced in its attachments) gets
     # created when that send happens, over the websocket — see
-    # app.api.websocket's message handler and app.core.agents.chat's
-    # _handle_idle(attachments=...).
+    # app.api.websocket's message handler.
 
     # Images never go through RAG ingestion at all by default — vision is
     # the only way their content is ever read. A vision-capable active
@@ -424,11 +421,12 @@ async def upload_document(
         )
     elif is_image and has_vision:
         doc.status = "ready"
-        # Flags this row as having NO searchable content at all — see
-        # ChatAgent._get_document_context (chat.py), which checks this at
-        # send time to catch the case where the active model has changed
-        # (or lost its vision pairing) since this upload, so the image's
-        # content isn't silently dropped with zero explanation.
+        # Flags this row as having NO searchable content at all. Not
+        # currently read back anywhere (see the column's own comment in
+        # db/models.py) — the workflow-based chat path just silently
+        # skips an image its node's model can't read, rather than
+        # surfacing an explicit note the way the old built-in chat
+        # pipeline used to.
         doc.ocr_skipped_for_vision = True
         db.commit()
         logger.info(f"Skipping OCR for image upload '{file.filename}' — vision model active, will be sent as real image input instead.")
@@ -440,8 +438,21 @@ async def upload_document(
         )
         db.commit()
         logger.info(f"Rejecting image upload '{file.filename}' — no vision model active and OCR fallback has been removed.")
+    elif _get_active_ingestion_workflow_id(conversation_id) is None:
+        # Document ingestion is workflow-only — there's no built-in
+        # fallback pipeline anymore (see process_upload_task's _run()).
+        # Rejected synchronously, before any background task is even
+        # queued, mirroring how app.api.websocket already refuses to
+        # generate a reply when no chat-handler workflow is connected.
+        doc.status = "failed"
+        doc.error_message = (
+            "No workflow is connected to handle document ingestion. Open "
+            "Workflows and connect one as the ingestion handler."
+        )
+        db.commit()
+        logger.info(f"Rejecting document upload '{file.filename}' — no ingestion workflow connected.")
     else:
-        logger.info(f"Received document upload: {file.filename} -> starting background RAG ingestion.")
+        logger.info(f"Received document upload: {file.filename} -> starting background ingestion workflow.")
         # Process asynchronously via BackgroundTasks to immediately return HTTP 200
         background_tasks.add_task(
             async_process_upload_task,

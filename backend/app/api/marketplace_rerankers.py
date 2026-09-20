@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 from app.core.connection_manager import manager
 from app.core.rerankers import CATALOG, get_catalog_entry
 from app.core.hf_search import search_models
+from app.core.friendly_errors import humanize_exception
 from app.db.database import SessionLocal, get_db
 from app.db.models import RerankerModelRegistry
 
@@ -34,6 +35,28 @@ _data_dir = os.environ.get("AEGIS_DATA_DIR")
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 RERANKERS_DIR = Path(_data_dir) / "reranker_models" if _data_dir else BASE_DIR / "reranker_models"
 RERANKERS_DIR.mkdir(parents=True, exist_ok=True)
+
+# app.core.rag.processor.get_reranker's hardcoded model — see
+# app.core.bundled_defaults' module docstring for why this needs its own
+# synthetic "installed" entry rather than a real RerankerModelRegistry row.
+AEGIS_BUNDLED_DEFAULT_ID = "BAAI/bge-reranker-base"
+
+
+def _bundled_default_entry() -> Optional[Dict[str, Any]]:
+    from app.core.bundled_defaults import cached_repo_info
+    info = cached_repo_info(AEGIS_BUNDLED_DEFAULT_ID)
+    if not info:
+        return None
+    return {
+        "id": "bundled-default",
+        "model_id": AEGIS_BUNDLED_DEFAULT_ID,
+        "display_name": f"{AEGIS_BUNDLED_DEFAULT_ID} — Aegis's own default",
+        "size_gb": round(info["size_on_disk"] / 1024 ** 3, 2),
+        "status": "downloaded",
+        "error_message": None,
+        "created_at": None,
+        "bundled": True,
+    }
 
 
 class DownloadRerankerRequest(BaseModel):
@@ -71,7 +94,23 @@ def search_hf_rerankers(q: str, limit: int = 20):
 @router.get("")
 def list_installed(db: Session = Depends(get_db)):
     rows = db.query(RerankerModelRegistry).order_by(RerankerModelRegistry.created_at.desc()).all()
-    return {"models": [_serialize(r) for r in rows]}
+    models = [_serialize(r) for r in rows]
+    bundled = _bundled_default_entry()
+    if bundled:
+        models.insert(0, bundled)
+    return {"models": models}
+
+
+@router.delete("/bundled-default")
+def delete_bundled_default():
+    """Deletes Aegis's own bundled default reranker's real Hugging Face
+    cache — see app.core.bundled_defaults' module docstring. Safe:
+    get_reranker() transparently re-downloads it the next time it's
+    actually needed, same as a fresh install's first use."""
+    from app.core.bundled_defaults import delete_cached_repo
+    if not delete_cached_repo(AEGIS_BUNDLED_DEFAULT_ID):
+        raise HTTPException(status_code=404, detail="Bundled default reranker isn't currently cached.")
+    return {"message": "Deleted Aegis's bundled default reranker."}
 
 
 @router.delete("/{model_row_id}")
@@ -146,19 +185,31 @@ async def _download_task(row_id: int, model_id: str, cache_dir: str) -> None:
         await manager.broadcast_json({"type": "reranker_download_complete", "model_row_id": row_id})
 
     except Exception as e:
-        logger.error(f"Reranker download {row_id} ({model_id}) failed: {e}")
+        friendly = humanize_exception(e, context=f"downloading '{model_id}'")
+        logger.info(f"Reranker download {row_id} ({model_id}) raw error: {e}")
+        logger.error(friendly)
         with SessionLocal() as db:
             row = db.query(RerankerModelRegistry).filter(RerankerModelRegistry.id == row_id).first()
             if row:
                 row.status = "failed"
-                row.error_message = str(e)
+                row.error_message = friendly
                 db.commit()
         _progress_by_row.pop(row_id, None)
-        await manager.broadcast_json({"type": "reranker_download_failed", "model_row_id": row_id, "message": str(e)})
+        await manager.broadcast_json({"type": "reranker_download_failed", "model_row_id": row_id, "message": friendly})
 
 
 @router.post("/download")
 def download_model(req: DownloadRerankerRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    # Every reranker (curated or custom) loads through sentence_transformers.
+    # CrossEncoder — check BEFORE starting a background task that would
+    # only fail later, so this is instant and shows up as a real popup, not
+    # a silent background-task failure the user has to go dig for.
+    from app.core.optional_deps import require_available, MissingDependencyError
+    try:
+        require_available("sentence-transformers", "The reranker")
+    except MissingDependencyError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     entry = get_catalog_entry(req.model_id)
     # Not in the curated list — treat it as a custom Hugging Face repo id.
     # get_cross_encoder (app.core.rerankers) already loads any model_id via

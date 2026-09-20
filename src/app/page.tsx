@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useCallback, useEffect, useRef } from 'react';
+import toast from 'react-hot-toast';
 import Sidebar, { TabType, AccountStatus } from '@/components/Sidebar';
 import ChatView from '@/components/ChatView';
 import ContextMemoryHub from '@/components/ContextMemoryHub';
@@ -12,6 +13,7 @@ import AuthScreen from '@/components/AuthScreen';
 import WelcomeScreen from '@/components/WelcomeScreen';
 import AnalyticsView from '@/components/AnalyticsView';
 import MarketplaceView from '@/components/MarketplaceView';
+import DependenciesPanel from '@/components/DependenciesPanel';
 import { useSocket } from '@/hooks/useSocket';
 import { useAppSelector } from '@/hooks/useStore';
 import { selectSessionId } from '@/store/sessionSlice';
@@ -139,7 +141,9 @@ export default function Home() {
       const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/chat/sessions`);
       const data = await res.json();
       setSessions(Array.isArray(data) ? data : []);
-    } catch {}
+    } catch {
+      toast.error('Could not load chat sessions.');
+    }
   }, []);
 
   // Refresh sessions list on mount and whenever a message is sent
@@ -158,9 +162,11 @@ export default function Home() {
     setActiveTab('chat');
   }, [switchSession]);
 
+  // Confirmation is Sidebar's own "click again to delete" arm (see its
+  // armedDeleteId) — not a native confirm(), which blocks the whole
+  // Electron renderer until dismissed (confirmed the hard way building the
+  // workflow-delete feature; see Sidebar.tsx's eraseArmed comment).
   const handleDeleteSession = useCallback(async (sessionId: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (!confirm('Delete this chat? This cannot be undone.')) return;
     try {
       const res = await fetch(
         `${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/chat/sessions/${encodeURIComponent(sessionId)}`,
@@ -173,11 +179,40 @@ export default function Home() {
           switchSession();
           setActiveTab('chat');
         }
+      } else {
+        toast.error('Failed to delete chat.');
       }
     } catch (err) {
-      console.error('Failed to delete session:', err);
+      toast.error('Network error while deleting chat.');
     }
   }, [currentSessionId, switchSession]);
+
+  // A blank title clears the custom title back to the auto-derived preview
+  // (see backend's set_conversation_title) — optimistic update here so the
+  // sidebar reflects the new name instantly instead of waiting on a refetch,
+  // reverted via fetchSessions() if the request actually failed.
+  const handleRenameSession = useCallback(async (sessionId: string, title: string) => {
+    setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, preview: title || s.preview, is_custom_title: !!title } : s));
+    try {
+      const res = await fetch(
+        `${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/chat/sessions/${encodeURIComponent(sessionId)}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title }),
+        }
+      );
+      if (!res.ok) {
+        toast.error('Failed to rename chat.');
+        fetchSessions();
+      } else {
+        fetchSessions();
+      }
+    } catch (err) {
+      toast.error('Network error while renaming chat.');
+      fetchSessions();
+    }
+  }, [fetchSessions]);
 
   const recentChats = sessions.map(s => ({
     id: s.id,
@@ -230,6 +265,7 @@ export default function Home() {
         recentChats={recentChats}
         onSelectSession={handleSelectSession}
         onDeleteSession={handleDeleteSession}
+        onRenameSession={handleRenameSession}
         activeSessionId={currentSessionId ?? undefined}
         account={account}
         onLogout={handleLogout}
@@ -258,7 +294,6 @@ export default function Home() {
             onSendMessage={sendMessage}
             onCancelGeneration={cancelGeneration}
             onClearMessages={clearMessages}
-            onOpenLLMPanel={() => setActiveTab('llms')}
             onOpenContextPanel={() => setActiveTab('context')}
             onOpenMarketplace={() => setActiveTab('marketplace')}
           />
@@ -279,7 +314,10 @@ export default function Home() {
           <AnalyticsView />
         )}
         {activeTab === 'marketplace' && (
-          <MarketplaceView onOpenConnectors={() => setActiveTab('mcp_servers')} />
+          <MarketplaceView />
+        )}
+        {activeTab === 'dependencies' && (
+          <DependenciesPanel />
         )}
       </div>
     </div>

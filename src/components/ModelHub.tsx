@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import toast from 'react-hot-toast';
 import {
   Download,
   CheckCircle2,
@@ -9,7 +10,6 @@ import {
   Cpu,
   Search,
   X,
-  Sparkles,
 } from 'lucide-react';
 import { useSocket } from '../hooks/useSocket';
 
@@ -280,16 +280,6 @@ const formatDownloads = (n: number) => {
   return String(n);
 };
 
-// A quant needs roughly 1.3x its file size in RAM once you account for the
-// KV cache and runtime overhead — this mirrors the headroom baked into each
-// model_catalog.py tier's min_ram_gb, just applied per-file instead of per
-// curated entry. Leaving ~2.5GB for the OS + Electron avoids recommending
-// something that technically "fits" but leaves no room to actually run it.
-function fitsComfortably(fileSizeBytes: number, ramTotalGb: number): boolean {
-  const fileGb = fileSizeBytes / (1024 ** 3);
-  return fileGb * 1.3 <= ramTotalGb - 2.5;
-}
-
 // ── Quantization info ─────────────────────────────────────────────────────────
 // GGUF filenames encode the quantization scheme (Q4_K_M, Q8_0, etc.) but say
 // nothing about what that actually trades off — this is the same reference
@@ -345,7 +335,6 @@ function FileRow({
   localModels,
   progressData,
   onDownload,
-  recommended,
   mmprojFilename,
 }: {
   file: GGUFFile;
@@ -353,7 +342,6 @@ function FileRow({
   localModels: Record<string, LocalModel>;
   progressData: Record<string, { progress: number; downloaded_bytes: number; total_bytes: number }>;
   onDownload: (repoId: string, filename: string, mmprojFilename?: string) => void;
-  recommended?: boolean;
   // Present only when this repo bundles a vision model — the paired mmproj
   // (vision tower) file gets downloaded automatically alongside whichever
   // quant the user picks here (see ModelHub's startDownload).
@@ -370,16 +358,11 @@ function FileRow({
   const quantInfo = getQuantInfo(file.filename);
 
   return (
-    <div className={`py-2.5 px-3 bg-aegis-overlay rounded-xl border transition-colors ${recommended ? 'border-aegis-primary/50' : 'border-aegis-border hover:border-aegis-primary/30'}`}>
+    <div className="py-2.5 px-3 bg-aegis-overlay rounded-xl border border-aegis-border hover:border-aegis-primary/30 transition-colors">
       <div className="flex items-center justify-between">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2 flex-wrap">
             <p className="text-xs font-semibold text-aegis-text-primary truncate">{file.filename}</p>
-            {recommended && (
-              <span className="flex items-center gap-1 text-[10px] font-semibold text-aegis-primary-light bg-aegis-primary/10 border border-aegis-primary/30 px-1.5 py-0.5 rounded-full flex-shrink-0">
-                <Sparkles className="w-2.5 h-2.5" /> Recommended for your RAM
-              </span>
-            )}
           </div>
           <p className="text-[11px] text-aegis-text-muted mt-0.5">
             {formatBytes(file.size)}
@@ -449,14 +432,13 @@ function FileRow({
 
 // ── Model Detail Modal ───────────────────────────────────────────────────────
 // The per-model "nice description" panel — model identity, a short blurb
-// (category blurb + parsed param size), and the full quant list with a
-// RAM-aware "Recommended" badge, closer to how LM Studio presents a model's
-// available quantizations rather than the old bare filename/size list.
+// (category blurb + parsed param size), and the full quant list, closer to
+// how LM Studio presents a model's available quantizations rather than the
+// old bare filename/size list.
 
 function ModelDetailModal({
   model,
   category,
-  ramTotalGb,
   localModels,
   progressData,
   onDownload,
@@ -464,7 +446,6 @@ function ModelDetailModal({
 }: {
   model: ModelResult;
   category: ModelCategory;
-  ramTotalGb: number | null;
   localModels: Record<string, LocalModel>;
   progressData: Record<string, { progress: number; downloaded_bytes: number; total_bytes: number }>;
   onDownload: (repoId: string, filename: string, mmprojFilename?: string) => void;
@@ -504,16 +485,6 @@ function ModelDetailModal({
       ? mmprojFiles.reduce((best, f) => (f.size > best.size ? f : best), mmprojFiles[0])
       : null
   ), [mmprojFiles]);
-
-  // Recommend the largest (best-quality) quant that still comfortably fits
-  // this machine's RAM — same "biggest that fits" logic as model_catalog.py's
-  // recommend_model, just evaluated per real file size instead of a fixed tier.
-  const recommendedFilename = useMemo(() => {
-    if (!ramTotalGb || visibleFiles.length === 0) return null;
-    const fitting = visibleFiles.filter(f => fitsComfortably(f.size, ramTotalGb));
-    if (fitting.length === 0) return null;
-    return fitting.reduce((best, f) => (f.size > best.size ? f : best), fitting[0]).filename;
-  }, [visibleFiles, ramTotalGb]);
 
   const paramSize = parseParamSize(model.id);
 
@@ -603,7 +574,6 @@ function ModelDetailModal({
                     localModels={localModels}
                     progressData={progressData}
                     onDownload={onDownload}
-                    recommended={f.filename === recommendedFilename}
                     mmprojFilename={bestMmproj?.filename}
                   />
                 ))}
@@ -694,9 +664,7 @@ export default function ModelHub() {
   const { addMessageHandler } = useSocket();
   const [localModels, setLocalModels] = useState<Record<string, LocalModel>>({});
   const [progressData, setProgressData] = useState<Record<string, { progress: number; downloaded_bytes: number; total_bytes: number }>>({});
-  const [ramTotalGb, setRamTotalGb] = useState<number | null>(null);
 
-  const [activeCategory, setActiveCategory] = useState<string>('all');
   const [categoryModels, setCategoryModels] = useState<Record<string, ModelResult[]>>({});
   const [categoryLoading, setCategoryLoading] = useState<Record<string, boolean>>({});
   const [categoryError, setCategoryError] = useState<Record<string, string | null>>({});
@@ -725,13 +693,6 @@ export default function ModelHub() {
   }, []);
 
   useEffect(() => { fetchLocalModels(); }, [fetchLocalModels]);
-
-  useEffect(() => {
-    fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hardware/status`)
-      .then(r => r.json())
-      .then(data => setRamTotalGb(data.ram_total_gb || null))
-      .catch(() => {});
-  }, []);
 
   // WebSocket progress
   useEffect(() => {
@@ -773,11 +734,20 @@ export default function ModelHub() {
 
   const startDownload = async (repoId: string, filename: string, mmprojFilename?: string) => {
     try {
-      await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hub/download`, {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/api/hub/download`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ repo_id: repoId, filename, mmproj_filename: mmprojFilename }),
       });
+      // Only show "downloading" once the backend actually accepted the
+      // request — a non-ok response (e.g. disk full, invalid repo) used to
+      // still flip this to "downloading" unconditionally, leaving it stuck
+      // there forever with no error and no way to retry short of a restart.
+      if (!res.ok) {
+        const detail = await res.json().catch(() => null);
+        toast.error(detail?.detail || `Could not start the download for ${filename}.`);
+        return;
+      }
       setLocalModels(prev => ({
         ...prev,
         [`${repoId}/${filename}`]: {
@@ -787,7 +757,9 @@ export default function ModelHub() {
           mmproj_status: mmprojFilename ? 'downloading' : undefined,
         },
       }));
-    } catch {}
+    } catch {
+      toast.error(`Could not reach the backend to start downloading ${filename}.`);
+    }
   };
 
   // Fetch a category's model list on first selection (or on first render for
@@ -813,14 +785,13 @@ export default function ModelHub() {
       .finally(() => setCategoryLoading(prev => ({ ...prev, [categoryKey]: false })));
   }, [categoryModels, categoryLoading]);
 
+  // No more per-category filter chips (removed — browsing is just this
+  // flattened "every category, all at once" list now, same as the old
+  // "All categories" chip's own behavior) — fetched once on mount.
   useEffect(() => {
-    if (activeCategory === 'all') {
-      CATEGORIES.forEach(c => loadCategory(c.key));
-    } else {
-      loadCategory(activeCategory);
-    }
+    CATEGORIES.forEach(c => loadCategory(c.key));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeCategory]);
+  }, []);
 
   // Debounced free-text search — takes over the grid whenever non-empty,
   // querying HF directly instead of the fixed per-category queries.
@@ -849,17 +820,11 @@ export default function ModelHub() {
 
   const displayedModels: ModelResult[] = isSearching
     ? searchResults
-    : activeCategory === 'all'
-      ? CATEGORIES.flatMap(c => categoryModels[c.key] || [])
-      : (categoryModels[activeCategory] || []);
+    : CATEGORIES.flatMap(c => categoryModels[c.key] || []);
 
-  const loadingGrid = isSearching
-    ? searching
-    : activeCategory === 'all'
-      ? CATEGORIES.some(c => categoryLoading[c.key])
-      : !!categoryLoading[activeCategory];
+  const loadingGrid = isSearching ? searching : CATEGORIES.some(c => categoryLoading[c.key]);
 
-  const gridError = isSearching ? searchError : (activeCategory !== 'all' ? categoryError[activeCategory] : null);
+  const gridError = isSearching ? searchError : null;
 
   return (
     <div className="flex-1 overflow-y-auto bg-aegis-base">
@@ -884,27 +849,6 @@ export default function ModelHub() {
           />
         </div>
       </div>
-
-      {/* Category filter chips */}
-      {!isSearching && (
-        <div className="px-8 pb-5 flex items-center gap-2 flex-wrap">
-          <button
-            onClick={() => setActiveCategory('all')}
-            className={`px-4 py-2 rounded-full text-sm font-semibold transition-colors ${activeCategory === 'all' ? 'bg-aegis-primary text-white' : 'bg-aegis-raised border border-aegis-border text-aegis-text-secondary hover:text-aegis-text-primary'}`}
-          >
-            All categories
-          </button>
-          {CATEGORIES.map(c => (
-            <button
-              key={c.key}
-              onClick={() => setActiveCategory(c.key)}
-              className={`px-4 py-2 rounded-full text-sm font-semibold transition-colors ${activeCategory === c.key ? 'bg-aegis-primary text-white' : 'bg-aegis-raised border border-aegis-border text-aegis-text-secondary hover:text-aegis-text-primary'}`}
-            >
-              {c.label}
-            </button>
-          ))}
-        </div>
-      )}
 
       {/* Grid */}
       <div className="px-8 pb-8">
@@ -941,7 +885,6 @@ export default function ModelHub() {
         <ModelDetailModal
           model={selectedModel.model}
           category={selectedModel.category}
-          ramTotalGb={ramTotalGb}
           localModels={localModels}
           progressData={progressData}
           onDownload={startDownload}

@@ -1,78 +1,26 @@
 """
 Aegis — Default Pipeline seed
 
-Inserts ONE starter workflow so a user has a real, fully-editable example of
-Aegis's own default Chat Mode behavior sitting right in the Workflows
-canvas — built from the exact same node kinds as anything they'd build
-themselves (see app.core.workflows.engine's module docstring), not a
-separate settings screen. Everything happens in a single tree starting at
-"On chat message" and ending at the reply — document ingestion for a
-chat-attached file is a real branch of THAT SAME tree (a loop over
-this-turn's not-yet-indexed attachments, feeding a visible Extract -> Chunk
--> Embedding -> Vector chain), not a separate parallel pipeline, because
-every document upload in this app is already scoped to one specific
-conversation (app.api.documents's /upload requires conversation_id) — an
-upload was never really a separate, chat-independent event to begin with.
+Inserts ONE starter workflow, connected as the global chat handler, so a
+fresh install can actually chat immediately — built from the exact same
+node kinds as anything a user would build themselves (see
+app.core.workflows.engine's module docstring), not a separate settings
+screen.
 
-Built entirely from the minimal, n8n-style node set (see
-app.core.workflows.engine's module docstring): a "decide"/"classify" step
-is just a plain "llm" node configured with a structured-output schema —
-not a dedicated node kind — and whether to even bother searching or
-classifying is a visible "logic" gate, not invisible Python control flow.
-
-Shape of the one tree, read top to bottom:
-  chat_trigger
-    -> loop (itemsField "pending_attachments") -> extract -> chunk
-       -> embedding -> vector (upsert, bundled aegis_hybrid store)
-       -> [ordering-only edge into "decide" below — see
-          _trace_loop_body_chain/_run_loop_node in engine.py for why a
-          join node needs a SECOND inbound edge, from something besides
-          the previous chain step, to stop being treated as part of the
-          loop's own body: "decide" is also fed directly by chat_trigger]
-    -> llm "Decide: Need Document Search?" (outputFields: needs_search,
-       whole_document, query — DEFAULT_DECIDE_SEARCH_PROMPT's exact shape)
-         -> logic "Needs search?" (needs_search is_true)
-              -> embedding "Embed Query" -> vector "Search documents"
-                 (search, same bundled store, topK 20 candidates — its own
-                 real dense+sparse re-embed wins there, but a Marketplace-
-                 installed store genuinely uses Embed Query's vector as-is)
-                   -> reranker "Rerank documents" (bundled cross-encoder,
-                      topK 5 — a separate node, not a checkbox on "vector",
-                      so search-wide-then-rerank-down is visible as two
-                      real steps)
-    -> logic "Looks export/multi-part?" (message matches_regex — an
-       approximation of _classify_export_and_compound's real regex
-       pre-gate, close enough to keep skipping the classify call on a
-       plain message)
-         -> llm "Classify Export & Multi-part" (outputFields: is_export,
-            format, parts — DEFAULT_TURN_CLASSIFIER_PROMPT's exact shape)
-    -> llm "Reply" (model config lives ONLY on "llm" nodes — this is the
-       one wired directly into "chat_reply" below, with nothing else
-       wired after it, so engine.py's run_chat_workflow treats it as the
-       real generator; every other "llm" node above is a plain,
-       non-streaming judgment call, unaffected)
-         -> chat_reply "Send Reply" (a thin "send" marker, no config of
-            its own — see _run_chat_generation_node/run_chat_workflow)
-    -> export_document "Export Reply" (only turns the reply into a file
-       if requested; an explicit chat_ctx export_format from the
-       composer's Export menu always wins over the classifier's guess —
-       see _run_export_document_node)
-
-"Memory & Entities" is deliberately NOT wired into this seed — plenty of
-turns confirm no entities at all, so it was often a visibly empty node in
-a fresh install; the "memory_context" kind stays fully supported (and in
-the node palette) for anyone who wants to add it back by hand.
-
-Ingestion into the bundled aegis_hybrid store is real, not a placeholder:
-_run_vector_node's upsert branch re-embeds the upstream chunk text with
-the exact dense+sparse indexing app.core.rag.processor.hybrid_embed_and_
-upsert uses (a generic Embedding node's dense-only output can't reproduce
-that hybrid shape, so — like "search" mode already does — it's ignored in
-favor of the real thing), and _run_loop_node marks the attachment's
-UserDocument "ready" once its chain finishes, so a later turn in the same
-conversation won't redo the work. A DIFFERENT, Marketplace-installed
-store's generic dense-only upsert still works exactly as before if a user
-swaps the Vector node's store.
+Deliberately minimal: chat_trigger -> llm "Reply" -> chat_reply "Send
+Reply", nothing else — one LLM node, one reply, exactly what a fresh
+install actually needs to hold a conversation. No auto document search,
+no auto export/multi-part classification, no attachment-ingestion loop,
+no export_document node either — all real, working branches in earlier
+versions of this seed (see git history if you need any of these shapes
+back), but every one of them made a fresh install's actual default
+behavior more than "just chat", which isn't what this seed is for. A user
+who wants document search, auto-classification, attachment ingestion, or
+the chat composer's Export-menu wired up now builds that themselves on
+the Workflows canvas, from the same node palette (embedding, vector,
+reranker, extract, chunk, loop, logic, export_document) this seed used to
+wire up automatically — none of those node kinds went away, only the
+seed's opinion that everyone wants them wired by default did.
 
 Bump SEED_VERSION whenever the tree's shape changes. On startup, the
 existing row for this seed (found by seed_key — see below) with an older
@@ -117,14 +65,20 @@ logger = logging.getLogger(__name__)
 
 SEED_WORKFLOW_NAME = "Aegis Default Pipeline"
 SEED_WORKFLOW_KEY = "default_pipeline"
-# Bumped 10 -> 11: the "rerank" node (kind "reranker", between
-# vector_search and reply_llm) was added to the template below without a
-# matching version bump at the time — every install that seeded at
-# version 10 kept running vector_search's raw hybrid-fused order straight
-# into reply_llm, never actually reranked, despite the template already
-# describing a reranker. This bump is what makes the self-healing
-# overwrite below actually fire for those installs.
-SEED_VERSION = 11
+# Bumped 11 -> 13 -> 15 (12 and 14 both got applied, mid-edit, to a dev
+# install with the OLD graph still in the file at that exact instant — a
+# hot-reload race between uvicorn's file-watcher and a multi-edit sequence
+# to this file, not a real intermediate shape either time; both times the
+# fix was one more version bump once the file was stable again. 13 first
+# replaced the old five-branch RAG+classify+ingestion tree with
+# chat_trigger -> llm -> chat_reply -> export_document; 15 drops
+# export_document too — two nodes, not four, see this module's docstring).
+# Every existing install's seeded workflow gets overwritten with the new
+# minimal shape on next startup (the normal self-healing overwrite this
+# version-bump mechanism always does); a user who wants any of the old
+# auto behavior (or the Export-menu node) back now builds it themselves on
+# the Workflows canvas.
+SEED_VERSION = 15
 
 # Pre-merge identity — only used for the one-time migration described in
 # this module's docstring, folding these two into the single row above.
@@ -279,120 +233,24 @@ def seed_default_pipeline(db: Session) -> None:
         return
 
     from app.prompts.chat import build_chat_prompt
-    from app.core.agents.chat import DEFAULT_DECIDE_SEARCH_PROMPT, DEFAULT_TURN_CLASSIFIER_PROMPT
-    from app.db.models import InstalledDatabase
-
-    builtin_store = db.query(InstalledDatabase).filter(InstalledDatabase.engine_id == BUILTIN_VECTOR_ENGINE_ID).first()
 
     def _node(node_id: str, x: int, y: int, data: dict) -> dict:
         return {"id": node_id, "type": "workflowNode", "position": {"x": x, "y": y}, "data": data}
 
-    builtin_id = builtin_store.id if builtin_store else None
-
-    # Approximates _classify_export_and_compound's real regex pre-gate
-    # (_EXPORT_HINT_RE OR (_COMPOUND_QUESTION_MARK_RE AND
-    # _COMPOUND_CONNECTOR_RE)) as one pattern for one "logic" node —
-    # close enough to keep skipping the classify LLM call on a plain
-    # message, not an exact reproduction (see this module's docstring).
-    _CLASSIFY_GATE_PATTERN = (
-        r"\b(export|download|save|convert|pdf|docx?|xlsx|excel|word|spreadsheet|file)\b"
-        r"|(?=.*\?)(?=.*\b(and|also|as well as|additionally)\b)"
-    )
-
     nodes = [
         _node("trigger", 540, 40, {"label": "On chat message", "kind": "chat_trigger"}),
-
-        # Ingestion branch — a loop over this turn's not-yet-indexed
-        # attachments, feeding a real, visible Extract -> Chunk ->
-        # Embedding -> Vector chain (see this module's docstring).
-        _node("ingest_loop", 80, 160, {"label": "For each new attachment", "kind": "loop", "itemsField": "pending_attachments"}),
-        _node("extract", 80, 280, {
-            "label": "Extract text", "kind": "extract", "isAi": False,
-            "filePath": "", "staticInputs": {},
-        }),
-        _node("chunk", 80, 400, {
-            "label": "Chunk text", "kind": "chunk", "isAi": False,
-            "chunkSize": 300, "overlap": 50,
-        }),
-        _node("embedding", 80, 520, {"label": "Embedding", "kind": "embedding", "isAi": False}),
-        _node("vector_ingest", 80, 640, {
-            "label": "Store in document index", "kind": "vector", "isAi": False,
-            "operation": "upsert", "databaseId": builtin_id,
-        }),
-
-        # Retrieval branch — a plain "llm" node does the judgment call
-        # (structured output, not a dedicated node kind), a "logic" node
-        # makes the resulting gate visible, then Embed Query -> Search
-        # mirrors the ingestion branch's own shape.
-        _node("decide", 540, 160, {
-            "label": "Decide: Need Document Search?", "kind": "llm", "isAi": False,
-            "modelName": "", "instruction": DEFAULT_DECIDE_SEARCH_PROMPT,
-            "outputFields": [
-                {"name": "needs_search", "type": "boolean", "description": "true only if the document's content is needed to answer"},
-                {"name": "whole_document", "type": "boolean", "description": "true if asking about the document broadly rather than one specific fact"},
-                {"name": "query", "type": "string", "description": "a short focused search phrase, if needs_search and not whole_document"},
-            ],
-        }),
-        _node("search_gate", 540, 280, {"label": "Needs search?", "kind": "logic", "field": "needs_search", "operator": "is_true"}),
-        _node("embedding_query", 540, 400, {"label": "Embed Query", "kind": "embedding", "isAi": False}),
-        _node("vector_search", 540, 520, {
-            "label": "Search documents", "kind": "vector", "isAi": False,
-            "operation": "search", "topK": 20,
-            "databaseId": builtin_id,
-        }),
-        _node("rerank", 540, 640, {
-            "label": "Rerank documents", "kind": "reranker", "isAi": False,
-            "topK": 5,
-        }),
-
-        _node("classify_gate", 940, 160, {"label": "Looks export/multi-part?", "kind": "logic", "field": "message", "operator": "matches_regex", "value": _CLASSIFY_GATE_PATTERN}),
-        _node("classifier", 940, 280, {
-            "label": "Classify Export & Multi-part", "kind": "llm", "isAi": False,
-            "modelName": "", "instruction": DEFAULT_TURN_CLASSIFIER_PROMPT,
-            "outputFields": [
-                {"name": "is_export", "type": "boolean", "description": "true only if the user wants a FILE created from this conversation"},
-                {"name": "format", "type": "string", "description": "pdf, docx, or xlsx, if is_export"},
-                {"name": "parts", "type": "array", "description": "distinct questions/requests, only if 2+ genuinely separate asks"},
-            ],
-        }),
-
-        _node("reply_llm", 540, 780, {
+        _node("reply_llm", 540, 160, {
+            # reply_llm's ONLY downstream edge (into "reply" below) is what
+            # marks it as the real generator — see run_chat_workflow's
+            # generation_ids detection.
             "label": "Reply", "kind": "llm", "isAi": False,
             "modelName": "", "instruction": build_chat_prompt(),
         }),
-        _node("reply", 540, 900, {"label": "Send Reply", "kind": "chat_reply"}),
-        _node("export", 540, 1020, {"label": "Export Reply", "kind": "export_document"}),
+        _node("reply", 540, 280, {"label": "Send Reply", "kind": "chat_reply"}),
     ]
     edges = [
-        {"id": "trigger-ingest_loop", "source": "trigger", "target": "ingest_loop", "data": {}},
-        {"id": "ingest_loop-extract", "source": "ingest_loop", "target": "extract", "data": {"outputField": "file_path", "inputField": "filePath"}},
-        {"id": "extract-chunk", "source": "extract", "target": "chunk", "data": {}},
-        {"id": "chunk-embedding", "source": "chunk", "target": "embedding", "data": {}},
-        {"id": "embedding-vector_ingest", "source": "embedding", "target": "vector_ingest", "data": {}},
-        # Purely structural: forces "decide" to only run once this turn's
-        # ingestion loop has fully finished (see this module's docstring
-        # and _trace_loop_body_chain) — decide itself reads no upstream
-        # data, so trigger-decide alone would otherwise make this edge's
-        # source ambiguous between "loop body" and "join point".
-        {"id": "vector_ingest-decide", "source": "vector_ingest", "target": "decide", "data": {}},
-        {"id": "trigger-decide", "source": "trigger", "target": "decide", "data": {}},
-
-        {"id": "decide-search_gate", "source": "decide", "target": "search_gate", "data": {}},
-        {"id": "search_gate-embedding_query", "source": "search_gate", "target": "embedding_query", "data": {}},
-        {"id": "embedding_query-vector_search", "source": "embedding_query", "target": "vector_search", "data": {}},
-        {"id": "vector_search-rerank", "source": "vector_search", "target": "rerank", "data": {}},
-
-        {"id": "trigger-classify_gate", "source": "trigger", "target": "classify_gate", "data": {}},
-        {"id": "classify_gate-classifier", "source": "classify_gate", "target": "classifier", "data": {}},
-
-        {"id": "rerank-reply_llm", "source": "rerank", "target": "reply_llm", "data": {}},
-        {"id": "classifier-reply_llm", "source": "classifier", "target": "reply_llm", "data": {}},
-        # reply_llm's ONLY downstream edge — this is what marks it (not
-        # any other "llm" node above) as the real generator; see
-        # run_chat_workflow's generation_ids detection.
+        {"id": "trigger-reply_llm", "source": "trigger", "target": "reply_llm", "data": {}},
         {"id": "reply_llm-reply", "source": "reply_llm", "target": "reply", "data": {}},
-        {"id": "reply-export", "source": "reply", "target": "export", "data": {}},
-        {"id": "classifier-export", "source": "classifier", "target": "export", "data": {}},
     ]
 
     graph_json = json.dumps({"nodes": nodes, "edges": edges})
@@ -408,6 +266,20 @@ def seed_default_pipeline(db: Session) -> None:
         db.commit()
         logger.info(f"Updated '{SEED_WORKFLOW_NAME}' from seed_version {old_version} to {SEED_VERSION}.")
     else:
-        db.add(Workflow(name=SEED_WORKFLOW_NAME, graph_json=graph_json, seed_version=SEED_VERSION, seed_key=SEED_WORKFLOW_KEY))
+        # A genuinely fresh install — connect it as the global chat handler
+        # immediately. This row's entire purpose is to BE Aegis's default
+        # Chat Mode behavior (see this module's docstring); leaving it
+        # unconnected meant every fresh install silently used the legacy
+        # built-in ChatAgent pipeline instead, and none of a user's edits
+        # to this "Default Pipeline" (its model picks, memory settings,
+        # search-decision prompt, etc.) ever actually affected real chat
+        # traffic until they noticed and hit "Connect to chat" themselves.
+        # Never touches an EXISTING row's connection state — see the
+        # `if existing:` branch above and this module's docstring on why
+        # that's preserved across a seed content update.
+        db.add(Workflow(
+            name=SEED_WORKFLOW_NAME, graph_json=graph_json, seed_version=SEED_VERSION, seed_key=SEED_WORKFLOW_KEY,
+            is_chat_handler=True,
+        ))
         db.commit()
-        logger.info(f"Seeded '{SEED_WORKFLOW_NAME}' workflow (version {SEED_VERSION}).")
+        logger.info(f"Seeded '{SEED_WORKFLOW_NAME}' workflow (version {SEED_VERSION}) and connected it as the chat handler.")

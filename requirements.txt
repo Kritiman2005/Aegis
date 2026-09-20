@@ -46,31 +46,39 @@ sqlalchemy>=2.0.0
 python-dotenv>=1.0.1
 
 # RAG & Document Processing
-pymupdf>=1.23.0
-python-pptx>=0.6.23
+# python-pptx intentionally not listed here — PPTX text-extraction (a
+# document upload, or a Workflow's Extract node) is install-on-demand from
+# the Marketplace's Document Extraction category, not bundled. See
+# app.core.rag.processor.extract_text and app.core.extraction_engines'
+# own docstrings. pymupdf/python-docx stay bundled regardless (below, with
+# the export packages) — PDF/DOCX extraction needs no install since
+# app.core.exporter already needs both anyway for PDF/DOCX export
+# (generating a file FROM a chat reply, the opposite direction).
 qdrant-client>=1.7.0
 fastembed>=0.2.0
-sentence-transformers>=2.3.00
+# sentence-transformers, torch, and torchvision are DELIBERATELY not
+# listed here — they're what sentence-transformers' own CrossEncoder
+# reranker (app.core.rag.processor.get_reranker, app.core.rerankers) and
+# EasyOCR need, and neither ships in the frozen app any more (see
+# backend/main.spec's excludes list and its own long note on why, plus
+# the earlier reverted attempt at exactly this same thing). A user who
+# wants a reranker, a sentence-transformers embedding backend, or EasyOCR
+# installs these themselves from the Dependencies panel — that panel's
+# generic "pip install anything" box already covers it, no new install
+# path needed. fastembed above stays: it's the default embedding engine
+# and is ONNX-based, no torch required.
 
-# Word/Excel read + write — python-docx and openpyxl back document upload's
-# .docx/.xlsx text extraction (app/core/rag/processor.py); python-docx,
-# xlsxwriter, and markdown-it-py back the export_document tool + manual
-# Export menu's PDF/DOCX/XLSX conversion (app/core/exporter.py). All four
-# were previously missing from this file (present only by accident in an
-# existing dev venv, or — python-docx — declared only in
-# backend/requirements.txt, which a plain `pip install -r requirements.txt`
-# from repo root never installs) — same class of gap faster-whisper had.
+# pymupdf, python-docx, xlsxwriter, and markdown-it-py back the
+# export_document tool + manual Export menu's PDF/DOCX/XLSX conversion
+# (app/core/exporter.py) — unrelated to the install-on-demand document
+# extraction above despite pymupdf/python-docx's names; this is the
+# write-out side, not the read-in side. openpyxl (the read-in side's XLSX
+# reader) is NOT listed here — it's install-on-demand too, same as
+# python-pptx above, since export never needs it.
+pymupdf>=1.23.0
 python-docx>=1.1.0
-openpyxl>=3.1.0
 xlsxwriter>=3.2.0
 markdown-it-py>=3.0.0
-
-# Web Scraping — Playwright drives a real headless Chromium so JS-rendered
-# pages actually render before extraction (a plain HTTP fetch can't). The
-# browser binary itself is NOT bundled (see app/core/scraper.py) — it
-# downloads on first use into AEGIS_DATA_DIR, same as GGUF models.
-playwright>=1.47,<2.0
-trafilatura>=1.12,<2.0
 
 # Refresh-token storage — wraps the OS credential store (macOS Keychain /
 # Windows Credential Manager / Linux Secret Service) so it isn't sitting in
@@ -87,3 +95,18 @@ pywin32-ctypes>=0.2.2; sys_platform == "win32"
 # leaves the machine. Model itself downloads on first explicit use into
 # AEGIS_DATA_DIR, same convention as GGUF models. See app/core/transcription.py.
 faster-whisper>=1.0,<2.0
+
+# Alternative OCR engine for a Workflow's Media tool node (Marketplace →
+# OCR, install-on-demand — see app/core/media_engines.py). Also NOT listed
+# here (needs torch/torchvision, see this file's own note in the RAG
+# section above) — installs via the Dependencies panel same as the rest of
+# that group. rapidocr-onnxruntime (backend/requirements.txt) is also now
+# install-on-demand, not bundled — see its own note there.
+
+# Not imported by any app code directly — PyInstaller's own bundled runtime
+# hook (pyi_rth_pkgres.py) fully exercises pkg_resources on every frozen-app
+# launch, and pkg_resources' own use of jaraco.text (normally an optional
+# soft dependency it catches gracefully when unfrozen) isn't optional once
+# that hook runs — a packaged build crashes on startup with "No module
+# named 'jaraco.text'" without it. See backend/main.spec's matching note.
+jaraco.text>=3.12

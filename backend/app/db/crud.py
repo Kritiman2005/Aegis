@@ -410,9 +410,11 @@ def add_chat_message(
     of 'tool_call' marks internal-only entries that should replay into the
     collapsed "Agent is working" card instead of a normal chat bubble.
     `rag_sources` is an optional list of {id, content, filename, document_id}
-    dicts — the document chunks actually used to answer THIS turn, if any,
-    so a later turn's weak/empty search can backfill from them (see
-    ChatAgent._backfill_sources_from_history)."""
+    dicts — the document chunks actually used to answer THIS turn, if any.
+    Currently unused by the live chat path (app.core.workflows.engine's
+    run_chat_workflow doesn't pass one), so rag_sources_json ends up null
+    in practice — kept as a real parameter in case a future workflow node
+    wants to populate it again."""
     msg = ChatMessage(
         conversation_id=conversation_id,
         role=role,
@@ -514,52 +516,94 @@ def search_messages(db: Session, query: str, conversation_id: Optional[str] = No
 
 
 def get_all_sessions(db: Session) -> List[dict]:
-    """Retrieves all distinct chat sessions, with the first user message as a preview."""
+    """Retrieves all distinct chat sessions, with a preview — a user-set
+    custom title (ConversationMeta, see set_conversation_title) if one
+    exists, otherwise the first user message, same as always."""
+    from app.db.models import ConversationMeta
+
     # Find the earliest message for each conversation
     subquery = db.query(
         ChatMessage.conversation_id,
         func.min(ChatMessage.created_at).label('first_message_time')
     ).group_by(ChatMessage.conversation_id).subquery()
-    
+
     # Get the first message content (preferring 'user' role)
     sessions = []
     conversations = db.query(subquery.c.conversation_id, subquery.c.first_message_time).order_by(subquery.c.first_message_time.desc()).all()
-    
+
+    custom_titles = {m.conversation_id: m.title for m in db.query(ConversationMeta).all()}
+
     for conv_id, start_time in conversations:
         # Get message count
         msg_count = db.query(ChatMessage).filter(ChatMessage.conversation_id == conv_id).count()
-        
-        # Get preview (first user message, or any first message)
-        first_msg = db.query(ChatMessage).filter(
-            ChatMessage.conversation_id == conv_id,
-            ChatMessage.role == 'user'
-        ).order_by(ChatMessage.created_at.asc()).first()
-        
-        if not first_msg:
+
+        custom_title = custom_titles.get(conv_id)
+        if custom_title:
+            preview = custom_title
+            is_custom_title = True
+        else:
+            # Get preview (first user message, or any first message)
             first_msg = db.query(ChatMessage).filter(
-                ChatMessage.conversation_id == conv_id
+                ChatMessage.conversation_id == conv_id,
+                ChatMessage.role == 'user'
             ).order_by(ChatMessage.created_at.asc()).first()
-            
-        preview = first_msg.content[:100] + "..." if first_msg and len(first_msg.content) > 100 else (first_msg.content if first_msg else "Empty session")
-        
+
+            if not first_msg:
+                first_msg = db.query(ChatMessage).filter(
+                    ChatMessage.conversation_id == conv_id
+                ).order_by(ChatMessage.created_at.asc()).first()
+
+            preview = first_msg.content[:100] + "..." if first_msg and len(first_msg.content) > 100 else (first_msg.content if first_msg else "Empty session")
+            is_custom_title = False
+
         sessions.append({
             "id": conv_id,
             "preview": preview,
+            "is_custom_title": is_custom_title,
             "message_count": msg_count,
             "created_at": start_time.isoformat() if start_time else None
         })
-        
+
     return sessions
 
 def delete_chat_session(db: Session, conversation_id: str) -> int:
-    """Deletes all messages for a given session. Returns the number of rows deleted."""
+    """Deletes all messages for a given session (and any custom title set
+    on it — see set_conversation_title, otherwise it'd be an orphaned row
+    a future session with the same freshly-generated id could never
+    legitimately reuse anyway, but there's no reason to keep it around).
+    Returns the number of message rows deleted."""
+    from app.db.models import ConversationMeta
+
     deleted = (
         db.query(ChatMessage)
         .filter(ChatMessage.conversation_id == conversation_id)
         .delete(synchronize_session=False)
     )
+    db.query(ConversationMeta).filter(ConversationMeta.conversation_id == conversation_id).delete(synchronize_session=False)
     db.commit()
     return deleted
+
+
+def set_conversation_title(db: Session, conversation_id: str, title: str) -> None:
+    """Sets (or clears, if title is blank) a conversation's custom display
+    title — the Sidebar's rename option. Upsert: a conversation may not
+    have a ConversationMeta row yet (nothing creates one until the first
+    rename)."""
+    from app.db.models import ConversationMeta
+
+    title = title.strip()
+    row = db.query(ConversationMeta).filter(ConversationMeta.conversation_id == conversation_id).first()
+    if not title:
+        if row:
+            db.delete(row)
+            db.commit()
+        return
+    if row:
+        row.title = title
+    else:
+        row = ConversationMeta(conversation_id=conversation_id, title=title)
+        db.add(row)
+    db.commit()
 
 
 # ─── Configuration & Telemetry ───────────────────────────────────────────────
@@ -848,6 +892,37 @@ def get_active_ingestion_workflow(db: Session, conversation_id: Optional[str] = 
         .filter(Workflow.is_ingestion_handler == True, Workflow.ingestion_handler_conversation_id.is_(None))  # noqa: E712
         .first()
     )
+
+
+def get_model_usage_by_workflows(db: Session) -> dict[str, List[str]]:
+    """
+    Maps model name -> the names of every workflow with an "llm" node
+    configured to call it (data.kind == "llm", data.modelName set) —
+    computed by reading every saved workflow's own graph_json rather than
+    tracked at run time, so it's always in sync with the current designs
+    with no separate state to keep updated. Used to show, next to a model
+    in Memory Hub, which workflow(s) actually use it — a workflow node can
+    call a different model than whichever one is explicitly "active"
+    (loaded via the LLM panel/Memory Hub's own Load button), and that
+    silent RAM usage was otherwise invisible there.
+    """
+    usage: dict[str, List[str]] = {}
+    for wf in db.query(Workflow).all():
+        try:
+            graph = json.loads(wf.graph_json)
+        except (TypeError, ValueError):
+            continue
+        for node in graph.get("nodes", []):
+            data = node.get("data") or {}
+            if data.get("kind") != "llm":
+                continue
+            model_name = data.get("modelName")
+            if not model_name:
+                continue
+            names = usage.setdefault(model_name, [])
+            if wf.name not in names:
+                names.append(wf.name)
+    return usage
 
 
 # ─── Token Usage / Analytics ─────────────────────────────────────────────────

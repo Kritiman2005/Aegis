@@ -51,10 +51,13 @@ from app.mcp.registry import mcp_registry, reconnect_from_saved_config
 from app.mcp.runtime_manager import ensure_runtime
 from app.mcp import registry_client as mcp_registry_client
 from app.mcp import github_installer
+from app.db.models import RemoteConnector
 from app.mcp.catalog import (
     get_catalog_list,
     get_catalog_for_audience,
     resolve_connector_command,
+    remote_entry_to_catalog_dict,
+    get_merged_catalog,
     CONNECTORS_CATALOG
 )
 
@@ -112,14 +115,40 @@ def _visible_catalog(items: List[dict]) -> List[dict]:
 
 
 @router.get("/catalog")
-def list_catalog(audience: Optional[str] = None):
+def list_catalog(audience: Optional[str] = None, db: Session = Depends(get_db)):
     """
-    Returns the connector gallery.
-    Optional ?audience=hr|marketing|sales|operations|developer|all to filter.
+    Returns the connector gallery — the 6 free built-ins plus the entire
+    public connector catalog (synced into the local RemoteConnector table;
+    see account_auth.py's _resync_catalog_in_background), each remote entry
+    marked `locked` unless the account's plan is "paid" (see
+    remote_entry_to_catalog_dict). There's no per-connector selection
+    anymore — paying unlocks the whole catalog at once.
+    Optional ?audience=hr|marketing|sales|operations|developer|all to filter
+    (built-in entries only — remote ones have no audience tagging yet).
+
+    Resyncs the catalog synchronously, right here, before reading
+    RemoteConnector — the frontend only calls this once per Connectors panel
+    open (MCPServersPanel.tsx's fetchCatalog, not on its 8s status-polling
+    interval), so this is "opens the panel → sees the latest catalog"
+    instead of waiting on /api/account/status's ~6h staleness window.
+    Best-effort, same as that background path: _resync_catalog_in_background
+    swallows offline/revoked-session failures internally and just leaves
+    the existing cache in place, so a flaky network degrades to "shows
+    last-known catalog," never a broken catalog load. Given its own fresh
+    SessionLocal() (it closes whatever session it's handed), not the
+    request's own `db`, which is still needed below.
     """
+    from app.api.account_auth import _account_row, _resync_catalog_in_background
+
+    account = _account_row(db)
+    if account:
+        _resync_catalog_in_background(SessionLocal(), account.id)
+    plan = account.cached_plan if account else "free"
+
+    remote_entries = [remote_entry_to_catalog_dict(rc, plan) for rc in db.query(RemoteConnector).all()]
     if audience:
-        return {"catalog": _visible_catalog(get_catalog_for_audience(audience))}
-    return {"catalog": _visible_catalog(get_catalog_list())}
+        return {"catalog": _visible_catalog(get_catalog_for_audience(audience) + remote_entries)}
+    return {"catalog": _visible_catalog(get_catalog_list() + remote_entries)}
 
 
 async def _connect_catalog_task(server_name: str, command: List[str], env: Optional[Dict[str, str]], input_params: Optional[Dict[str, str]]) -> None:
@@ -157,18 +186,36 @@ async def _connect_catalog_task(server_name: str, command: List[str], env: Optio
 
 
 @router.post("/catalog/connect")
-def connect_from_catalog(req: ConnectCatalogRequest, background_tasks: BackgroundTasks):
+def connect_from_catalog(req: ConnectCatalogRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """
-    Connect a pre-configured connector from the catalog. Resolves commands
-    and template parameters, then — same as the custom-server connect path
-    — auto-downloads whatever runtime the command needs (npx/uvx) in the
-    background and reports progress over the same WebSocket events, rather
-    than blocking the request on a cold download.
+    Connect a pre-configured connector from the catalog — built-in or from
+    the public catalog synced via RemoteConnector (see list_catalog above).
+    Resolves commands and template parameters, then — same as the
+    custom-server connect path — auto-downloads whatever runtime the
+    command needs (npx/uvx) in the background and reports progress over the
+    same WebSocket events, rather than blocking the request on a cold
+    download.
     """
-    if req.server_name not in CONNECTORS_CATALOG:
+    from app.api.account_auth import _account_row
+
+    account = _account_row(db)
+    plan = account.cached_plan if account else "free"
+    remote_entries = [remote_entry_to_catalog_dict(rc, plan) for rc in db.query(RemoteConnector).all()]
+    merged_catalog = get_merged_catalog(remote_entries)
+
+    if req.server_name not in merged_catalog:
         raise HTTPException(status_code=404, detail=f"Connector '{req.server_name}' not found in catalog.")
 
-    cat_item = CONNECTORS_CATALOG[req.server_name]
+    cat_item = merged_catalog[req.server_name]
+
+    # Defense in depth — MCPServersPanel.tsx already hides the Connect
+    # button for a locked entry, but the panel's UI state isn't a security
+    # boundary; this is the one that actually matters.
+    if cat_item.get("locked"):
+        raise HTTPException(
+            status_code=402,
+            detail=f"'{req.server_name}' is part of the paid catalog — unlock it at aegisaistudio.online/account/connectors."
+        )
 
     if cat_item.get("auth_type") == "oauth":
         raise HTTPException(
@@ -177,7 +224,7 @@ def connect_from_catalog(req: ConnectCatalogRequest, background_tasks: Backgroun
         )
 
     try:
-        command = resolve_connector_command(req.server_name, req.input_params or {})
+        command = resolve_connector_command(req.server_name, req.input_params or {}, catalog=merged_catalog)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -461,4 +508,53 @@ def disconnect_connector(server_name: str, db: Session = Depends(get_db)):
         return {"message": f"Successfully disconnected '{server_name}'"}
     except Exception as e:
         logger.error(f"Error disconnecting MCP server '{server_name}': {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Resources & Prompts ──────────────────────────────────────────────────
+# The MCP primitives beyond tools — a server can expose a browsable
+# resource tree (files, DB rows, anything URI-addressable) and reusable
+# prompt templates. Most connected servers declare neither, so these
+# routes return an empty list rather than 404ing on a server that just
+# doesn't have any.
+
+@custom_mcp_router.get("/{server_name}/resources")
+def list_server_resources(server_name: str):
+    """The resources/list catalog (uri/name/description/mimeType) for one
+    connected server — not the content itself, see .../resources/read."""
+    return {"resources": mcp_registry.list_resources(server_name)}
+
+
+@custom_mcp_router.get("/{server_name}/resources/read")
+def read_server_resource(server_name: str, uri: str):
+    """Fetches one resource's actual content, live (never cached — see
+    MCPServerRegistry.read_resource)."""
+    try:
+        return mcp_registry.read_resource(server_name, uri)
+    except Exception as e:
+        logger.error(f"Error reading resource '{uri}' from '{server_name}': {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@custom_mcp_router.get("/{server_name}/prompts")
+def list_server_prompts(server_name: str):
+    """The prompts/list catalog (name/description/arguments schema) for one
+    connected server — not a filled prompt, see .../prompts/{name}."""
+    return {"prompts": mcp_registry.list_prompts(server_name)}
+
+
+class GetPromptRequest(BaseModel):
+    arguments: Optional[Dict[str, str]] = None
+    model_config = {"defer_build": True}
+
+
+@custom_mcp_router.post("/{server_name}/prompts/{prompt_name}")
+def get_server_prompt(server_name: str, prompt_name: str, req: GetPromptRequest):
+    """Fetches a filled prompt template, live, with whatever arguments the
+    caller supplies (validated against the prompt's own schema server-side,
+    same as any other MCP call — Aegis doesn't re-validate them)."""
+    try:
+        return mcp_registry.get_prompt(server_name, prompt_name, req.arguments)
+    except Exception as e:
+        logger.error(f"Error getting prompt '{prompt_name}' from '{server_name}': {e}")
         raise HTTPException(status_code=500, detail=str(e))

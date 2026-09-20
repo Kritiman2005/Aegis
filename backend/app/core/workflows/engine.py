@@ -31,6 +31,13 @@ Nine node kinds (node.data.kind):
     propagation pass) — this is how "should we even search" or "does this
     look export-related" becomes a visible, reconfigurable node instead of
     logic hardcoded inside some other node.
+  - "switch": a multi-way router generalizing "logic" to N labeled
+    branches — same data.field/subject resolution, but matching happens
+    per OUTGOING EDGE (edge.data.caseValue, plain string equality) rather
+    than a single node-level condition, since one switch node can have
+    many outgoing edges. Edges with no caseValue set act as the default
+    branch when nothing else matches. See _run_switch_node/
+    _gate_switch_node/_downstream_gated_by_edges.
   - "database": targets data.databaseId, an app.db.models.InstalledDatabase
     row — either one installed from the Marketplace's Databases category
     (a SQL query, any relational engine in app.core.dbengines' catalog:
@@ -55,10 +62,12 @@ Nine node kinds (node.data.kind):
   - "reranker": re-scores an upstream "vector" search's list of matches
     against a query with a cross-encoder (data.rerankerModel — a model
     downloaded from the Marketplace's Rerankers category, or the app's own
-    bundled default if unset) and returns the top data.topK, reordered by
-    relevance rather than raw embedding/BM25 similarity — see
-    _run_reranker_node. Deliberately its own node, not a checkbox on
-    "vector", so a workflow can search wide and rerank down explicitly.
+    default if unset, NOT bundled either way — needs sentence-transformers
+    installed from the Dependencies panel first) and returns the top
+    data.topK, reordered by relevance rather than raw embedding/BM25
+    similarity — see _run_reranker_node. Deliberately its own node, not a
+    checkbox on "vector", so a workflow can search wide and rerank down
+    explicitly.
   - "extract": pulls plain text out of a document file (data.staticInputs
     filePath / an upstream-wired path) — the same extractor the app's own
     document upload pipeline uses (app.core.rag.processor.extract_text).
@@ -70,6 +79,16 @@ Nine node kinds (node.data.kind):
   - "loop": runs its single direct downstream node once per item in an
     upstream array, collecting the results — see _run_loop_node for the
     (deliberately scoped-down) semantics.
+  - "http_request": a raw outbound HTTP call (data.url/method/headers/
+    body) — see _run_http_request_node. The escape hatch for any REST API
+    with no dedicated MCP server; retried on transient failure like
+    "tool"/"database" (see _RETRYABLE_KINDS).
+  - "set_fields": deterministic dict reshaping (rename/pick/add fields)
+    without an "llm" judgment call — see _run_set_fields_node.
+  - "merge": explicitly combines every upstream node's output (list,
+    concat, or first-non-empty) — see _run_merge_node's own docstring for
+    why this exists alongside every other node's "first upstream only"
+    default.
   - "chat_trigger": the graph's entry point when this workflow is connected
     as the live chat handler (Workflow.is_chat_handler — see
     app.api.workflows's /set-chat-handler and run_chat_workflow below).
@@ -79,13 +98,14 @@ Nine node kinds (node.data.kind):
   - "document_upload_trigger": the analogous entry point for a workflow
     connected as the live ingestion handler (Workflow.is_ingestion_handler
     — see app.api.workflows's /set-ingestion-handler and
-    run_ingestion_workflow below), which app.api.documents's upload
-    handler runs in place of app.core.rag.processor.ingest_document for
-    every future upload. Its "output" is {file_path, document_id,
-    filename, file_type} for the document being ingested. A real
-    ingestion pipeline built from this plus the existing "extract" ->
-    "chunk" -> "embedding" -> "vector" (upsert) nodes needs no new
-    per-step logic — only the trigger and orchestration are new.
+    run_ingestion_workflow below). Ingestion is workflow-only — with no
+    workflow connected, app.api.documents's upload handler rejects the
+    upload outright rather than falling back to any built-in pipeline.
+    Its "output" is {file_path, document_id, filename, file_type} for the
+    document being ingested. A real ingestion pipeline built from this
+    plus the existing "extract" -> "chunk" -> "embedding" -> "vector"
+    (upsert) nodes needs no new per-step logic — only the trigger and
+    orchestration are new.
 
 Two more kinds exist ONLY for a chat-connected graph (run_chat_workflow) —
 and, per the rule that model config lives ONLY on "llm" nodes, "chat_reply"
@@ -98,17 +118,17 @@ itself holds none:
     "embedding"+"vector" search's results, another "llm" node's structured
     "is_export"/"format"/"parts" output, or anything else, folded in
     generically), builds the prompt via app.prompts.chat.build_chat_prompt,
-    and streams via chat_agent._call_llm_text with the same JSON-leak
-    guard Chat Mode's built-in pipeline uses (see
+    and streams via chat_agent._call_llm_text, the shared JSON-leak-guarded
+    generation call every chat reply goes through now (see
     _run_chat_generation_node). Exactly one such pair is required per
     chat-connected workflow (see run_chat_workflow) — every OTHER "llm"
     node in the graph is a plain, non-streaming reasoning step (a
     decide/classify judgment call, say), completely unaffected.
-  - "export_document": the post-reply export pipeline _handle_idle runs
-    after generating a reply (fence extraction, the LLM-fallback
-    extractor, the actual file export, appending the download link) —
-    runs AFTER the "chat_reply" node, so it's the one case where the
-    graph's true terminal isn't "chat_reply" itself; see
+  - "export_document": the post-reply export pipeline (fence extraction,
+    the LLM-fallback extractor, the actual file export, appending the
+    download link — see _run_export_document_node) that runs after
+    generating a reply — runs AFTER the "chat_reply" node, so it's the one
+    case where the graph's true terminal isn't "chat_reply" itself; see
     run_chat_workflow's docstring.
 
 A workflow's memory/entity context and the bundled hybrid document store's
@@ -141,6 +161,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import anyio
 
 from app.core.connection_manager import manager
+from app.core.friendly_errors import humanize_exception
 from app.core.agents.chat import ChatAgent, llm_executor, _trim_history_to_token_budget
 from app.core.agents.executor import ExecutorAgent
 from app.core.dbengines import relational as relational_engine
@@ -249,23 +270,51 @@ def _resolve_named_arguments(node: Dict, edges: List[Dict], node_outputs: Dict[s
     return arguments
 
 
-async def _dispatch_tool(chat_agent: ChatAgent, tool_name: str, arguments: Dict) -> Any:
+_JSON_TYPED_FIELD_TYPES = ("object", "array", "boolean", "number", "integer")
+
+
+def _coerce_structured_arguments(arguments: Dict, schema: Optional[Dict]) -> Dict:
+    """A node's "Fixed values" panel only ever produces plain strings (see
+    WorkflowsView.tsx's staticInputs) — even its boolean checkbox and number
+    inputs store "true"/"false"/"5", not a real bool/int. But a tool's own
+    inputSchema may declare a parameter as object/array (an IAM policy
+    document, a Lambda payload, ...), boolean, or number/integer. Without
+    this, that string would reach the MCP server verbatim and fail its
+    schema validation (e.g. the literal string "true" where the server
+    expects the JSON boolean true). JSON-parses just those typed fields —
+    which handles all five cases uniformly, since "true"/"5"/"5.5" are valid
+    JSON literals too — anything already non-string (e.g. an edge-mapped
+    value pulled straight from an upstream node's own JSON output) passes
+    through untouched, and a blank field is left for the tool's own
+    default."""
+    properties = (schema or {}).get("properties") or {}
+    coerced = dict(arguments)
+    for key, meta in properties.items():
+        if not isinstance(meta, dict) or meta.get("type") not in _JSON_TYPED_FIELD_TYPES:
+            continue
+        value = coerced.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        try:
+            coerced[key] = json.loads(value)
+        except json.JSONDecodeError as e:
+            raise WorkflowError(f"'{key}' needs valid JSON (a {meta['type']}) — got: {value[:80]!r} ({e})")
+    return coerced
+
+
+async def _dispatch_tool(chat_agent: ChatAgent, tool_name: str, arguments: Dict, media_engine: Optional[str] = None) -> Any:
     """Local tools go through ChatAgent's own sandboxed executors, everything
     else through the MCP registry. Returns the raw result (dict for local
     tools; string or parsed-JSON for MCP tools, matching
-    mcp_registry.call_tool's contract)."""
-    if tool_name == "web_scrape":
-        return await chat_agent._execute_web_scrape(arguments)
-    if tool_name == "extract_webpage_text":
-        return await chat_agent._execute_extract_webpage(arguments)
+    mcp_registry.call_tool's contract). media_engine only applies to the two
+    Media tool names — a node-config choice (data.mediaEngine, see
+    _run_tool_node), never part of arguments itself."""
     if tool_name == "transcribe_media":
-        return await chat_agent._execute_transcribe_media(arguments)
+        return await chat_agent._execute_transcribe_media(arguments, media_engine)
     if tool_name == "extract_image_text":
-        return await chat_agent._execute_extract_image_text(arguments)
+        return await chat_agent._execute_extract_image_text(arguments, media_engine)
     if tool_name in chat_agent._FILESYSTEM_TOOL_NAMES:
         return await chat_agent._execute_filesystem_tool(tool_name, arguments)
-    if tool_name.startswith("browser_"):
-        return await chat_agent._execute_browser_action(tool_name, arguments)
 
     import anyio
     raw_result = await anyio.to_thread.run_sync(
@@ -283,15 +332,14 @@ _STRUCTURED_FIELD_DEFAULTS = {"boolean": False, "string": "", "number": 0, "arra
 
 def _build_structured_output_grammar(fields: List[Dict[str, Any]]):
     """
-    Generalizes the exact grammar-constrained-JSON pattern
-    app.core.agents.chat._build_document_search_grammar (and
-    planner.py's _build_plan_grammar) already use, to an arbitrary
+    Generalizes grammar-constrained-JSON generation to an arbitrary
     user-authored field list — this is what lets a plain "llm" node be
-    configured to do the same kind of structured judgment call those
-    dedicated methods make, instead of needing its own dedicated node
-    kind. Returns None (caller falls back to response_format json_object)
-    if llama_cpp isn't importable, there are no fields, or compilation
-    fails for any reason.
+    configured to do any structured judgment call (is_export/format/parts,
+    needs_search/whole_document/query, or anything else a user defines)
+    instead of needing its own dedicated node kind per judgment. Returns
+    None (caller falls back to response_format json_object) if llama_cpp
+    isn't importable, there are no fields, or compilation fails for any
+    reason.
     """
     if not fields:
         return None
@@ -434,9 +482,14 @@ async def _run_ai_reasoning_node(
         raise WorkflowError(f"{detail} — pick one from the LLM panel, or on this node.")
 
     context_str = json.dumps(upstream_outputs, indent=2, default=str) if upstream_outputs else "No upstream input."
+    # Clamped against this node's OWN resolved model's real context window
+    # (llm.n_ctx(), read from its GGUF metadata) — a node-configured value
+    # saved while a larger-context model was picked can otherwise exceed
+    # what the model actually running this call supports.
+    requested_max_tokens = max_tokens if max_tokens is not None else 1024
     kwargs: Dict[str, Any] = {
         "temperature": temperature if temperature is not None else 0.0,
-        "max_tokens": max_tokens if max_tokens is not None else 1024,
+        "max_tokens": min(requested_max_tokens, llm.n_ctx()),
     }
 
     if output_fields:
@@ -932,9 +985,14 @@ async def _run_reranker_node(
     message.
 
     data.rerankerModel: a cross-encoder downloaded from the Marketplace's
-    Rerankers category (app.core.rerankers), or the app's own bundled
-    default (app.core.rag.processor.get_reranker) when unset — same
-    resolution shape as a "vector"/"embedding" node's data.embeddingModel.
+    Rerankers category (app.core.rerankers), or the app's own default
+    (app.core.rag.processor.get_reranker) when unset — same resolution
+    shape as a "vector"/"embedding" node's data.embeddingModel, except
+    neither this nor the default is ever bundled: both need
+    sentence-transformers installed from the Dependencies panel first, and
+    a missing install surfaces as a real, visible workflow-run failure
+    here (unlike hybrid_search's own automatic rerank pass, which quietly
+    skips reranking instead — see rerank_chunks's own docstring).
     """
     from app.core.rag.processor import rerank_chunks
     from app.core.rerankers import get_cross_encoder
@@ -995,6 +1053,133 @@ async def _run_extract_node(node: Dict, edges: List[Dict], node_outputs: Dict[st
     fmt = extraction_engines.format_for_ext(ext)
     engine_id = (data.get("enginePerFormat") or {}).get(fmt) or data.get("engine")
     return await anyio.to_thread.run_sync(lambda: extraction_engines.extract(file_path, ext, engine_id))
+
+
+async def _run_http_request_node(node: Dict, edges: List[Dict], node_outputs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    A generic outbound HTTP call — the escape hatch for any REST API that
+    doesn't have (and doesn't need) its own MCP server, since nothing else
+    here lets a workflow call an arbitrary endpoint. data.url/data.method
+    are static node config, overridable per-run via an edge explicitly
+    mapped to inputField "url"/"method"/"body" (see
+    _resolve_named_arguments's own docstring on why this is a plain
+    field-to-field mapping, not free-form templating) — e.g. a classifier
+    "llm" node deciding which endpoint to hit. data.headers is a plain
+    name->value map, always static (a header value that needs to vary
+    per-run belongs in the URL or body instead, kept simple rather than
+    adding a second mapping surface for the same job). data.body, for
+    POST/PUT/PATCH, is sent as real JSON if it parses as valid JSON, else
+    as plain text — no guessing beyond that.
+
+    Returns {status_code, headers, body} — body is the parsed JSON object
+    when the response is JSON, else the raw text, so a downstream node
+    (e.g. "Set fields", or a classifier "llm") can read a specific
+    response field either way.
+    """
+    import httpx
+
+    data = node.get("data", {})
+    label = data.get("label") or node["id"]
+    mapped = _resolve_named_arguments(node, edges, node_outputs)
+    url = mapped.get("url") or data.get("url")
+    if not url:
+        raise WorkflowError(f"Node '{label}' has no URL — set one or wire it in from upstream.")
+    method = str(mapped.get("method") or data.get("method") or "GET").upper()
+    headers = data.get("headers") or {}
+    body = mapped.get("body") if "body" in mapped else data.get("body")
+
+    request_kwargs: Dict[str, Any] = {"headers": headers}
+    if body and method in ("POST", "PUT", "PATCH"):
+        try:
+            request_kwargs["json"] = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            request_kwargs["content"] = body
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            resp = await client.request(method, url, **request_kwargs)
+    except httpx.HTTPError as e:
+        raise WorkflowError(f"Node '{label}': request to '{url}' failed — {e}")
+
+    content_type = resp.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            parsed_body: Any = resp.json()
+        except ValueError:
+            parsed_body = resp.text
+    else:
+        parsed_body = resp.text
+
+    return {"status_code": resp.status_code, "headers": dict(resp.headers), "body": parsed_body}
+
+
+def _run_set_fields_node(node: Dict, edges: List[Dict], node_outputs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Deterministic dict reshaping — n8n's "Set"/"Edit Fields" node, for
+    renaming/picking/adding fields without needing an "llm" judgment call
+    (slow, non-deterministic, overkill) just to reformat data between two
+    nodes with different shapes. data.staticInputs (name -> literal
+    string, set directly on this node) and any edge explicitly mapped to a
+    named inputField (see _resolve_named_arguments) both become keys on
+    the output dict — a field mapping wins over a same-named static value,
+    since it's a real pull from upstream rather than a hand-typed
+    fallback. data.mode "merge" (default) additionally starts from a
+    shallow copy of the upstream value when it's itself a dict, so this
+    only has to declare the fields that actually change; "replace" starts
+    from nothing but this node's own fields, dropping everything else the
+    upstream value carried.
+    """
+    data = node.get("data", {})
+    upstream_ids = _upstream_node_ids(node["id"], edges)
+    upstream = node_outputs.get(upstream_ids[0]) if upstream_ids else None
+
+    fields = _resolve_named_arguments(node, edges, node_outputs)
+
+    if data.get("mode", "merge") == "merge" and isinstance(upstream, dict):
+        result = dict(upstream)
+        result.update(fields)
+        return result
+    return fields
+
+
+def _run_merge_node(node: Dict, edges: List[Dict], node_outputs: Dict[str, Any]) -> Any:
+    """
+    Explicitly combines EVERY upstream node's output into one value —
+    every other node here that can technically have more than one
+    incoming edge (llm, http_request, set_fields, database's query
+    parameters) only ever reads ONE upstream by default
+    (_upstream_node_ids(...)[0], or a static/mapped field) for anything
+    not routed through _resolve_named_arguments's explicit field mapping;
+    wiring a second, unmapped edge into one of those silently drops it
+    with no warning (see WorkflowsView.tsx's own edge-count warning on
+    those kinds, which points here instead). This node exists so
+    combining branches is a deliberate, visible step.
+
+    data.mergeMode:
+    - "list" (default): every upstream output, in edge order, as a plain
+      list — safe for any input shape.
+    - "concat": every upstream value stringified (dicts/lists as JSON) and
+      joined with data.separator (default: two newlines) — for combining
+      several text-producing branches into one block.
+    - "first": the first upstream output that isn't None/empty/falsy — a
+      fallback chain (e.g. "prefer the vector search result, but if that
+      branch was gated closed by an upstream Logic node, use this static
+      default instead").
+    """
+    data = node.get("data", {})
+    upstream_ids = _upstream_node_ids(node["id"], edges)
+    values = [node_outputs.get(uid) for uid in upstream_ids]
+
+    mode = data.get("mergeMode", "list")
+    if mode == "concat":
+        sep = data.get("separator", "\n\n")
+        return sep.join(v if isinstance(v, str) else json.dumps(v, default=str) for v in values if v is not None)
+    if mode == "first":
+        for v in values:
+            if v:
+                return v
+        return None
+    return values
 
 
 def _run_chunk_node(node: Dict, edges: List[Dict], node_outputs: Dict[str, Any]) -> List[str]:
@@ -1080,7 +1265,7 @@ async def _run_send_to_chat_node(node: Dict, edges: List[Dict], node_outputs: Di
     return content
 
 
-_RETRYABLE_KINDS = {"mcp", "tool", "database", "vector", "embedding", "reranker"}
+_RETRYABLE_KINDS = {"mcp", "tool", "database", "vector", "embedding", "reranker", "http_request"}
 _RETRY_DELAYS = (0.5, 1.5)  # gaps between attempts — 3 tries total
 
 
@@ -1098,13 +1283,13 @@ async def _execute_node_with_retry(
     """
     Thin wrapper around _execute_node that automatically retries node kinds
     which talk to something outside this process — an MCP tool call, an
-    installed relational/vector database, or a downloaded embedding/
-    reranker model — since a transient network blip or a momentary rate
-    limit shouldn't fail an entire run when trying again a moment later
-    would have worked. Every OTHER kind ("llm", "logic", "extract",
-    "chunk", the trigger/reply kinds) is pure local compute where a second
-    attempt would just fail identically, so those go straight through with
-    no added latency.
+    installed relational/vector database, a downloaded embedding/reranker
+    model, or a raw HTTP request — since a transient network blip or a
+    momentary rate limit shouldn't fail an entire run when trying again a
+    moment later would have worked. Every OTHER kind ("llm", "logic",
+    "extract", "chunk", "set_fields", "merge", the trigger/reply kinds) is
+    pure local compute where a second attempt would just fail identically,
+    so those go straight through with no added latency.
 
     Never retries a WorkflowError — that signals a structural/config
     problem (no tool selected, invalid regex, missing database) that a
@@ -1179,8 +1364,9 @@ async def _execute_node(
                 raise WorkflowError(arguments["error"])
         else:
             arguments = _resolve_named_arguments(node, edges, node_outputs)
+            arguments = _coerce_structured_arguments(arguments, _find_tool_schema(tool_name))
 
-        return await _dispatch_tool(chat_agent, tool_name, arguments)
+        return await _dispatch_tool(chat_agent, tool_name, arguments, data.get("mediaEngine"))
 
     elif kind == "llm":
         # Left unset, this resolves to whichever model is currently active
@@ -1241,6 +1427,18 @@ async def _execute_node(
 
     elif kind == "schedule_trigger":
         raise WorkflowError(f"'{label}' only runs on its own schedule — it fires automatically in the background, nothing to click.")
+
+    elif kind == "http_request":
+        return await _run_http_request_node(node, edges, node_outputs)
+
+    elif kind == "set_fields":
+        return _run_set_fields_node(node, edges, node_outputs)
+
+    elif kind == "merge":
+        return _run_merge_node(node, edges, node_outputs)
+
+    elif kind == "switch":
+        return _run_switch_node(node, edges, node_outputs)
 
     else:
         raise WorkflowError(f"Node '{label}' has an unrecognized type '{kind}'.")
@@ -1307,6 +1505,93 @@ def _downstream_gated_by(start_id: str, edges: List[Dict]) -> set:
                 changed = True
     gated.discard(start_id)
     return gated
+
+
+def _downstream_gated_by_edges(closed_edge_ids: set, edges: List[Dict]) -> set:
+    """
+    Generalizes _downstream_gated_by to per-EDGE gating, for a "switch"
+    node — which (unlike "logic"'s all-or-nothing single gate) closes all
+    but one of its own outgoing edges each run, so the thing being closed
+    is a specific set of edges, not a whole node. Same fixed-point
+    reasoning: a node is gated once every one of its incoming edges is
+    either in closed_edge_ids or comes from an already-gated node. A node
+    with one closed-edge input and one ordinary, ungated input is
+    correctly NOT gated — the ungated input alone is enough to run it,
+    same join-safety guarantee _downstream_gated_by gives per-node,
+    generalized to work when only some of a source's edges close instead
+    of the whole node.
+    """
+    edges_by_target: Dict[str, List[Dict]] = {}
+    for e in edges:
+        edges_by_target.setdefault(e["target"], []).append(e)
+
+    gated: set = set()
+    changed = True
+    while changed:
+        changed = False
+        for tgt, incoming in edges_by_target.items():
+            if tgt in gated:
+                continue
+            if all(e["id"] in closed_edge_ids or e["source"] in gated for e in incoming):
+                gated.add(tgt)
+                changed = True
+    return gated
+
+
+def _run_switch_node(node: Dict, edges: List[Dict], node_outputs: Dict[str, Any]) -> Any:
+    """
+    A multi-way router — n8n's "Switch" node, generalizing "logic"'s
+    binary gate to N labeled branches instead of chaining several logic
+    gates to get the same effect. data.field/subject resolution is
+    identical to _run_logic_node (blank field = whole upstream value).
+    Matching is plain string equality against each outgoing edge's OWN
+    edge.data.caseValue (set per-edge in the canvas — see NodeOutputColumn
+    — since a single node can have many outgoing edges, unlike every other
+    per-node config field here): the edge(s) whose caseValue equals str(
+    subject) stay open; if none match, every edge with NO caseValue set
+    acts as the default branch instead. Returns the upstream value
+    unchanged (same convention as "logic") — actual branch selection
+    happens via edge gating (_gate_switch_node), not this return value.
+    """
+    data = node.get("data", {})
+    upstream_ids = _upstream_node_ids(node["id"], edges)
+    upstream = node_outputs.get(upstream_ids[0]) if upstream_ids else None
+
+    field = data.get("field")
+    subject = upstream.get(field) if field and isinstance(upstream, dict) else upstream
+    return subject
+
+
+def _switch_matched_edges(node_id: str, node: Dict, edges: List[Dict], node_outputs: Dict[str, Any]) -> List[Dict]:
+    """Re-derives which of this "switch" node's own outgoing edges match
+    its current run's resolved value — same field/subject resolution
+    _run_switch_node used to produce its return value, recomputed here
+    (cheap, purely local) rather than threading the match out of band
+    through _execute_node's single-return-value contract."""
+    data = node.get("data", {})
+    upstream_ids = _upstream_node_ids(node_id, edges)
+    upstream = node_outputs.get(upstream_ids[0]) if upstream_ids else None
+    field = data.get("field")
+    subject = upstream.get(field) if field and isinstance(upstream, dict) else upstream
+    subject_str = str(subject)
+
+    outgoing = [e for e in edges if e["source"] == node_id]
+    matched = [e for e in outgoing if (e.get("data") or {}).get("caseValue") not in (None, "") and str((e.get("data") or {}).get("caseValue")) == subject_str]
+    if not matched:
+        matched = [e for e in outgoing if not (e.get("data") or {}).get("caseValue")]
+    return matched
+
+
+def _gate_switch_node(node_id: str, node: Dict, edges: List[Dict], node_outputs: Dict[str, Any]) -> set:
+    """Every downstream node that should be skipped this run because it's
+    only reachable through one of THIS switch node's non-matching outgoing
+    edges — see _switch_matched_edges/_downstream_gated_by_edges."""
+    outgoing_ids = {e["id"] for e in edges if e["source"] == node_id}
+    matched_ids = {e["id"] for e in _switch_matched_edges(node_id, node, edges, node_outputs)}
+    closed_edge_ids = outgoing_ids - matched_ids
+    if not closed_edge_ids:
+        return set()
+    return _downstream_gated_by_edges(closed_edge_ids, edges)
 
 
 async def _run_loop_node(
@@ -1398,12 +1683,10 @@ def _enrich_attachments(attachments: List[Dict]) -> List[Dict]:
     """
     The WebSocket payload only ever carries {document_id, filename,
     file_type} per attachment (see useSocket.ts's Attachment interface) —
-    enough for the built-in _get_document_context path, which looks
-    everything else up itself, but a workflow's own Extract node needs the
-    real file_path, and the ingestion loop needs "ready"/"processing" to
-    know which attachments still need indexing at all. Looked up once here
-    (a single DB round trip for the whole turn) rather than by each node
-    individually.
+    but a workflow's own Extract node needs the real file_path, and the
+    ingestion loop needs "ready"/"processing" to know which attachments
+    still need indexing at all. Looked up once here (a single DB round
+    trip for the whole turn) rather than by each node individually.
     """
     if not attachments:
         return []
@@ -1478,25 +1761,24 @@ async def _run_export_document_node(
     nodes: Dict[str, Dict],
     edges: List[Dict],
     node_outputs: Dict[str, Any],
-    chat_ctx: Dict[str, Any],
     token_callback,
 ) -> str:
     """
-    Wraps _handle_idle's post-reply export pipeline verbatim (chat.py's
-    _handle_idle, the "if export_fmt:" block after the LLM call): prefers
-    the "```export" fence the reply's system prompt asked for, falls back
-    to _extract_export_content_via_llm, then _execute_export_document, then
-    appends the download link — pushed through token_callback the same
-    way, since the reply text was already streamed (by the "llm" node
-    feeding "chat_reply" — see _run_chat_generation_node) before this
-    node ever runs. Passthrough (the reply text, unchanged) when nothing
-    requested an export.
+    Post-reply export pipeline: prefers the "```export" fence the reply's
+    system prompt asked for, falls back to _extract_export_content_via_llm,
+    then _execute_export_document, then appends the download link — pushed
+    through token_callback the same way, since the reply text was already
+    streamed (by the "llm" node feeding "chat_reply" — see
+    _run_chat_generation_node) before this node ever runs. Passthrough
+    (the reply text, unchanged) when nothing requested an export.
 
-    An explicit chat_ctx["export_format"] (the composer's Export menu)
-    always wins over whatever an upstream classifier dict guessed — same
-    precedence _classify_export_and_compound's callers always enforced
-    (explicit_format or export_fmt), applied here since guessing is a
-    plain "llm" node's job now, not overriding.
+    Whether to export, and in what format, is entirely a classifier
+    "llm" node's judgment call (structured output with is_export/format
+    fields — see WorkflowsView.tsx's EXPORT_CLASSIFIER_PROMPT for a
+    starting-point prompt shape) wired directly upstream of this node —
+    there's no other way to request one; the chat composer's own Export
+    menu (which used to set this explicitly, overriding the classifier)
+    was removed in favor of this node.
     """
     import asyncio
     import re
@@ -1507,11 +1789,10 @@ async def _run_export_document_node(
         raise WorkflowError(f"'{label}' has no upstream Chat Reply node wired in — it needs the reply text to (maybe) export.")
 
     # Duck-typed, not kind-checked: whichever upstream (typically a plain
-    # "llm" node configured with DEFAULT_TURN_CLASSIFIER_PROMPT's
-    # is_export/format/parts structured output) carries this key.
+    # "llm" node configured with is_export/format/parts structured
+    # output) carries this key.
     classification = _upstream_dict_with_key(node["id"], edges, node_outputs, "is_export") or {}
-    explicit_format = chat_ctx.get("export_format") if chat_ctx.get("export_format") in ("pdf", "docx", "xlsx") else None
-    export_fmt = explicit_format or (classification.get("format") if classification.get("is_export") else None)
+    export_fmt = classification.get("format") if classification.get("is_export") else None
     if not export_fmt:
         return text
 
@@ -1563,15 +1844,13 @@ async def _run_chat_generation_node(
     Every non-None upstream output (of THIS llm node — memory/vector
     search/classifier/etc., whatever's wired directly into it, not into
     chat_reply) is folded into full_context and passed through
-    build_chat_prompt exactly like _handle_idle does — the node's own
-    data.instruction is the base_prompt override slot (the same role
-    context_config.system_prompt_override plays for the built-in path,
-    just scoped to this graph). A dict upstream carrying an "is_export" key
-    (duck-typed, not kind-checked — e.g. another plain "llm" node
-    configured with DEFAULT_TURN_CLASSIFIER_PROMPT's is_export/format/parts
-    structured output shape) folds in as the exact same [MULTI-PART
-    QUESTION]/[EXPORT INSTRUCTION] blocks _handle_idle builds. A "vector"
-    node's search-result list formats as a document-excerpt block.
+    build_chat_prompt — the node's own data.instruction is the base_prompt
+    override slot, scoped to this graph. A dict upstream carrying an
+    "is_export" key (duck-typed, not kind-checked — e.g. another plain
+    "llm" node configured with is_export/format/parts structured output)
+    folds in as the exact same [MULTI-PART QUESTION]/[EXPORT INSTRUCTION]
+    blocks below. A "vector" node's search-result list formats as a
+    document-excerpt block.
     Anything else (a tool result, plain text, a "logic" pass-through, ...)
     is folded in generically as text/JSON, so this still composes with a
     fully custom graph, not only the seeded one.
@@ -1616,9 +1895,9 @@ async def _run_chat_generation_node(
                     block += f"--- Source: {filename} ---\n{content}\n\n"
                 context_parts.append(block)
         elif isinstance(val, dict) and "is_export" in val:
-            # DEFAULT_TURN_CLASSIFIER_PROMPT's raw shape — translated here
-            # (not by a Python wrapper method anymore, since this is now
-            # just a plain structured "llm" node's output).
+            # A classifier "llm" node's raw is_export/format/parts output —
+            # translated here (not by a Python wrapper method), since this
+            # is just a plain structured "llm" node's output.
             compound_parts = val.get("parts") or None
             export_fmt = val.get("format") if val.get("is_export") else None
         else:
@@ -1657,19 +1936,37 @@ async def _run_chat_generation_node(
     chat_cfg = ctx_cfg.get("chat")
     max_history = chat_cfg.get("max_history_messages", 20)
     max_chars = chat_cfg.get("max_msg_chars", 4000)
+    # Clamped against THIS node's own resolved model's real context window —
+    # same reasoning as _run_ai_reasoning_node above: a node can call a
+    # different model than whatever's globally active, so the configured
+    # response length must be bounded by the model that actually runs this
+    # call, not just trusted outright.
+    reply_budget = min(chat_cfg.get("max_output_tokens", 5120), llm.n_ctx())
     history = [
         {"role": m["role"], "content": m["content"][:max_chars] + ("..." if len(m["content"]) > max_chars else "")}
         for m in (chat_ctx.get("history") or [])[-max_history:]
     ]
-    history = _trim_history_to_token_budget(llm, chat_prompt, history)
+    history = _trim_history_to_token_budget(llm, chat_prompt, history, reply_buffer=reply_budget)
 
     messages = [{"role": "system", "content": chat_prompt}]
     messages.extend(history)
     messages.append({"role": "user", "content": chat_ctx["message"]})
+    # Purely additive — a no-op unless an image is actually sitting among
+    # this node's upstream outputs AND its own picked model is vision-
+    # capable (see _attach_workflow_vision_image's docstring). Needed here
+    # too, not just in _run_ai_reasoning_node above: this is the node the
+    # WorkflowsView.tsx UI itself points users toward for vision ("wire it
+    # directly into an 'llm' node with a vision-capable model picked") is
+    # usually THIS node — the one llm node feeding chat_reply directly —
+    # not a separate judgment-call node.
+    upstream_outputs = {src: node_outputs.get(src) for src in _upstream_node_ids(node["id"], edges)}
+    _attach_workflow_vision_image(messages, data.get("modelName") or None, upstream_outputs)
 
     import asyncio
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(llm_executor, lambda: chat_agent._call_llm_text(messages, token_callback))
+    return await loop.run_in_executor(
+        llm_executor, lambda: chat_agent._call_llm_text(messages, token_callback, max_tokens=reply_budget)
+    )
 
 
 _HISTORY_MAX_STR = 4000
@@ -1747,17 +2044,17 @@ async def run_chat_workflow(
     attachments: Optional[List[Dict]],
     connection_id: str,
     token_callback,
-    export_format: Optional[str] = None,
+    message_source: Optional[str] = None,
 ) -> str:
     """
     Runs one workflow graph as the live handler for a real chat turn — used
     by app.api.websocket's process_message_task when a workflow has been
-    connected via app.api.workflows's /set-chat-handler, in place of
-    ChatAgent.handle_message for exactly this turn. `chat_agent` is the
-    SAME per-connection instance websocket.py already keeps in
-    agent_sessions (not a throwaway one) so cancellation, history
-    persistence, and token-usage logging keep working exactly as they do
-    for the built-in pipeline.
+    connected via app.api.workflows's /set-chat-handler; this is the only
+    way a chat turn ever gets a reply now. `chat_agent` is the SAME
+    per-connection instance websocket.py already keeps in agent_sessions
+    (not a throwaway one) so cancellation, history persistence, and
+    token-usage logging all work the same way they would for any other
+    turn.
 
     Reuses every existing node executor unchanged via _execute_node for
     tool/database/vector/extract/chunk/loop/logic nodes, and for any
@@ -1779,17 +2076,21 @@ async def run_chat_workflow(
     assuming they're the same node
     (app.api.workflows._validate_chat_handler_graph mirrors this).
 
-    Trade-off (documented for whoever connects a workflow this way): a
-    couple of _handle_idle-specific things still aren't modeled as nodes —
-    vision-image attachment handling, and the Agent-Mode tool-result
-    carryover block — since those aren't part of "how the reply gets
-    shaped" so much as separate, narrower concerns.
-
     Raises WorkflowError on any structural problem (missing/duplicate
     trigger or reply node, a node failing) — app.api.websocket
     catches this the same way it catches any other chat-turn exception,
     surfacing it as a normal chat error rather than crashing the
     connection.
+
+    message_source: "voice" only when the composer's own mic auto-send
+    fired this turn (the connected trigger node's own "Send automatically"
+    setting — see app.api.voice._get_active_voice_config), None for a
+    normal typed message (which includes a voice transcript the user
+    reviewed before hitting Send — only the immediate, unedited auto-send
+    path is ever tagged). Gated against the trigger node's own
+    data.acceptsVoice in _run_chat_workflow_body below — accepted by
+    default; an explicit False (unchecking "Also accept voice input")
+    rejects it.
     """
     from app.db.database import SessionLocal
     from app.db.models import Workflow as WorkflowModel
@@ -1806,10 +2107,12 @@ async def run_chat_workflow(
     node_outputs: Dict[str, Any] = {}
     try:
         return await _run_chat_workflow_body(
-            chat_agent, workflow_id, message, history, attachments, connection_id, token_callback, export_format, graph, run_id, node_outputs,
+            chat_agent, workflow_id, message, history, attachments, connection_id, token_callback, graph, run_id, node_outputs,
+            message_source=message_source,
         )
     except Exception as e:
-        await anyio.to_thread.run_sync(_record_run_finish, run_id, "failed", node_outputs, None, str(e))
+        friendly = humanize_exception(e, context="running this chat workflow")
+        await anyio.to_thread.run_sync(_record_run_finish, run_id, "failed", node_outputs, None, friendly)
         raise
 
 
@@ -1821,10 +2124,10 @@ async def _run_chat_workflow_body(
     attachments: Optional[List[Dict]],
     connection_id: str,
     token_callback,
-    export_format: Optional[str],
     graph: Dict,
     run_id: str,
     node_outputs: Dict[str, Any],
+    message_source: Optional[str] = None,
 ) -> str:
     nodes = {n["id"]: n for n in graph.get("nodes", [])}
     edges = graph.get("edges", [])
@@ -1833,6 +2136,20 @@ async def _run_chat_workflow_body(
     if len(trigger_ids) != 1:
         raise WorkflowError('The connected chat workflow must have exactly one "On chat message" trigger node.')
     trigger_id = trigger_ids[0]
+
+    # Voice messages are accepted by default — data.acceptsVoice is
+    # opt-OUT (missing/None/True all accept; only an explicit False, set by
+    # unchecking "Also accept voice input" on the trigger node, rejects).
+    # A rejected voice turn surfaces as a real, visible WorkflowError
+    # (caught by app.api.websocket the same as any other chat-turn
+    # failure) rather than silently falling through to a confusing
+    # generic reply.
+    if message_source == "voice" and nodes[trigger_id].get("data", {}).get("acceptsVoice") is False:
+        raise WorkflowError(
+            'This workflow\'s "On chat message" trigger doesn\'t accept voice input yet — turn on '
+            '"Also accept voice input" on that node, or type your message instead.'
+        )
+
     enriched_attachments = await anyio.to_thread.run_sync(_enrich_attachments, attachments or [])
     node_outputs[trigger_id] = {
         "message": message, "history": history, "attachments": enriched_attachments,
@@ -1842,6 +2159,11 @@ async def _run_chat_workflow_body(
         # document a previous turn in this same conversation already
         # finished ingesting.
         "pending_attachments": [a for a in enriched_attachments if a.get("status") != "ready"],
+        # "voice" or "text" — a real field so a Logic/Switch node can route
+        # differently on it (e.g. a voice-command branch through different
+        # MCP tools) instead of it only being an invisible accept/reject
+        # gate on the trigger itself.
+        "source": message_source or "text",
     }
 
     # A single workflow may hold more than one independent pipeline (e.g. a
@@ -1881,7 +2203,7 @@ async def _run_chat_workflow_body(
 
     executor = ExecutorAgent(chat_agent.llm_manager)
     order = _topological_order(list(nodes.values()), edges)
-    chat_ctx = {"message": message, "history": history, "attachments": enriched_attachments, "export_format": export_format}
+    chat_ctx = {"message": message, "history": history, "attachments": enriched_attachments}
 
     # Every node inside a "loop" node's own body chain (see
     # _trace_loop_body_chain) only ever runs THROUGH that loop's per-item
@@ -1917,6 +2239,28 @@ async def _run_chat_workflow_body(
     gated_closed: set = set()
 
     for node_id in order:
+        # The "Stop Generating" button (app.api.websocket's "cancel" message
+        # handler) sets this same threading.Event chat_agent already uses
+        # inside its own _call_llm_text streaming loop — but that's only
+        # ever consulted from WITHIN one node's own LLM call.
+        # Every node before the final reply-generating one (a classifier
+        # "llm" node, a tool call, a database query, ...) used to run to
+        # completion regardless, since nothing here ever checked
+        # cancel_event BETWEEN nodes — a turn stuck in one of those earlier
+        # steps had no way to be cancelled at all, only one already
+        # mid-stream on the final node did. Checked once per node, not
+        # per-line, since a node's own body isn't generally interruptible
+        # mid-way (same granularity the two existing per-chunk checks
+        # already accept for a single LLM call). The eventual return value
+        # is discarded by websocket.py's generation_id/superseded() check
+        # regardless, so bailing out with whatever's accumulated so far is
+        # safe — nothing downstream ever sees a cancelled turn's output.
+        if getattr(chat_agent, "cancel_event", None) and chat_agent.cancel_event.is_set():
+            await anyio.to_thread.run_sync(
+                _record_run_finish, run_id, "failed", node_outputs, None, "Cancelled by user"
+            )
+            return node_outputs.get(terminal_id) or ""
+
         if node_id == trigger_id or node_id in loop_body_ids:
             continue
 
@@ -1940,7 +2284,7 @@ async def _run_chat_workflow_body(
                 upstream_ids = _upstream_node_ids(node_id, edges)
                 result = node_outputs.get(upstream_ids[0]) if upstream_ids else ""
             elif kind == "export_document":
-                result = await _run_export_document_node(chat_agent, node, nodes, edges, node_outputs, chat_ctx, token_callback)
+                result = await _run_export_document_node(chat_agent, node, nodes, edges, node_outputs, token_callback)
             else:
                 result = await _execute_node_with_retry(
                     node_id, nodes, edges, node_outputs, chat_agent, executor,
@@ -1953,6 +2297,8 @@ async def _run_chat_workflow_body(
         node_outputs[node_id] = result
         if kind == "logic" and result is None:
             gated_closed.update(logic_gated_chains.get(node_id, []))
+        elif kind == "switch":
+            gated_closed.update(_gate_switch_node(node_id, node, edges, node_outputs))
 
     reply_text = node_outputs.get(terminal_id) or ""
     await anyio.to_thread.run_sync(_record_run_finish, run_id, "completed", node_outputs)
@@ -1962,10 +2308,10 @@ async def _run_chat_workflow_body(
 async def run_ingestion_workflow(document_id: int, file_path: str, filename: str, file_type: str) -> None:
     """
     Runs one workflow graph as the live handler for a document upload —
-    used by app.api.documents's upload handler in place of
-    app.core.rag.processor.ingest_document for this document, when a
-    workflow has been connected via app.api.workflows's
-    /set-ingestion-handler. Structurally mirrors run_chat_workflow (load
+    the only way a document ever gets ingested now (app.api.documents's
+    upload handler rejects the upload outright when no workflow is
+    connected via app.api.workflows's /set-ingestion-handler). Structurally
+    mirrors run_chat_workflow (load
     graph, inject trigger output, topological run) but has no reply/
     streaming semantics — it just runs to completion or raises, same as
     run_workflow's manual-run shape.
@@ -1983,10 +2329,9 @@ async def run_ingestion_workflow(document_id: int, file_path: str, filename: str
     one specific chat connection the way a chat turn is.
 
     Raises WorkflowError on any structural problem or node failure — the
-    caller (app.api.documents) catches this the same way it already
-    catches app.core.rag.processor.ingest_document failing, marking the
-    document "failed" with the error message rather than crashing the
-    upload endpoint.
+    caller (app.api.documents) catches this and marks the document
+    "failed" with the error message rather than crashing the upload
+    endpoint.
     """
     from app.db.database import SessionLocal
     from app.db.models import Workflow as WorkflowModel
@@ -2004,7 +2349,8 @@ async def run_ingestion_workflow(document_id: int, file_path: str, filename: str
     try:
         await _run_ingestion_workflow_body(document_id, file_path, filename, file_type, graph, workflow_id, node_outputs)
     except Exception as e:
-        await anyio.to_thread.run_sync(_record_run_finish, run_id, "failed", node_outputs, None, str(e))
+        friendly = humanize_exception(e, context=f"processing '{filename}'")
+        await anyio.to_thread.run_sync(_record_run_finish, run_id, "failed", node_outputs, None, friendly)
         raise
     await anyio.to_thread.run_sync(_record_run_finish, run_id, "completed", node_outputs)
 
@@ -2080,6 +2426,8 @@ async def _run_ingestion_workflow_body(
         node_outputs[node_id] = result
         if kind == "logic" and result is None:
             gated_closed.update(logic_gated_chains.get(node_id, []))
+        elif kind == "switch":
+            gated_closed.update(_gate_switch_node(node_id, node, edges, node_outputs))
         await manager.broadcast_json({
             "type": "workflow_node_progress", "workflow_id": workflow_id, "run_id": f"ingest_{document_id}",
             "node_id": node_id, "status": "completed", "message": f"'{label}' completed.",
@@ -2089,8 +2437,9 @@ async def _run_ingestion_workflow_body(
 async def run_schedule_workflow(workflow_id: int, trigger_node_id: str) -> None:
     """
     Runs one workflow graph because its "On a schedule" trigger came due —
-    invoked periodically by app.core.scheduler_daemon's background loop
-    (see _check_schedule_triggers), never by an HTTP request. Structurally
+    invoked periodically by app.core.scheduler's scheduler_daemon background
+    loop (see its own check_and_run_workflow_triggers), never by an HTTP
+    request. Structurally
     mirrors run_ingestion_workflow: load the graph, restrict to the
     subgraph reachable from ONE specific trigger node (a canvas may hold
     more than one schedule_trigger, each on its own cadence, side by side
@@ -2117,7 +2466,8 @@ async def run_schedule_workflow(workflow_id: int, trigger_node_id: str) -> None:
     try:
         await _run_schedule_workflow_body(workflow_id, trigger_node_id, graph, run_id, node_outputs)
     except Exception as e:
-        await anyio.to_thread.run_sync(_record_run_finish, run_id, "failed", node_outputs, None, str(e))
+        friendly = humanize_exception(e, context="running this scheduled workflow")
+        await anyio.to_thread.run_sync(_record_run_finish, run_id, "failed", node_outputs, None, friendly)
         raise
     await anyio.to_thread.run_sync(_record_run_finish, run_id, "completed", node_outputs)
 
@@ -2175,6 +2525,8 @@ async def _run_schedule_workflow_body(
         node_outputs[node_id] = result
         if kind == "logic" and result is None:
             gated_closed.update(logic_gated_chains.get(node_id, []))
+        elif kind == "switch":
+            gated_closed.update(_gate_switch_node(node_id, node, edges, node_outputs))
         await manager.broadcast_json({
             "type": "workflow_node_progress", "workflow_id": workflow_id, "run_id": run_id,
             "node_id": node_id, "status": "completed", "message": f"'{label}' completed.",
@@ -2279,17 +2631,21 @@ async def run_workflow(workflow_id: int, run_id: str, graph: Dict) -> None:
             node_outputs[node_id] = result
             if kind == "logic" and result is None:
                 gated_closed.update(logic_gated_chains.get(node_id, []))
+            elif kind == "switch":
+                gated_closed.update(_gate_switch_node(node_id, node, edges, node_outputs))
             await broadcast(node_id, "completed", f"'{label}' completed.", output=result)
         except Exception as e:
-            logger.error(f"[Workflow {workflow_id} run {run_id}] Node '{node_id}' failed: {e}")
-            await broadcast(node_id, "failed", str(e))
+            friendly = humanize_exception(e, context=f"running '{label}'")
+            logger.info(f"[Workflow {workflow_id} run {run_id}] Node '{node_id}' raw error: {e}")
+            logger.error(f"[Workflow {workflow_id} run {run_id}] Node '{node_id}' failed: {friendly}")
+            await broadcast(node_id, "failed", friendly)
             await manager.broadcast_json({
                 "type": "workflow_run_failed",
                 "workflow_id": workflow_id,
                 "run_id": run_id,
-                "message": f"Node '{label}' failed: {e}",
+                "message": f"'{label}' failed: {friendly}",
             })
-            await anyio.to_thread.run_sync(_record_run_finish, run_id, "failed", node_outputs, node_id, str(e))
+            await anyio.to_thread.run_sync(_record_run_finish, run_id, "failed", node_outputs, node_id, friendly)
             return
 
     await manager.broadcast_json({"type": "workflow_run_complete", "workflow_id": workflow_id, "run_id": run_id, "outputs": node_outputs})

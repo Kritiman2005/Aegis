@@ -48,7 +48,7 @@ export default function AegisDatabaseBrowser({ onClose }: { onClose: () => void 
     try {
       const res = await fetch(`${API_BASE}/api/aegis-db/tables`);
       if (res.ok) setTables((await res.json()).tables || []);
-    } catch (e) {}
+    } catch (e) { toast.error('Could not load Aegis database tables.'); }
   }, []);
 
   const fetchRows = useCallback(async (table: string, pageNum: number) => {

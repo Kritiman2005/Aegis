@@ -26,6 +26,8 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from app.mcp.content import flatten_content_item
+
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = httpx.Timeout(30.0, read=60.0)
@@ -199,17 +201,8 @@ class StreamableHTTPMCPClient:
         result = response.get("result", {})
         content = result.get("content", [])
 
-        parts = []
-        for item in content:
-            item_type = item.get("type", "")
-            if item_type == "text":
-                parts.append(item.get("text", ""))
-            elif item_type == "resource":
-                parts.append(json.dumps(item.get("resource", {})))
-            elif item_type == "image":
-                parts.append(f"[image: {item.get('url', 'embedded')}]")
-
-        return "\n".join(parts) if parts else str(result)
+        parts = [flatten_content_item(item) for item in content]
+        return "\n".join(p for p in parts if p) if parts else str(result)
 
     def list_resources(self) -> List[dict]:
         if "resources" not in self.server_capabilities:
@@ -232,6 +225,32 @@ class StreamableHTTPMCPClient:
             "params": {},
         })
         return response.get("result", {}).get("prompts", [])
+
+    def read_resource(self, uri: str) -> dict:
+        """See StdioMCPClient.read_resource — identical shape, just over
+        this transport."""
+        response = self._post({
+            "jsonrpc": "2.0",
+            "id": self._next_id(),
+            "method": "resources/read",
+            "params": {"uri": uri},
+        })
+        if "error" in response:
+            raise RuntimeError(f"resources/read failed for '{uri}': {response['error']}")
+        return response.get("result", {})
+
+    def get_prompt(self, name: str, arguments: Optional[dict] = None) -> dict:
+        """See StdioMCPClient.get_prompt — identical shape, just over this
+        transport."""
+        response = self._post({
+            "jsonrpc": "2.0",
+            "id": self._next_id(),
+            "method": "prompts/get",
+            "params": {"name": name, "arguments": arguments or {}},
+        })
+        if "error" in response:
+            raise RuntimeError(f"prompts/get failed for '{name}': {response['error']}")
+        return response.get("result", {})
 
     @property
     def cached_tools(self) -> List[dict]:

@@ -16,6 +16,9 @@ import {
   Workflow,
   Search,
   X,
+  HardDriveDownload,
+  Pencil,
+  Check,
 } from 'lucide-react';
 import { AegisMark } from './AegisLogo';
 import toast from 'react-hot-toast';
@@ -44,7 +47,7 @@ function highlightSnippet(snippet: string): string {
   return escaped.replace(/\*\*(.+?)\*\*/g, '<mark>$1</mark>');
 }
 
-export type TabType = 'chat' | 'mcp_servers' | 'workflows' | 'llms' | 'discover' | 'history' | 'model_hub' | 'context' | 'analytics' | 'marketplace';
+export type TabType = 'chat' | 'mcp_servers' | 'workflows' | 'llms' | 'discover' | 'history' | 'model_hub' | 'context' | 'analytics' | 'marketplace' | 'dependencies';
 
 export interface AccountStatus {
   logged_in: boolean;
@@ -59,6 +62,7 @@ interface SidebarProps {
   recentChats?: { id: string; preview: string }[];
   onSelectSession?: (id: string) => void;
   onDeleteSession?: (id: string, e: React.MouseEvent) => void;
+  onRenameSession?: (id: string, title: string) => void;
   activeSessionId?: string;
   account?: AccountStatus | null;
   onLogout?: () => void;
@@ -71,6 +75,7 @@ const NAV_ITEMS = [
   { id: 'llms'        as TabType, label: 'LLMs',        icon: Cpu },
   { id: 'context'     as TabType, label: 'Memory Hub', icon: Database },
   { id: 'analytics'   as TabType, label: 'Analytics',   icon: BarChart3 },
+  { id: 'dependencies' as TabType, label: 'Dependencies', icon: HardDriveDownload },
 ];
 
 export default function Sidebar({
@@ -80,11 +85,40 @@ export default function Sidebar({
   recentChats = [],
   onSelectSession,
   onDeleteSession,
+  onRenameSession,
   activeSessionId,
   account = null,
   onLogout,
 }: SidebarProps) {
   const [recentsOpen, setRecentsOpen] = useState(true);
+  // Plain "click again to confirm" arm — not a native confirm(), which
+  // blocks the whole Electron renderer until dismissed (see eraseArmed's
+  // comment below for the story on why this codebase avoids it everywhere).
+  const [armedDeleteId, setArmedDeleteId] = useState<string | null>(null);
+
+  // Inline rename — click the pencil (or double-click the title) to edit in
+  // place, Enter/blur to save, Escape to cancel. renamingValue is separate
+  // from the chat's own preview so typing doesn't affect anything until
+  // it's actually committed.
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renamingValue, setRenamingValue] = useState('');
+  const renameInputRef = useRef<HTMLInputElement>(null);
+
+  const startRename = (id: string, currentTitle: string) => {
+    setRenamingId(id);
+    setRenamingValue(currentTitle);
+  };
+
+  const commitRename = () => {
+    if (!renamingId) return;
+    const trimmed = renamingValue.trim();
+    onRenameSession?.(renamingId, trimmed);
+    setRenamingId(null);
+  };
+
+  useEffect(() => {
+    if (renamingId) renameInputRef.current?.focus();
+  }, [renamingId]);
 
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
@@ -269,28 +303,85 @@ export default function Sidebar({
                           : 'hover:bg-aegis-sidebar-raised'
                       }`}
                     >
-                      {/* Session title — click to open */}
-                      <button
-                        onClick={() => {
-                          onSelectSession?.(chat.id);
-                          setActiveTab('chat');
-                        }}
-                        className={`flex-1 min-w-0 text-left px-3 py-2 text-[12px] truncate transition-colors ${
-                          isActiveChat
-                            ? 'text-aegis-primary-light font-semibold'
-                            : 'text-aegis-sidebar-text-muted hover:text-aegis-sidebar-text'
-                        }`}
-                        title={chat.preview}
-                      >
-                        {chat.preview}
-                      </button>
-
-                      {/* Delete button — visible on hover */}
-                      {onDeleteSession && (
+                      {/* Session title — click to open, double-click (or the
+                          pencil icon) to rename in place */}
+                      {renamingId === chat.id ? (
+                        <input
+                          ref={renameInputRef}
+                          value={renamingValue}
+                          onChange={e => setRenamingValue(e.target.value)}
+                          onClick={e => e.stopPropagation()}
+                          onBlur={commitRename}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter') { e.preventDefault(); commitRename(); }
+                            else if (e.key === 'Escape') { e.preventDefault(); setRenamingId(null); }
+                          }}
+                          maxLength={200}
+                          className="flex-1 min-w-0 bg-aegis-sidebar-raised text-[12px] text-aegis-sidebar-text px-3 py-1.5 mx-1 my-1 rounded-md border border-aegis-primary/50 focus:outline-none"
+                        />
+                      ) : (
                         <button
-                          onClick={(e) => onDeleteSession(chat.id, e)}
-                          className="opacity-0 group-hover:opacity-100 flex-shrink-0 p-1.5 mr-1 rounded-md text-aegis-sidebar-text-muted hover:text-aegis-error hover:bg-aegis-sidebar-raised transition-all"
-                          title="Delete this chat"
+                          onClick={() => {
+                            onSelectSession?.(chat.id);
+                            setActiveTab('chat');
+                          }}
+                          onDoubleClick={(e) => {
+                            e.stopPropagation();
+                            if (onRenameSession) startRename(chat.id, chat.preview);
+                          }}
+                          className={`flex-1 min-w-0 text-left px-3 py-2 text-[12px] truncate transition-colors ${
+                            isActiveChat
+                              ? 'text-aegis-primary-light font-semibold'
+                              : 'text-aegis-sidebar-text-muted hover:text-aegis-sidebar-text'
+                          }`}
+                          title={chat.preview}
+                        >
+                          {chat.preview}
+                        </button>
+                      )}
+
+                      {/* Rename button — visible on hover, matches the delete
+                          button's show-on-hover treatment */}
+                      {onRenameSession && renamingId !== chat.id && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            startRename(chat.id, chat.preview);
+                          }}
+                          className="flex-shrink-0 p-1.5 rounded-md transition-all opacity-0 group-hover:opacity-100 text-aegis-sidebar-text-muted hover:text-aegis-primary-light hover:bg-aegis-sidebar-raised"
+                          title="Rename this chat"
+                        >
+                          <Pencil className="w-3 h-3" />
+                        </button>
+                      )}
+                      {renamingId === chat.id && (
+                        <button
+                          onMouseDown={(e) => { e.preventDefault(); commitRename(); }}
+                          className="flex-shrink-0 p-1.5 mr-1 rounded-md text-aegis-success hover:bg-aegis-sidebar-raised transition-colors"
+                          title="Save"
+                        >
+                          <Check className="w-3 h-3" />
+                        </button>
+                      )}
+
+                      {/* Delete button — visible on hover, click-again-to-confirm armed */}
+                      {onDeleteSession && renamingId !== chat.id && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (armedDeleteId !== chat.id) {
+                              setArmedDeleteId(chat.id);
+                              return;
+                            }
+                            setArmedDeleteId(null);
+                            onDeleteSession(chat.id, e);
+                          }}
+                          className={`flex-shrink-0 p-1.5 mr-1 rounded-md transition-all ${
+                            armedDeleteId === chat.id
+                              ? 'opacity-100 bg-aegis-error/10 text-aegis-error'
+                              : 'opacity-0 group-hover:opacity-100 text-aegis-sidebar-text-muted hover:text-aegis-error hover:bg-aegis-sidebar-raised'
+                          }`}
+                          title={armedDeleteId === chat.id ? 'Click again to delete' : 'Delete this chat'}
                         >
                           <Trash2 className="w-3 h-3" />
                         </button>
@@ -343,8 +434,8 @@ export default function Sidebar({
             <p className="text-[12px] font-semibold text-white leading-tight truncate">
               {account?.logged_in ? account.email : 'Not signed in'}
             </p>
-            <p className="text-[11px] text-aegis-sidebar-text-muted leading-tight capitalize">
-              {account?.logged_in ? `${account.plan || 'free'} plan` : 'Sign in for cloud features'}
+            <p className="text-[11px] text-aegis-sidebar-text-muted leading-tight">
+              {account?.logged_in ? (account.plan === 'paid' ? 'Pro plan' : 'Free plan') : 'Sign in for cloud features'}
             </p>
           </div>
         </button>

@@ -17,7 +17,9 @@
     "package:win": "npm run build && electron-builder --win",
     "package:linux": "npm run build && electron-builder --linux",
     "lint": "next lint",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "build": {
     "appId": "com.aegis.desktop",
@@ -50,7 +52,11 @@
       "target": [
         "dmg",
         "zip"
-      ]
+      ],
+      "hardenedRuntime": true,
+      "entitlements": "packaging/mac/entitlements.mac.plist",
+      "entitlementsInherit": "packaging/mac/entitlements.mac.plist",
+      "gatekeeperAssess": false
     },
     "win": {
       "icon": "assets/icon.ico",
@@ -99,6 +105,8 @@
     "postcss": "^8.4.38",
     "tailwindcss": "^3.4.4",
     "typescript": "^5.4.5",
+    "vite": "^8.3.0",
+    "vitest": "^5.0.1",
     "wait-on": "^7.2.0"
   }
 }

@@ -1,8 +1,10 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Globe, Loader2 } from 'lucide-react';
+import { Loader2 } from 'lucide-react';
+import { SiApple, SiGoogle } from 'react-icons/si';
 import { AegisMark } from './AegisLogo';
+import { openInBrowser } from '@/lib/openInBrowser';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
 // The Aegis website — real login/sign-up lives there (2FA, password
@@ -17,24 +19,19 @@ interface AuthScreenProps {
   onAuthenticated: () => void;
 }
 
-function openInBrowser(url: string) {
-  const aegis = typeof window !== 'undefined' ? (window as any).aegis : undefined;
-  if (aegis?.openExternal) {
-    aegis.openExternal(url);
-  } else {
-    // Not running inside Electron (e.g. plain browser during dev) — fall
-    // back to a normal tab so the flow still works for local testing.
-    window.open(url, '_blank', 'noopener,noreferrer');
-  }
-}
-
 export default function AuthScreen({ onAuthenticated }: AuthScreenProps) {
   const [mode, setMode] = useState<'idle' | 'waiting'>('idle');
   const [lastUrl, setLastUrl] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const startAuth = useCallback((path: '/auth/login' | '/auth/sign-up') => {
-    const url = `${WEBAPP_BASE}${path}?next=${encodeURIComponent('/desktop/callback')}`;
+  // Login and sign-up are the same action now that the website is
+  // OAuth-only (Supabase creates the account automatically on a first
+  // sign-in) — always land on /auth/login, and `provider` deep-links
+  // straight into that provider's redirect so opening the browser doesn't
+  // make the user pick again on the page that opens.
+  const startAuth = useCallback((provider: 'google' | 'apple') => {
+    const next = encodeURIComponent('/desktop/callback');
+    const url = `${WEBAPP_BASE}/auth/login?next=${next}&provider=${provider}`;
     setLastUrl(url);
     openInBrowser(url);
     setMode('waiting');
@@ -82,17 +79,18 @@ export default function AuthScreen({ onAuthenticated }: AuthScreenProps) {
               </div>
 
               <button
-                onClick={() => startAuth('/auth/login')}
+                onClick={() => startAuth('google')}
                 className="w-full flex items-center justify-center gap-2 p-3 rounded-xl bg-aegis-primary text-white text-xs font-semibold hover:opacity-90 transition-all"
               >
-                <Globe className="w-3.5 h-3.5" />
-                Sign In
+                <SiGoogle className="w-3.5 h-3.5" />
+                Continue with Google
               </button>
               <button
-                onClick={() => startAuth('/auth/sign-up')}
-                className="w-full flex items-center justify-center gap-2 p-3 rounded-xl border border-aegis-border text-xs font-semibold text-aegis-text-primary hover:bg-aegis-overlay transition-all"
+                onClick={() => startAuth('apple')}
+                className="w-full flex items-center justify-center gap-2 p-3 rounded-xl bg-aegis-overlay border border-aegis-border text-aegis-text-primary text-xs font-semibold hover:bg-aegis-sidebar-raised transition-all"
               >
-                Create Account
+                <SiApple className="w-3.5 h-3.5" />
+                Continue with Apple
               </button>
             </>
           ) : (

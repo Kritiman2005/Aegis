@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Plug, ShieldAlert, RefreshCw, Trash2, Loader2, CheckCircle2, XCircle, Plus, Download, Store, Eye, EyeOff, ChevronRight, Code2, Search, Globe, Wrench, X } from 'lucide-react';
+import { Plug, ShieldAlert, RefreshCw, Trash2, Loader2, CheckCircle2, XCircle, Plus, Download, Store, Eye, EyeOff, ChevronRight, Code2, Search, Globe, Wrench, X, Lock, FileText } from 'lucide-react';
 import { SiGithub } from 'react-icons/si';
 import toast from 'react-hot-toast';
 import { useSocket } from '../hooks/useSocket';
 import { ServiceLogo } from '../lib/serviceIcons';
+import { openInBrowser } from '../lib/openInBrowser';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
 
@@ -11,6 +12,35 @@ interface ServerStatus {
   running: boolean;
   server_info?: { name?: string; version?: string };
   tools_count: number;
+  resources_count?: number;
+  prompts_count?: number;
+}
+
+// resources/list and prompts/get's own MCP shapes — see backend/app/mcp/
+// registry.py's list_resources/get_prompt and connectors.py's
+// /{server_name}/resources|prompts routes.
+interface McpResource {
+  uri: string;
+  name?: string;
+  description?: string;
+  mimeType?: string;
+}
+
+interface McpPromptArgument {
+  name: string;
+  description?: string;
+  required?: boolean;
+}
+
+interface McpPrompt {
+  name: string;
+  description?: string;
+  arguments?: McpPromptArgument[];
+}
+
+interface McpPromptMessage {
+  role: string;
+  content: { type: string; text?: string };
 }
 
 interface ToolDef {
@@ -73,6 +103,13 @@ interface CatalogEntry {
   input_schema: CatalogField[];
   oauth_service?: string;  // matches oauth_service.OAUTH_CONFIGS key; absent for google_* entries
   setup_hint?: string;
+  // Present only on a connector from aegisaistudio.online's public catalog
+  // (see backend's RemoteConnector / remote_entry_to_catalog_dict) — not on
+  // any built-in entry.
+  remote?: boolean;
+  setup_guide?: string;  // markdown walkthrough for where to get this connector's credential
+  needs_reconnect?: boolean;  // the website updated this connector's definition while it was actively connected — see account_auth.py's _resync_catalog_in_background
+  locked?: boolean;  // remote entry, but this account's plan isn't "paid" yet — see catalog.py's remote_entry_to_catalog_dict
 }
 
 // Mirrors registry_client.py's _extract_install output — a single server
@@ -196,6 +233,10 @@ function RegistryResultCard({ entry, connecting, onInstall }: { entry: RegistryR
   );
 }
 
+// Only ever rendered with unlocked entries — MCPServersPanel filters locked
+// ones out into the one "Get prebuilt connectors config" summary card
+// instead (see lockedCatalog below), so there's no locked state to handle
+// here.
 function CatalogCard({ entry, connecting, onConnect }: { entry: CatalogEntry; connecting: boolean; onConnect: (env: Record<string, string>, inputParams: Record<string, string>) => void }) {
   const needsConfiguring = entry.auth_type !== 'none';
   const [expanded, setExpanded] = useState(!needsConfiguring);
@@ -226,7 +267,14 @@ function CatalogCard({ entry, connecting, onConnect }: { entry: CatalogEntry; co
         <div className="flex items-center gap-3 min-w-0">
           <ServiceLogo serviceKey={entry.name} />
           <div className="min-w-0">
-            <div className="text-xs font-semibold text-aegis-text-primary">{entry.display_name}</div>
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs font-semibold text-aegis-text-primary">{entry.display_name}</span>
+              {entry.remote && (
+                <span className="text-[9px] font-medium text-aegis-primary-light bg-aegis-primary/10 rounded px-1 py-0.5">
+                  aegisaistudio.online
+                </span>
+              )}
+            </div>
             <div className="text-[10px] text-aegis-text-muted leading-relaxed line-clamp-2">{entry.description}</div>
           </div>
         </div>
@@ -253,8 +301,19 @@ function CatalogCard({ entry, connecting, onConnect }: { entry: CatalogEntry; co
         </div>
       </div>
 
+      {entry.needs_reconnect && (
+        <p className="mt-2 pl-[52px] text-[10px] text-aegis-warning bg-aegis-warning/10 rounded-md px-2 py-1.5 leading-relaxed">
+          This connector was updated on aegisaistudio.online — reconnect to apply the change.
+        </p>
+      )}
+
       {expanded && fields.length > 0 && (
         <div className="mt-3 pl-[52px] flex flex-col gap-2">
+          {entry.setup_guide && (
+            <p className="text-[10px] text-aegis-text-muted bg-aegis-overlay rounded-md px-2 py-1.5 leading-relaxed whitespace-pre-wrap">
+              {entry.setup_guide}
+            </p>
+          )}
           {entry.auth_type === 'oauth' && entry.setup_hint && (
             <p className="text-[10px] text-aegis-text-muted bg-aegis-overlay rounded-md px-2 py-1.5 leading-relaxed">
               {entry.setup_hint}
@@ -294,6 +353,201 @@ function CatalogCard({ entry, connecting, onConnect }: { entry: CatalogEntry; co
   );
 }
 
+// Renders one resource's fetched content — an MCP resources/read result is
+// {"contents": [{uri, mimeType, text?, blob?}, ...]}. An image with real
+// bytes (blob, base64) renders as an actual <img>; text renders as-is;
+// anything else falls back to a raw JSON dump rather than silently hiding
+// it.
+function ResourceContentView({ content }: { content: any }) {
+  const contents = content?.contents || [];
+  if (contents.length === 0) return <p className="text-[10px] text-aegis-text-muted">Empty resource.</p>;
+  return (
+    <div className="flex flex-col gap-2">
+      {contents.map((c: any, i: number) => {
+        if (c.mimeType?.startsWith('image/') && c.blob) {
+          return <img key={i} src={`data:${c.mimeType};base64,${c.blob}`} alt={c.uri || 'resource'} className="max-w-full rounded-md" />;
+        }
+        if (typeof c.text === 'string') {
+          return <pre key={i} className="text-[10px] text-aegis-text-primary whitespace-pre-wrap break-words font-mono">{c.text}</pre>;
+        }
+        return <pre key={i} className="text-[10px] text-aegis-text-muted whitespace-pre-wrap break-words font-mono">{JSON.stringify(c, null, 2)}</pre>;
+      })}
+    </div>
+  );
+}
+
+// A connected server's resources/prompts — the two MCP primitives beyond
+// tools (see backend/app/mcp/registry.py's list_resources/list_prompts).
+// Fetched lazily, once, when this section is first expanded — most
+// connected servers declare neither, so there's no point fetching this for
+// every server up front.
+function ServerResourcesPrompts({ serverName }: { serverName: string }) {
+  const [resources, setResources] = useState<McpResource[] | null>(null);
+  const [prompts, setPrompts] = useState<McpPrompt[] | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [expandedResource, setExpandedResource] = useState<string | null>(null);
+  const [resourceContent, setResourceContent] = useState<Record<string, any>>({});
+  const [expandedPrompt, setExpandedPrompt] = useState<string | null>(null);
+  const [promptArgs, setPromptArgs] = useState<Record<string, string>>({});
+  const [promptResult, setPromptResult] = useState<{ messages: McpPromptMessage[] } | null>(null);
+  const [promptLoading, setPromptLoading] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      fetch(`${API_BASE}/api/connectors/${encodeURIComponent(serverName)}/resources`).then(r => (r.ok ? r.json() : { resources: [] })),
+      fetch(`${API_BASE}/api/connectors/${encodeURIComponent(serverName)}/prompts`).then(r => (r.ok ? r.json() : { prompts: [] })),
+    ])
+      .then(([resData, promptData]) => {
+        if (cancelled) return;
+        setResources(resData.resources || []);
+        setPrompts(promptData.prompts || []);
+      })
+      .catch(() => {
+        if (!cancelled) { setResources([]); setPrompts([]); toast.error(`Could not load resources/prompts for ${serverName}.`); }
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [serverName]);
+
+  const toggleResource = async (uri: string) => {
+    if (expandedResource === uri) { setExpandedResource(null); return; }
+    setExpandedResource(uri);
+    if (resourceContent[uri]) return; // already fetched
+    try {
+      const res = await fetch(`${API_BASE}/api/connectors/${encodeURIComponent(serverName)}/resources/read?uri=${encodeURIComponent(uri)}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Failed');
+      setResourceContent(prev => ({ ...prev, [uri]: data }));
+    } catch {
+      setResourceContent(prev => ({ ...prev, [uri]: { error: true } }));
+    }
+  };
+
+  const runPrompt = async (name: string) => {
+    setPromptLoading(true);
+    setPromptResult(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/connectors/${encodeURIComponent(serverName)}/prompts/${encodeURIComponent(name)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ arguments: promptArgs }),
+      });
+      const data = await res.json();
+      if (res.ok) setPromptResult(data);
+      else toast.error(data.detail || `Could not get prompt '${name}'.`);
+    } catch {
+      toast.error(`Could not reach the backend to get prompt '${name}'.`);
+    } finally {
+      setPromptLoading(false);
+    }
+  };
+
+  if (loading) return <p className="text-[11px] text-aegis-text-muted pl-[52px] py-1">Loading resources & prompts…</p>;
+  if ((resources?.length || 0) === 0 && (prompts?.length || 0) === 0) {
+    return <p className="text-[11px] text-aegis-text-muted pl-[52px] py-1">This server doesn't expose any resources or prompts.</p>;
+  }
+
+  return (
+    <div className="pl-[52px] flex flex-col gap-3 mt-2 mb-1">
+      {resources && resources.length > 0 && (
+        <div>
+          <div className="text-[10px] font-semibold text-aegis-text-muted uppercase mb-1">Resources ({resources.length})</div>
+          <div className="flex flex-col gap-1">
+            {resources.map(r => {
+              const isOpen = expandedResource === r.uri;
+              const content = resourceContent[r.uri];
+              return (
+                <div key={r.uri} className="border border-aegis-border rounded-md">
+                  <button
+                    onClick={() => toggleResource(r.uri)}
+                    className="w-full flex items-center justify-between gap-2 px-2 py-1.5 text-left hover:bg-aegis-overlay transition-colors"
+                  >
+                    <div className="min-w-0">
+                      <div className="text-[11px] font-medium text-aegis-text-primary truncate">{r.name || r.uri}</div>
+                      <div className="text-[10px] text-aegis-text-muted truncate">{r.uri}</div>
+                    </div>
+                    <ChevronRight className={`w-3 h-3 text-aegis-text-muted flex-shrink-0 transition-transform ${isOpen ? 'rotate-90' : ''}`} />
+                  </button>
+                  {isOpen && (
+                    <div className="px-2 pb-2 border-t border-aegis-border pt-2">
+                      {!content ? (
+                        <Loader2 className="w-3 h-3 animate-spin text-aegis-text-muted" />
+                      ) : content.error ? (
+                        <p className="text-[10px] text-aegis-error">Could not read this resource.</p>
+                      ) : (
+                        <ResourceContentView content={content} />
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {prompts && prompts.length > 0 && (
+        <div>
+          <div className="text-[10px] font-semibold text-aegis-text-muted uppercase mb-1">Prompts ({prompts.length})</div>
+          <div className="flex flex-col gap-1">
+            {prompts.map(p => {
+              const isOpen = expandedPrompt === p.name;
+              return (
+                <div key={p.name} className="border border-aegis-border rounded-md">
+                  <button
+                    onClick={() => { setExpandedPrompt(isOpen ? null : p.name); setPromptResult(null); setPromptArgs({}); }}
+                    className="w-full flex items-center justify-between gap-2 px-2 py-1.5 text-left hover:bg-aegis-overlay transition-colors"
+                  >
+                    <div className="min-w-0">
+                      <div className="text-[11px] font-medium text-aegis-text-primary truncate">{p.name}</div>
+                      {p.description && <div className="text-[10px] text-aegis-text-muted truncate">{p.description}</div>}
+                    </div>
+                    <ChevronRight className={`w-3 h-3 text-aegis-text-muted flex-shrink-0 transition-transform ${isOpen ? 'rotate-90' : ''}`} />
+                  </button>
+                  {isOpen && (
+                    <div className="px-2 pb-2 border-t border-aegis-border pt-2 flex flex-col gap-2">
+                      {(p.arguments || []).map(arg => (
+                        <div key={arg.name}>
+                          <label className="text-[10px] text-aegis-text-muted">{arg.name}{arg.required && ' *'}</label>
+                          <input
+                            value={promptArgs[arg.name] || ''}
+                            onChange={e => setPromptArgs(prev => ({ ...prev, [arg.name]: e.target.value }))}
+                            placeholder={arg.description}
+                            className="w-full bg-aegis-base border border-aegis-border rounded-md px-2 py-1 text-[11px] text-aegis-text-primary focus:outline-none focus:ring-1 focus:ring-aegis-primary"
+                          />
+                        </div>
+                      ))}
+                      <button
+                        onClick={() => runPrompt(p.name)}
+                        disabled={promptLoading}
+                        className="self-start flex items-center gap-1 px-2 py-1 bg-aegis-primary text-white text-[10px] font-semibold rounded-md hover:opacity-90 disabled:opacity-50 transition-opacity"
+                      >
+                        {promptLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+                        Get prompt
+                      </button>
+                      {promptResult && (
+                        <div className="flex flex-col gap-1.5 mt-1">
+                          {(promptResult.messages || []).map((m, i) => (
+                            <div key={i} className="text-[10px] bg-aegis-overlay rounded-md px-2 py-1.5">
+                              <span className="font-semibold text-aegis-text-secondary">{m.role}: </span>
+                              <span className="text-aegis-text-primary whitespace-pre-wrap">{m.content?.text || JSON.stringify(m.content)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function MCPServersPanel() {
   const { addMessageHandler } = useSocket();
   const [statusMap, setStatusMap] = useState<Record<string, ServerStatus>>({});
@@ -302,6 +556,7 @@ export default function MCPServersPanel() {
   const [submitting, setSubmitting] = useState(false);
   const [pending, setPending] = useState<Record<string, ConnectProgress>>({});
   const [busyServer, setBusyServer] = useState<string | null>(null);
+  const [expandedRPServer, setExpandedRPServer] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [catalog, setCatalog] = useState<CatalogEntry[]>([]);
   const [customServerOpen, setCustomServerOpen] = useState(false);
@@ -347,26 +602,38 @@ export default function MCPServersPanel() {
     try {
       const res = await fetch(`${API_BASE}/api/connectors/catalog`);
       if (res.ok) setCatalog((await res.json()).catalog || []);
-    } catch (e) {}
+    } catch (e) {
+      toast.error('Could not load the connector catalog.');
+    }
+  }, []);
+
+  // Bypasses the account's normal 6-hour lazy plan/catalog resync
+  // (app.api.account_auth's /status) — without this, a user who just paid
+  // for the catalog would see it still show as locked here for up to 6
+  // hours. Best-effort: no toast on failure (offline, or no Aegis account
+  // signed in at all — same "silently no-op" contract the backend's own
+  // _resync_*_in_background functions already have), since this fires
+  // automatically on every mount, not just an explicit user action.
+  const [resyncing, setResyncing] = useState(false);
+  const resyncAccount = useCallback(async () => {
+    try {
+      await fetch(`${API_BASE}/api/account/resync`, { method: 'POST' });
+    } catch (e) {
+      // offline, or no Aegis account signed in — fetchCatalog right after
+      // this still shows whatever was already cached locally either way.
+    }
   }, []);
 
   useEffect(() => {
+    (async () => {
+      await resyncAccount();
+      fetchCatalog();
+    })();
     fetchStatus();
-    fetchCatalog();
     const interval = setInterval(fetchStatus, 8000);
     return () => clearInterval(interval);
-  }, [fetchStatus, fetchCatalog]);
+  }, [fetchStatus, fetchCatalog, resyncAccount]);
 
-  // Opens a URL in the system browser (required for the OAuth redirect back
-  // to the local backend to work — an embedded Electron window can't handle
-  // that), falling back to window.open for dev-in-Chrome.
-  const openInSystemBrowser = (url: string) => {
-    if ((window as any).aegis?.openExternal) {
-      (window as any).aegis.openExternal(url);
-    } else {
-      window.open(url, '_blank');
-    }
-  };
 
   const handleOAuthConnect = async (entry: CatalogEntry, env: Record<string, string>) => {
     const clientId = env['OAUTH_CLIENT_ID'];
@@ -378,7 +645,7 @@ export default function MCPServersPanel() {
       const loginUrl = isGoogle
         ? `${API_BASE}/auth/google/login?service=${entry.name}`
         : `${API_BASE}/auth/${entry.oauth_service || entry.name}/login`;
-      openInSystemBrowser(loginUrl);
+      openInBrowser(loginUrl);
       return;
     }
     setPending(prev => ({ ...prev, [entry.name]: { stage: 'connect', message: 'Saving OAuth app…' } }));
@@ -399,7 +666,7 @@ export default function MCPServersPanel() {
       const loginUrl = isGoogle
         ? `${API_BASE}/auth/google/login?service=${entry.name}`
         : `${API_BASE}/auth/${entry.oauth_service || entry.name}/login`;
-      openInSystemBrowser(loginUrl);
+      openInBrowser(loginUrl);
       toast.success(`OAuth app saved. Finish signing in to ${entry.display_name} in the browser window that just opened.`, { duration: 6000 });
     } catch (e) {
       toast.error('Could not reach the backend.');
@@ -713,7 +980,14 @@ export default function MCPServersPanel() {
   const pendingNames = Object.keys(pending);
 
   const availableCatalog = catalog.filter(c => !(c.name in statusMap));
-  const catalogByCategory = availableCatalog.reduce<Record<string, CatalogEntry[]>>((acc, entry) => {
+  // Locked entries are all "the same card" from the user's point of view —
+  // every one leads to the exact same place (pay once, unlock everything).
+  // Once a plan unlocks them they're genuinely different tools worth
+  // browsing individually, so only collapse them into one summary card
+  // while still locked — see the "Unlock the catalog" section below.
+  const lockedCatalog = availableCatalog.filter(c => c.locked);
+  const unlockedCatalog = availableCatalog.filter(c => !c.locked);
+  const catalogByCategory = unlockedCatalog.reduce<Record<string, CatalogEntry[]>>((acc, entry) => {
     (acc[entry.category] ||= []).push(entry);
     return acc;
   }, {});
@@ -748,6 +1022,56 @@ export default function MCPServersPanel() {
             <p className="text-[13px] text-aegis-text-muted mb-3">
               Pre-configured servers — just an API key, folder, or nothing at all to get going.
             </p>
+
+            {lockedCatalog.length > 0 && (
+              <div className="mb-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 rounded-xl border border-aegis-primary/30 bg-gradient-to-br from-aegis-primary/10 to-transparent px-5 py-4">
+                <div className="flex items-start gap-3">
+                  <div className="flex-shrink-0 w-9 h-9 rounded-lg bg-aegis-primary/15 flex items-center justify-center">
+                    <Lock className="w-4 h-4 text-aegis-primary-light" />
+                  </div>
+                  <div>
+                    <p className="text-sm font-semibold text-aegis-text-primary">Get prebuilt connectors config</p>
+                    <p className="text-[12px] text-aegis-text-muted mt-0.5 leading-relaxed">
+                      {lockedCatalog.length} pre-built connectors — Slack, Notion, AWS, Google Workspace, and more —
+                      unlock with one subscription on aegisaistudio.online.
+                    </p>
+                  </div>
+                </div>
+                <div className="flex-shrink-0 flex items-center gap-2">
+                  {/* Already paid but this panel hasn't noticed yet (opening
+                      it already triggers a resync automatically — this is
+                      just a visible, explicit way to ask again, e.g. right
+                      after finishing checkout in the browser). */}
+                  <button
+                    onClick={async () => {
+                      setResyncing(true);
+                      await resyncAccount();
+                      await fetchCatalog();
+                      setResyncing(false);
+                      toast.success('Refreshed.');
+                    }}
+                    disabled={resyncing}
+                    title="Already paid? Check again"
+                    className="flex items-center gap-1.5 px-3 py-2 text-aegis-text-secondary text-[12px] font-medium rounded-lg hover:bg-aegis-overlay transition-colors disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${resyncing ? 'animate-spin' : ''}`} /> Refresh
+                  </button>
+                  <button
+                    // /pricing decides where this visitor actually lands
+                    // (the free/paid comparison, or straight through to
+                    // checkout, or straight to the connectors dashboard if
+                    // they're already on a paid plan — see its own
+                    // docstring) rather than this button assuming
+                    // "not paid" off its own possibly-stale local cache.
+                    onClick={() => openInBrowser('https://aegisaistudio.online/pricing')}
+                    className="flex items-center gap-1.5 px-4 py-2 bg-aegis-primary text-white text-[12px] font-semibold rounded-lg hover:opacity-90 transition-opacity"
+                  >
+                    <Lock className="w-3.5 h-3.5" /> Unlock all connectors
+                  </button>
+                </div>
+              </div>
+            )}
+
             <div className="space-y-5">
               {Object.entries(catalogByCategory).map(([category, entries]) => (
                 <div key={category}>
@@ -1080,41 +1404,56 @@ export default function MCPServersPanel() {
               {serverNames.map((name) => {
                 const s = statusMap[name];
                 const busy = busyServer === name;
+                const rpCount = (s.resources_count || 0) + (s.prompts_count || 0);
+                const rpOpen = expandedRPServer === name;
                 return (
-                  <div key={name} className="flex items-center gap-4 bg-aegis-raised border border-aegis-border rounded-xl px-5 py-3">
-                    <div className="relative flex-shrink-0">
-                      <ServiceLogo serviceKey={name} size="sm" />
-                      {s.running ? (
-                        <CheckCircle2 className="w-3 h-3 text-aegis-success absolute -bottom-0.5 -right-0.5 bg-aegis-raised rounded-full" />
-                      ) : (
-                        <XCircle className="w-3 h-3 text-aegis-error absolute -bottom-0.5 -right-0.5 bg-aegis-raised rounded-full" />
-                      )}
+                  <div key={name} className="bg-aegis-raised border border-aegis-border rounded-xl px-5 py-3">
+                    <div className="flex items-center gap-4">
+                      <div className="relative flex-shrink-0">
+                        <ServiceLogo serviceKey={name} size="sm" />
+                        {s.running ? (
+                          <CheckCircle2 className="w-3 h-3 text-aegis-success absolute -bottom-0.5 -right-0.5 bg-aegis-raised rounded-full" />
+                        ) : (
+                          <XCircle className="w-3 h-3 text-aegis-error absolute -bottom-0.5 -right-0.5 bg-aegis-raised rounded-full" />
+                        )}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-[13px] font-semibold text-aegis-text-primary truncate">{name}</p>
+                        <p className="text-[11px] text-aegis-text-muted">
+                          {s.running ? `Running` : 'Not running'} · {s.tools_count} tool{s.tools_count === 1 ? '' : 's'}
+                          {rpCount > 0 && ` · ${rpCount} resource${rpCount === 1 ? '' : 's'}/prompt${rpCount === 1 ? '' : 's'}`}
+                          {s.server_info?.version ? ` · v${s.server_info.version}` : ''}
+                        </p>
+                      </div>
+                      <div className="flex-shrink-0 flex items-center gap-2">
+                        {rpCount > 0 && (
+                          <button
+                            onClick={() => setExpandedRPServer(rpOpen ? null : name)}
+                            title="Resources & prompts"
+                            className={`p-1.5 rounded-md hover:bg-aegis-overlay text-aegis-text-muted transition-colors ${rpOpen ? 'bg-aegis-overlay text-aegis-text-secondary' : ''}`}
+                          >
+                            <FileText className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                        <button
+                          onClick={() => handleReload(name)}
+                          disabled={busy}
+                          title="Reload"
+                          className="p-1.5 rounded-md hover:bg-aegis-overlay text-aegis-text-muted disabled:opacity-40 transition-colors"
+                        >
+                          {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                        </button>
+                        <button
+                          onClick={() => handleDisconnect(name)}
+                          disabled={busy}
+                          title="Disconnect"
+                          className="p-1.5 rounded-md hover:bg-aegis-error/10 text-aegis-text-muted hover:text-aegis-error disabled:opacity-40 transition-colors"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
                     </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-[13px] font-semibold text-aegis-text-primary truncate">{name}</p>
-                      <p className="text-[11px] text-aegis-text-muted">
-                        {s.running ? `Running` : 'Not running'} · {s.tools_count} tool{s.tools_count === 1 ? '' : 's'}
-                        {s.server_info?.version ? ` · v${s.server_info.version}` : ''}
-                      </p>
-                    </div>
-                    <div className="flex-shrink-0 flex items-center gap-2">
-                      <button
-                        onClick={() => handleReload(name)}
-                        disabled={busy}
-                        title="Reload"
-                        className="p-1.5 rounded-md hover:bg-aegis-overlay text-aegis-text-muted disabled:opacity-40 transition-colors"
-                      >
-                        {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
-                      </button>
-                      <button
-                        onClick={() => handleDisconnect(name)}
-                        disabled={busy}
-                        title="Disconnect"
-                        className="p-1.5 rounded-md hover:bg-aegis-error/10 text-aegis-text-muted hover:text-aegis-error disabled:opacity-40 transition-colors"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
+                    {rpOpen && <ServerResourcesPrompts serverName={name} />}
                   </div>
                 );
               })}

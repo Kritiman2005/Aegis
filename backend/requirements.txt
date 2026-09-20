@@ -1,12 +1,19 @@
 psutil
+# Still needed — app.core.exporter's DOCX export (the composer's Export
+# menu / export_document node), unrelated to the removed extraction below.
 python-docx
 httpx
 certifi
-trafilatura
-rapidocr-onnxruntime
-pdfplumber
-pypdf
-pdfminer.six
-docx2txt
-mammoth
-python-docx
+truststore
+# rapidocr-onnxruntime (needs opencv/cv2) intentionally not listed here —
+# OCR engines are install-on-demand via the Dependencies panel now, not
+# bundled by default. See root requirements.txt's matching note and
+# backend/main.spec's excludes list.
+#
+# pdfplumber, pypdf, pdfminer.six, docx2txt, mammoth, python-pptx, and
+# openpyxl intentionally not listed here either — every alternative (or,
+# for PPTX/XLSX, the only) document-extraction engine is install-on-demand
+# from the Marketplace's Document Extraction category, not bundled. See
+# app.core.extraction_engines and app.core.rag.processor.extract_text's
+# own docstrings. PDF (pymupdf) and DOCX (python-docx) stay bundled either
+# way — see the pymupdf/python-docx note in the root requirements.txt.

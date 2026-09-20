@@ -18,6 +18,7 @@ import anyio
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from app.core.connection_manager import manager
 from app.core.agents import ChatAgent
+from app.core.friendly_errors import humanize_exception
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["WebSocket"])
@@ -92,9 +93,11 @@ async def websocket_endpoint(
             msg_type = payload.get("type", "message")
             content = payload.get("content", "")
             attachments = payload.get("attachments") or None
-            export_format = payload.get("export_format") or None
-            attachments = payload.get("attachments") or None
-            export_format = payload.get("export_format") or None
+            # "voice" only when the composer's own mic auto-send fired this
+            # (see useSocket.ts's sendMessage) — gated per-workflow by the
+            # "On chat message" trigger's own acceptsVoice setting, not
+            # trusted/acted on here directly.
+            message_source = payload.get("source") or None
 
             if msg_type == "ping":
                 await manager.send_json(connection_id, {"type": "pong"})
@@ -148,7 +151,7 @@ async def websocket_endpoint(
                 if hasattr(session, "cancel_event"):
                     session.cancel_event.clear()
 
-                async def process_message_task(msg_content: str, msg_attachments=attachments, msg_export_format=export_format):
+                async def process_message_task(msg_content: str, msg_attachments=attachments, msg_source=message_source):
                     def superseded() -> bool:
                         # True once a cancel (or a newer message) has moved
                         # the session on from this task — its eventual
@@ -212,12 +215,10 @@ async def websocket_endpoint(
 
                         if active_workflow_id is not None:
                             # A workflow is connected as the chat handler (see
-                            # app.api.workflows's /set-chat-handler) — run it
-                            # instead of the built-in pipeline for this turn.
-                            # Persisting the user message / assistant reply
-                            # ourselves here mirrors exactly what
-                            # ChatAgent._handle_idle does internally, since
-                            # run_chat_workflow bypasses it entirely.
+                            # app.api.workflows's /set-chat-handler) — this is
+                            # the only way a chat turn gets a reply now.
+                            # run_chat_workflow doesn't persist history
+                            # itself, so that's done explicitly here.
                             from app.core.workflows.engine import run_chat_workflow, WorkflowError
                             await session._append_history("user", msg_content, attachments=msg_attachments)
                             turn_history = await session._get_history()
@@ -225,20 +226,29 @@ async def websocket_endpoint(
                             try:
                                 response_text = await run_chat_workflow(
                                     session, active_workflow_id, msg_content, turn_history, msg_attachments,
-                                    connection_id, send_token_sync, export_format=msg_export_format,
+                                    connection_id, send_token_sync, message_source=msg_source,
                                 )
                                 await session._append_history("assistant", response_text)
                             except WorkflowError as e:
                                 response_text = f"⚠ {e}"
                                 await session._append_history("assistant", response_text)
                         else:
-                            response_text = await session.handle_message(
-                                msg_content,
-                                token_callback=send_token_sync,
-                                status_callback=send_status,
-                                attachments=msg_attachments,
-                                export_format=msg_export_format,
+                            # No workflow connected — chat no longer silently
+                            # falls back to the legacy built-in ChatAgent
+                            # pipeline (session.handle_message), which used to
+                            # load a model and reply on its own regardless of
+                            # whether the user had deliberately disconnected
+                            # everything. Disconnecting a workflow is now a
+                            # real "chat is off" state, not just "use the old
+                            # path instead" — matches how a WorkflowError
+                            # above shows a clear inline message rather than
+                            # a silently different reply.
+                            await session._append_history("user", msg_content, attachments=msg_attachments)
+                            response_text = (
+                                "⚠ No workflow is connected to handle chat. Open **Workflows** and "
+                                "connect one (e.g. the Aegis Default Pipeline) to continue chatting."
                             )
+                            await session._append_history("assistant", response_text)
 
                         # Stop the token sender task
                         loop.call_soon_threadsafe(token_queue.put_nowait, None)
@@ -304,7 +314,8 @@ async def websocket_endpoint(
                     await manager.send_json(connection_id, {"type": "done", "content": ""})
                 except Exception as exc:
                     logger.error(f"[WS:{connection_id[:8]}] Save error: {exc}")
-                    await manager.send_json(connection_id, {"type": "error", "content": str(exc)})
+                    friendly = humanize_exception(exc, context="saving that")
+                    await manager.send_json(connection_id, {"type": "error", "content": friendly})
 
             elif msg_type == "extract_specific_facts" and content.strip():
                 logger.info(f"[WS:{connection_id[:8]}] Extract Specific Facts Triggered")
@@ -317,7 +328,8 @@ async def websocket_endpoint(
                     await manager.send_json(connection_id, {"type": "done", "content": ""})
                 except Exception as exc:
                     logger.error(f"[WS:{connection_id[:8]}] Extraction error: {exc}")
-                    await manager.send_json(connection_id, {"type": "error", "content": str(exc)})
+                    friendly = humanize_exception(exc, context="extracting those facts")
+                    await manager.send_json(connection_id, {"type": "error", "content": friendly})
 
     except WebSocketDisconnect:
         logger.info(f"[WS] Client disconnected: {connection_id[:8]}")
@@ -334,8 +346,8 @@ async def websocket_endpoint(
         manager.disconnect(connection_id, websocket)
         # Only destroy the ChatAgent if this WebSocket is still the active connection.
         # If the client reconnected and a new socket has already taken over this session ID,
-        # the old disconnect must NOT wipe the ChatAgent (which holds in-progress LLM state,
-        # _last_tool_results, _turn_counter, and plan data for the new connection).
+        # the old disconnect must NOT wipe the ChatAgent (which holds in-progress LLM state
+        # for the new connection).
         current_ws = manager._connections.get(connection_id)
         if current_ws is None and connection_id in agent_sessions:
             del agent_sessions[connection_id]
