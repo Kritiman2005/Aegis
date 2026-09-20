@@ -24,6 +24,7 @@
   "build": {
     "appId": "com.aegis.desktop",
     "productName": "Aegis",
+    "afterPack": "packaging/mac/afterPack.js",
     "directories": {
       "output": "release"
     },

@@ -135,74 +135,23 @@ jobs:
       - name: Compile Electron main process
         run: npx tsc -p electron/tsconfig.json
 
-      # ── Package (unsigned, --dir) so app.asar can be pruned before the
-      # real signed build ────────────────────────────────────────────────
-      # CSC_IDENTITY_AUTO_DISCOVERY: false is required here even though no
-      # CSC_LINK is set for this step — without it, electron-builder still
-      # tries to auto-discover a signing identity from the runner's default
-      # keychain, and modifying app.asar (below) after signing would
-      # invalidate the whole .app bundle's signature (hardened runtime
-      # seals every file's hash). The real, final signing happens in the
-      # last step below, against the pruned app.
-      - name: Package macOS app (unpacked, unsigned)
-        run: npx electron-builder --mac --dir
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CSC_IDENTITY_AUTO_DISCOVERY: false
-
-      # electron-builder's default packaging bundles package.json's full
-      # `dependencies` into app.asar (next, react, react-dom, @xyflow/react,
-      # @reduxjs/toolkit, react-redux, react-markdown, remark-gfm,
-      # react-hot-toast, react-icons, @tailwindcss/typography, lucide-react
-      # — ~300MB+) even though NONE of them are needed at Electron-main
-      # runtime: electron/main.ts and electron/preload.ts import only
-      # 'electron' itself and Node builtins — every one of those npm
-      # packages exists solely to PRODUCE the static files already sitting
-      # in out/ (via `next build`), which is what the renderer actually
-      # loads. Also drops out/ from inside the asar — it's shipped a
-      # second time via extraResources (Contents/Resources/out), which is
-      # the only copy electron/main.ts actually reads from
-      # (process.resourcesPath + 'out'); the asar copy was never read.
-      # Mirrors build-windows.yml's equivalent step, adapted for the
-      # macOS .app bundle's asar location (Contents/Resources/app.asar
-      # instead of Windows's resources\app.asar) — this is a CI-only size
-      # optimization, not a behavior change.
-      - name: Prune unused frontend deps + duplicate out/ from app.asar
-        run: |
-          APP_PATH="release/mac-arm64/Aegis.app"
-          ASAR_PATH="$APP_PATH/Contents/Resources/app.asar"
-          if [ ! -f "$ASAR_PATH" ]; then
-            echo "app.asar not found at $ASAR_PATH — electron-builder's --dir output location may have changed." >&2
-            exit 1
-          fi
-
-          EXTRACT_DIR="release/asar-extracted"
-          npx --yes @electron/asar extract "$ASAR_PATH" "$EXTRACT_DIR"
-
-          BEFORE=$(stat -f%z "$ASAR_PATH")
-
-          UNUSED_NODE_MODULES=(next react react-dom react-hot-toast react-icons react-markdown react-redux remark-gfm lucide-react "@xyflow/react" "@reduxjs/toolkit" "@tailwindcss/typography")
-          for pkg in "${UNUSED_NODE_MODULES[@]}"; do
-            target="$EXTRACT_DIR/node_modules/$pkg"
-            if [ -d "$target" ]; then
-              rm -rf "$target"
-            fi
-          done
-
-          DUP_OUT="$EXTRACT_DIR/out"
-          if [ -d "$DUP_OUT" ]; then
-            rm -rf "$DUP_OUT"
-          fi
-
-          rm -f "$ASAR_PATH"
-          npx --yes @electron/asar pack "$EXTRACT_DIR" "$ASAR_PATH"
-          rm -rf "$EXTRACT_DIR"
-
-          AFTER=$(stat -f%z "$ASAR_PATH")
-          echo "app.asar: $(echo "scale=1; $BEFORE/1048576" | bc) MB -> $(echo "scale=1; $AFTER/1048576" | bc) MB"
-
-      # ── Sign (hardened runtime + entitlements — already configured in
-      # package.json's build.mac block) and notarize the pruned app ──────
+      # ── Package, code-sign (hardened runtime + entitlements — already
+      # configured in package.json's build.mac block) and notarize ──────────
+      # app.asar pruning (next/react/etc. — see packaging/mac/afterPack.js)
+      # happens automatically via electron-builder's own afterPack hook,
+      # BEFORE its signing phase runs, all within this one invocation.
+      # A prior version of this step ran pruning as a separate `--dir` +
+      # `--prepackaged` CLI pass instead — that silently shipped a
+      # completely UNSIGNED, UNNOTARIZED app: `--prepackaged` only
+      # repackages an already-built app into dmg/zip, it does not sign or
+      # notarize, so the whole point of this step was quietly skipped
+      # while the job still reported success. afterPack is the correct,
+      # supported extension point for "modify the packed app before
+      # electron-builder signs it" — verified locally (`CSC_IDENTITY_
+      # AUTO_DISCOVERY=false npx electron-builder --mac --dir`) that the
+      # hook fires automatically and the app still launches cleanly
+      # afterward, before trusting this in CI again.
+      #
       # CSC_LINK here is the base64-encoded .p12 itself (electron-builder
       # accepts base64 directly, not just a file path/URL) — set via
       # `gh secret set CSC_LINK < cert_base64.txt`. electron-builder creates
@@ -210,11 +159,9 @@ jobs:
       # else in this job touches the certificate. Notarization runs
       # automatically (built into electron-builder 24.x via @electron/notarize,
       # given mac.notarize's teamId in package.json plus these env vars) —
-      # no separate notarize step needed. --prepackaged signs/notarizes/
-      # repackages the already-built (and now pruned) .app directly,
-      # instead of building from source again.
-      - name: Sign & notarize pruned app
-        run: npx electron-builder --mac --prepackaged release/mac-arm64/Aegis.app
+      # no separate notarize step needed.
+      - name: Package, sign & notarize macOS app
+        run: npx electron-builder --mac
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_LINK: ${{ secrets.CSC_LINK }}
