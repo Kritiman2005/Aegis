@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Plug, ShieldAlert, RefreshCw, Trash2, Loader2, CheckCircle2, XCircle, Plus, Download, Store, Eye, EyeOff, ChevronRight, Code2, Search, Globe, Wrench, X, Lock, FileText } from 'lucide-react';
+import { Plug, ShieldAlert, RefreshCw, Trash2, Loader2, CheckCircle2, XCircle, Plus, Download, Store, Eye, EyeOff, ChevronRight, Code2, Search, Globe, Wrench, X, Lock, FileText, Mail } from 'lucide-react';
 import { SiGithub } from 'react-icons/si';
 import toast from 'react-hot-toast';
 import { useSocket } from '../hooks/useSocket';
@@ -1005,6 +1005,21 @@ export default function MCPServersPanel() {
       </div>
 
       <div className="px-8 pb-8 space-y-8">
+        {/* Custom MCP request */}
+        <div className="flex items-center gap-2 bg-aegis-primary/5 border border-aegis-primary/20 rounded-lg px-3 py-2">
+          <Mail className="w-3.5 h-3.5 text-aegis-primary flex-shrink-0" />
+          <p className="text-[13px] text-aegis-text-secondary">
+            Can't find the server you need?{' '}
+            <button
+              onClick={() => openInBrowser('mailto:kingzkritiman@gmail.com?subject=Custom%20MCP%20server%20request')}
+              className="font-semibold text-aegis-primary hover:underline"
+            >
+              Mail us
+            </button>{' '}
+            and we'll look into building a custom connector for it.
+          </p>
+        </div>
+
         {/* Safety warning */}
         <div className="flex items-center gap-2 bg-aegis-error/5 border border-aegis-error/20 rounded-lg px-3 py-2">
           <ShieldAlert className="w-3.5 h-3.5 text-aegis-error flex-shrink-0" />
